@@ -238,6 +238,7 @@ function setPanelControls(controls) {
     button.onpointerup = button.onpointercancel = button.onlostpointercapture = release;
     button.onkeydown = (event) => { if (!event.repeat && (event.key === ' ' || event.key === 'Enter')) { event.preventDefault(); press(); } };
     button.onkeyup = (event) => { if (event.key === ' ' || event.key === 'Enter') { event.preventDefault(); release(); } };
+    button.onclick = (event) => { if (event.detail === 0 && !down) { press(); setTimeout(release, 0); } };
     button.onblur = release;
     row.append(button);
   }
