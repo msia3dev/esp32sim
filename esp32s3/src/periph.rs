@@ -374,6 +374,41 @@ impl Device for FeIq {
     fn write(&mut self, _off: u32, v: u32) -> WriteEffect { self.word = v; WriteEffect::NONE }
 }
 
+// ------------------------------------------------------------------ External-memory AES-XTS
+/// Manual flash-encryption front end. Physical ciphertext is intentionally not retained: the
+/// emulator's flash array is the CPU-visible, transparently decrypted view used by its fast memory
+/// path. The control states and 32/64-byte hand-off to SPI1 match the hardware protocol.
+pub struct FlashEncrypt { plain: [u32; 16], size: u32, destination: u32, address: u32, state: u32, ready: Option<(u32, Vec<u8>)> }
+impl FlashEncrypt {
+    pub fn new() -> Self { Self { plain: [0; 16], size: 0, destination: 0, address: 0, state: 0, ready: None } }
+    pub fn read(&self, off: u32) -> u32 { match off { 0x00..=0x3c => self.plain[(off / 4) as usize], 0x40 => self.size, 0x44 => self.destination, 0x48 => self.address, 0x58 => self.state, 0x5c => 0x20210331, _ => 0 } }
+    pub fn write(&mut self, off: u32, v: u32) {
+        match off {
+            0x00..=0x3c => self.plain[(off / 4) as usize] = v,
+            0x40 => self.size = v,
+            0x44 => self.destination = v,
+            0x48 => self.address = v,
+            0x4c => {                                                                        // TRIGGER
+                let len = ((self.size & 3) * 32) as usize;
+                let start = (self.address as usize) & 0x3f;
+                let mut data = Vec::with_capacity(len);
+                for i in 0..len { data.push((self.plain[(start + i) / 4] >> (((start + i) & 3) * 8)) as u8); }
+                self.ready = Some((self.address, data));
+                self.state = 2;                                                               // calculation complete
+            }
+            0x50 => self.state = 3,                                                           // RELEASE: result available to SPI1
+            0x54 => { self.state = 0; self.ready = None; }                                    // DESTROY
+            _ => {}
+        }
+    }
+    pub fn take_ready(&mut self) -> Option<(u32, Vec<u8>)> { if self.state == 3 { self.ready.take() } else { None } }
+}
+impl Default for FlashEncrypt { fn default() -> Self { Self::new() } }
+impl Device for FlashEncrypt {
+    fn read(&mut self, off: u32) -> u32 { FlashEncrypt::read(self, off) }
+    fn write(&mut self, off: u32, v: u32) -> WriteEffect { FlashEncrypt::write(self, off, v); WriteEffect::NONE }
+}
+
 // ------------------------------------------------------------------ all together
 pub struct Peripherals {
     pub usb: UsbSerialJtag,
@@ -397,6 +432,7 @@ pub struct Peripherals {
     pub aes: Aes,
     pub rsa: Rsa,
     pub sha: Sha,
+    pub flash_encrypt: FlashEncrypt,
     pub wdev: Wdev,
     pub i2c_mst: I2cMst,
     pub gdma: Gdma,
@@ -434,6 +470,7 @@ device_set! { Peripherals; clock: (clock) CPU_HZ, [(ClockDomain::Systimer, 15), 
     0x02 "SPI1" (spi1) => [];
     0x03 "SPI0" (spi0) => [];
     0x3b "SHA" (sha) => [];
+    0xcc "EXT_MEM_ENC" (flash_encrypt) => [];
     0x0e "I2C_MST" (i2c_mst) => [];
     0x3f "GDMA" (gdma) => [SRC_DMA_OUT_CH0, SRC_DMA_OUT_CH0 + 1, SRC_DMA_OUT_CH0 + 2, SRC_DMA_OUT_CH0 + 3, SRC_DMA_OUT_CH0 + 4,
                            SRC_DMA_IN_CH0, SRC_DMA_IN_CH0 + 1, SRC_DMA_IN_CH0 + 2, SRC_DMA_IN_CH0 + 3, SRC_DMA_IN_CH0 + 4];
@@ -480,7 +517,7 @@ impl Peripherals {
             timg: [TimerGroup::new(), TimerGroup::new()], intmatrix: IntMatrix::new(), gpio: Gpio::new(), rtc: RtcCntl::new(),
             efuse: Efuse::new(mac), system: SystemRegs::new(0x30), extmem: Extmem::new(), spi0: SpiMem::new(false), spi1: SpiMem::new(true),
             i2c: [crate::i2c::I2c::new(), crate::i2c::I2c::new()], lcd_cam: LcdCam::new(), spi2: GpSpi::new(), pcnt: Pcnt::new(), wifi: WifiMac::new(), fe: FeIq { word: 0, done: false },
-            aes: Aes::new(), rsa: Rsa::new(), sha: Sha::new(), wdev: Wdev::new(), i2c_mst: I2cMst::new(), gdma: Gdma::new(), i2s0: I2s::new(CPU_HZ), i2s1: I2s::new(CPU_HZ), rmt: Rmt::new(CPU_HZ),
+            aes: Aes::new(), rsa: Rsa::new(), sha: Sha::new(), flash_encrypt: FlashEncrypt::new(), wdev: Wdev::new(), i2c_mst: I2cMst::new(), gdma: Gdma::new(), i2s0: I2s::new(CPU_HZ), i2s1: I2s::new(CPU_HZ), rmt: Rmt::new(CPU_HZ),
             io_mux: RegRam::new(), misc: Misc::new(), fake_reads: std::env::var("ESP_EMU_FAKE_READ").ok().map(|v| v.split(',').filter_map(|e| { let mut p = e.split(':'); let a = u32::from_str_radix(p.next()?.trim_start_matches("0x"), 16).ok()?; let o = u32::from_str_radix(p.next().unwrap_or("0").trim_start_matches("0x"), 16).ok()?; let m = u32::from_str_radix(p.next().unwrap_or("ffffffff").trim_start_matches("0x"), 16).ok()?; Some((a, (o, m))) }).collect()).unwrap_or_default(),
             clock: Self::new_clock(),
             spi_exec: false, last_status: [0; 4], intmatrix_dirty: false,
@@ -495,7 +532,7 @@ impl Peripherals {
             0x18 => "SLC", 0x19 => "LEDC", 0x1c => "NRX", 0x1d => "BB", 0x1e => "PWM0", 0x1f => "TIMG0", 0x20 => "TIMG1", 0x21 => "RTC_SLOWMEM", 0x23 => "SYSTIMER",
             0x24 => "SPI2", 0x25 => "SPI3", 0x26 => "APB_CTRL", 0x27 => "I2C1", 0x28 => "SDMMC", 0x2a => "PERI_BACKUP", 0x2b => "TWAI", 0x2c => "PWM1", 0x2d => "I2S1", 0x2e => "UART2", 0x33 => "WIFI_MAC", 0x34 => "WIFI_MAC2", 0x35 => "WDEV", 0x0e => "I2C_MST",
             0x38 => "USB_SERIAL_JTAG", 0x39 => "USB_WRAP", 0x3a => "AES", 0x3b => "SHA", 0x3c => "RSA", 0x3d => "DS", 0x3e => "HMAC", 0x3f => "GDMA", 0x40 => "APB_SARADC", 0x41 => "LCD_CAM",
-            0xc0 => "SYSTEM", 0xc1 => "SENSITIVE", 0xc2 => "INTERRUPT", 0xc4 => "EXTMEM", 0xc5 => "MMU", 0xce => "ASSIST_DEBUG", 0xcf => "ASSIST_DEBUG2", 0xd0 => "WCL",
+            0xc0 => "SYSTEM", 0xc1 => "SENSITIVE", 0xc2 => "INTERRUPT", 0xc4 => "EXTMEM", 0xc5 => "MMU", 0xcc => "EXT_MEM_ENC", 0xce => "ASSIST_DEBUG", 0xcf => "ASSIST_DEBUG2", 0xd0 => "WCL",
             _ => "?",
         }
     }
@@ -587,4 +624,36 @@ impl Peripherals {
     }
     /// SYSTEM_CORE_1_CONTROL_0: (clkgate_en, reseting, runstall)
     pub fn core1_control(&self) -> (bool, bool, bool) { let v = self.system.ram.read(0); (v & 2 != 0, v & 4 != 0, v & 1 != 0) }
+}
+
+#[cfg(test)]
+mod flash_encrypt_tests {
+    use super::*;
+
+    #[test]
+    fn released_result_captures_the_addressed_half_of_the_plaintext_window() {
+        let mut xts = FlashEncrypt::new();
+        for i in 0..16 { xts.write(i * 4, 0x0302_0100 + i * 0x0404_0404); }
+        xts.write(0x40, 1);
+        xts.write(0x48, 0x1020);
+        xts.write(0x4c, 1);
+        assert_eq!(xts.read(0x58), 2);
+        assert!(xts.take_ready().is_none());
+        xts.write(0x50, 1);
+
+        let (address, data) = xts.take_ready().unwrap();
+        assert_eq!(address, 0x1020);
+        assert_eq!(data, (32u8..64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn destroy_discards_a_released_result() {
+        let mut xts = FlashEncrypt::new();
+        xts.write(0x40, 1);
+        xts.write(0x4c, 1);
+        xts.write(0x50, 1);
+        xts.write(0x54, 1);
+        assert_eq!(xts.read(0x58), 0);
+        assert!(xts.take_ready().is_none());
+    }
 }

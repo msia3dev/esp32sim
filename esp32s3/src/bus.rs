@@ -238,6 +238,16 @@ impl SocBus {
     #[inline]
     fn is_periph(addr: u32) -> bool { (PERIPH_BASE..PERIPH_END).contains(&addr) }
 
+    #[inline]
+    fn is_efuse(addr: u32) -> bool {
+        (PERIPH_BASE + 0x7000..PERIPH_BASE + 0x8000).contains(&addr)
+    }
+
+    fn efuse_read8(&mut self, addr: u32) -> u8 {
+        let word = self.periph_read(addr & !3);
+        (word >> ((addr & 3) * 8)) as u8
+    }
+
     fn periph_read(&mut self, addr: u32) -> u32 {
         if (MMU_TABLE..MMU_TABLE + (MMU_ENTRIES as u32) * 4).contains(&addr) {
             return self.mmu[((addr - MMU_TABLE) >> 2) as usize];
@@ -282,6 +292,9 @@ impl SocBus {
         }
         if self.periph.spi_exec {
             self.periph.spi_exec = false;
+            if let Some(program) = self.periph.flash_encrypt.take_ready() {
+                self.periph.spi1.encrypted_program = Some(program);
+            }
             self.periph.spi1.execute(&mut self.flash, &mut self.psram);
             for (m, off, len) in std::mem::take(&mut self.periph.spi1.dirty) { self.note_written(match m { crate::periph::DirtyMem::Flash => SRC_FLASH, crate::periph::DirtyMem::Psram => SRC_PSRAM }, off, len); }
         }
@@ -909,11 +922,18 @@ impl SocBus {
 
 impl Bus for SocBus {
     fn read8(&mut self, addr: u32) -> Result<u8, Fault> {
+        // ESP32-S3's ROM byte-reads eFuse shadow registers while provisioning
+        // Secure Boot. Narrow reads remain rejected for other peripherals,
+        // where widening a FIFO or clear-on-read access could add side effects.
+        if Self::is_efuse(addr) { return Ok(self.efuse_read8(addr)); }
         if Self::is_periph(addr) { self.last_fault = Some((addr, false)); return Err(Fault::Prohibited); }
         let Some(e) = self.lookup(addr) else { self.last_fault = Some((addr, false)); return Err(Fault::Unmapped) };
         Ok(self.buf(e.src as u8)[e.off as usize + (addr - e.lo) as usize])
     }
     fn read16(&mut self, addr: u32) -> Result<u16, Fault> {
+        if Self::is_efuse(addr) {
+            return Ok(u16::from_le_bytes([self.efuse_read8(addr), self.efuse_read8(addr + 1)]));
+        }
         if Self::is_periph(addr) { self.last_fault = Some((addr, false)); return Err(Fault::Prohibited); }
         match self.lookup(addr) {
             Some(e) if addr.wrapping_add(2) <= e.hi => { let o = e.off as usize + (addr - e.lo) as usize; Ok(u16::from_le_bytes(self.buf(e.src as u8)[o..o + 2].try_into().unwrap())) }
@@ -1643,6 +1663,22 @@ mod gp_spi_board_tests {
         assert_eq!(bus.read32(USB), Ok(0x11));
         assert_eq!(bus.periph.usb.rx.iter().copied().collect::<Vec<_>>(), [0x22]);
         assert_eq!(bus.tick_pending, 0);
+    }
+
+    #[test]
+    fn efuse_shadow_registers_allow_narrow_reads() {
+        const EFUSE: u32 = 0x6000_7000;
+        let mut bus = SocBus::new(1024, 1024, [0; 6]);
+        bus.periph.efuse.ram.write(0x9c, 0x4433_2211);
+        bus.periph.efuse.ram.write(0xa0, 0x8877_6655);
+
+        assert_eq!(bus.read8(EFUSE + 0x9c), Ok(0x11));
+        assert_eq!(bus.read8(EFUSE + 0x9f), Ok(0x44));
+        assert_eq!(bus.read16(EFUSE + 0x9d), Ok(0x3322));
+        assert_eq!(bus.read16(EFUSE + 0x9f), Ok(0x5544));
+
+        assert_eq!(bus.read8(0x6003_8000), Err(Fault::Prohibited));
+        assert_eq!(bus.read16(0x6003_8000), Err(Fault::Prohibited));
     }
 
     #[test]

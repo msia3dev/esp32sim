@@ -14,10 +14,61 @@ impl Efuse {
         e
     }
     pub fn read(&self, off: u32) -> u32 { self.ram.read(off) }
-    pub fn write(&mut self, off: u32, v: u32) { match off { 0x1d4 => {} /* CMD: read/pgm done immediately */ _ => self.ram.write(off, v) } }
+    pub fn write(&mut self, off: u32, v: u32) {
+        match off {
+            0x1d4 => {                                                     // CMD: read/pgm done immediately
+                if v & 2 != 0 { self.program((v >> 2) & 0xf); }
+            }
+            _ => self.ram.write(off, v)
+        }
+    }
+
+    fn program(&mut self, block: u32) {
+        let (start, words) = match block {
+            0 => (0x2c, 6),
+            1 => (0x44, 6),
+            2 => (0x5c, 8),
+            3..=10 => (0x7c + (block - 3) * 0x20, 8),
+            _ => return,
+        };
+        for word in 0..words {
+            let staged = self.ram.read(word * 4);
+            let off = start + word * 4;
+            self.ram.write(off, self.ram.read(off) | staged);              // eFuse bits are one-way
+        }
+    }
 }
 
 impl Device for Efuse {
     fn read(&mut self, off: u32) -> u32 { Efuse::read(self, off) }
     fn write(&mut self, off: u32, v: u32) -> WriteEffect { Efuse::write(self, off, v); WriteEffect::NONE }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn program_command_burns_staged_words_into_the_selected_block() {
+        let mut efuse = Efuse::new([0; 6]);
+        efuse.write(0, 0x0000_0003);
+        efuse.write(4, 0x1122_3344);
+
+        efuse.write(0x1d4, (4 << 2) | 2);
+
+        assert_eq!(efuse.read(0x9c), 0x0000_0003);
+        assert_eq!(efuse.read(0xa0), 0x1122_3344);
+        assert_eq!(efuse.read(0xbc), 0);
+        assert_eq!(efuse.read(0x1d4), 0);
+    }
+
+    #[test]
+    fn programming_can_only_set_additional_bits() {
+        let mut efuse = Efuse::new([0; 6]);
+        efuse.ram.write(0x9c, 0x0000_0001);
+        efuse.write(0, 0x0000_0002);
+        efuse.write(0x1d4, (4 << 2) | 2);
+
+        assert_eq!(efuse.read(0x9c), 0x0000_0003);
+    }
 }
