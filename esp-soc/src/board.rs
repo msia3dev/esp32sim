@@ -12,6 +12,14 @@ pub struct BoardEdge {
     pub level: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PanelControl {
+    pub name: &'static str,
+    pub label: &'static str,
+    pub x: u16,
+    pub y: u16,
+}
+
 /// What a board does with the SoC's pin-level activity.
 pub trait BoardModel {
     fn name(&self) -> &'static str;
@@ -45,6 +53,9 @@ pub trait BoardModel {
     /// Preferred clockwise presentation rotation for the dashboard. Raw framebuffer/PNG data
     /// remains in controller coordinates; a URL `?rotate=` selection overrides this hint.
     fn display_rotation(&self) -> u16 { 0 }
+    /// Optional controls rendered directly below the dashboard display. Coordinates are in raw
+    /// panel space and are delivered through the same touch path as a framebuffer pointer event.
+    fn panel_controls(&self) -> Vec<PanelControl> { Vec::new() }
     /// Completed display frames (for the UI's statistics line).
     fn display_frames(&self) -> u64 { 0 }
     /// Cheap change counter of the display (`display().3` without building the frame).

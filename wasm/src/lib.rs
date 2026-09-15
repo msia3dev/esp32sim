@@ -8,7 +8,7 @@
 //! feeding the page's inputs.
 use esp_soc::observers::{BlockProfile, Coverage, IrqLatency};
 use esp_soc::web::{json_escape, WebServer};
-use esp_soc::{Machine, Soc, SocBus, Stop};
+use esp_soc::{Machine, PanelControl, Soc, SocBus, Stop};
 use std::any::Any;
 
 #[cfg(target_arch = "wasm32")]
@@ -23,6 +23,7 @@ trait MachineApi {
     fn boot(&mut self, app_direct: bool) -> Result<(), String>;
     fn board_name(&self) -> String;
     fn board_rotation(&self) -> u16;
+    fn panel_controls(&self) -> Vec<PanelControl>;
     fn web(&self) -> Option<&WebServer>;
     fn run_slice(&mut self, cycles: u32) -> u32;
     fn cpu_hz(&self) -> f64;
@@ -51,6 +52,7 @@ impl<S: Soc> MachineApi for Machine<S> {
     fn boot(&mut self, app_direct: bool) -> Result<(), String> { if app_direct { self.boot_app(0x10000).map(|_| ()) } else { self.boot_rom(); Ok(()) } }
     fn board_name(&self) -> String { self.bus.board_ref().name().to_string() }
     fn board_rotation(&self) -> u16 { self.bus.board_ref().display_rotation() }
+    fn panel_controls(&self) -> Vec<PanelControl> { self.bus.board_ref().panel_controls() }
     fn web(&self) -> Option<&WebServer> { self.web.as_ref() }
     fn run_slice(&mut self, cycles: u32) -> u32 {
         self.max_cycles = self.bus.cycles() + cycles as u64;
@@ -370,7 +372,8 @@ pub unsafe extern "C" fn esp32sim_boot(e: *mut Emu, app_direct: u32) -> u32 {
     // the WebSocket server announces the board in its per-client hello; here there is one client
     let name = e.m.board_name();
     let rotation = e.m.board_rotation();
-    if let Some(w) = e.m.web() { w.send_text(&format!("{{\"t\":\"board\",\"name\":\"{}\",\"rotate\":{}}}", name, rotation)); }
+    let controls = e.m.panel_controls().iter().map(|control| format!("{{\"name\":\"{}\",\"label\":\"{}\",\"x\":{},\"y\":{}}}", json_escape(control.name), json_escape(control.label), control.x, control.y)).collect::<Vec<_>>().join(",");
+    if let Some(w) = e.m.web() { w.send_text(&format!("{{\"t\":\"board\",\"name\":\"{}\",\"rotate\":{},\"controls\":[{}]}}", name, rotation, controls)); }
     e.booted = true; 0
 }
 

@@ -57,6 +57,10 @@
   input[type=text] { flex:1; min-width:260px; border:1px solid #e5e7eb; border-radius:8px; padding:7px 10px; font-family:ui-monospace,Menlo,monospace; }
   button.act { background:#fff; border:1px solid #d1d5db; border-radius:8px; padding:6px 12px; cursor:pointer; }
   button.act:hover { border-color:var(--acc); }
+  #lcdcontrols { display:none; justify-content:center; gap:14px; margin:12px auto 0; }
+  .panel-control { width:64px; height:42px; color:#e5e7eb; border:1px solid #40444a; border-radius:10px; background:#25282d; box-shadow:inset 0 -3px 0 rgba(0,0,0,.3); cursor:pointer; font-size:20px; font-weight:650; user-select:none; }
+  .panel-control:hover { border-color:var(--acc); }
+  .panel-control:active, .panel-control.down { transform:translateY(2px); color:#fff; background:#343840; box-shadow:inset 0 1px 0 rgba(255,255,255,.08); }
   #tftbig { width:480px; height:240px; image-rendering:pixelated; background:#000; border-radius:6px; border:3px solid #222; }
   .boardbtn { display:inline-block; padding:6px 14px; border-radius:8px; background:#d9d9dc; box-shadow: inset 0 -4px 0 rgba(0,0,0,.25); cursor:pointer; user-select:none; font-weight:600; }
   .boardbtn.down { box-shadow: inset 0 2px 0 rgba(0,0,0,.35); transform: translateY(2px); }
@@ -100,6 +104,7 @@
     <div class="card" id="lcdpanel" style="display:none">
       <div class="row"><strong>Panel</strong><span class="st" id="lcdstat">ST7701S 480×480 over the RGB bus — click/drag to touch</span><span style="flex:1"></span><label class="st">rotate <select id="lcdrot"><option value="0">0°</option><option value="90">90°</option><option value="180">180°</option><option value="270">270°</option></select></label></div>
       <canvas id="lcd" width="480" height="480" style="margin-top:8px;width:480px;height:480px;border-radius:12px;background:#000;cursor:crosshair;touch-action:none"></canvas>
+      <div id="lcdcontrols" aria-label="Panel controls"></div>
       <div class="row" id="lcdextras" style="display:none;margin-top:8px"><span class="boardbtn" id="lcdboot" data-pin="9">BOOT</span><span class="st">press to switch all-channel / single-channel scan</span><span class="led" id="lcdled" title="WS2812"></span><span class="st">WS2812</span></div>
     </div>
     <div class="card" id="netpanel" style="display:none">
@@ -221,6 +226,23 @@ function setLcdRotation(deg) {
   deg = [0, 90, 180, 270].includes(+deg) ? +deg : 0;
   lcdRotation = deg; $('#lcdrot').value = String(deg); paintLcd();
 }
+function setPanelControls(controls) {
+  const row = $('#lcdcontrols'); row.replaceChildren();
+  for (const control of controls || []) {
+    const button = document.createElement('button'); button.type = 'button'; button.className = 'panel-control';
+    button.textContent = control.label; button.setAttribute('aria-label', control.name);
+    let down = false;
+    const press = () => { if (down) return; down = true; button.classList.add('down'); send({t:'touch', x:control.x, y:control.y, down:1}); };
+    const release = () => { if (!down) return; down = false; button.classList.remove('down'); send({t:'touch', x:control.x, y:control.y, down:0}); };
+    button.onpointerdown = (event) => { event.preventDefault(); button.setPointerCapture(event.pointerId); press(); };
+    button.onpointerup = button.onpointercancel = button.onlostpointercapture = release;
+    button.onkeydown = (event) => { if (!event.repeat && (event.key === ' ' || event.key === 'Enter')) { event.preventDefault(); press(); } };
+    button.onkeyup = (event) => { if (event.key === ' ' || event.key === 'Enter') { event.preventDefault(); release(); } };
+    button.onblur = release;
+    row.append(button);
+  }
+  row.style.display = row.children.length ? 'flex' : 'none';
+}
 function drawFrame(buf) {
   const dv = new DataView(buf); const w = dv.getUint16(1, true), h = dv.getUint16(3, true);
   if (w > 160) {   // a panel, not the Atech TFT
@@ -313,7 +335,7 @@ function handleMessage(data) {
     if (m.t === 'board') window.dispatchEvent(new CustomEvent('esp32sim-board', { detail: m.name }));
     if (m.t === 'serial') { if (m.src === terminal.src) terminal.write(m.data); addSerial(m.src, m.data); }
     else if (m.t === 'emu') addSerial('usb', m.msg + '\n');
-    else if (m.t === 'board') { boardName = m.name; setLcdRotation(new URLSearchParams(location.search).get('rotate') ?? m.rotate ?? (window.EmuLink && window.EmuLink.displayRotate) ?? 0); document.body.classList.toggle('bare', m.name !== 'atech14'); $('#line').placeholder = lineHint(m.name); if (m.name === 'atech14') { document.querySelector('h1').textContent = 'ESP32‑S3 emulator — Atech 14‑port board'; } else if (m.name === 'esp32c3') { document.querySelector('h1').textContent = 'ESP32‑C3 emulator — RISC-V, console only'; } else if (m.name === 'esp32c6') { document.querySelector('h1').textContent = 'ESP32‑C6 emulator — RISC-V, console only'; } else if (m.name === 'waveshare-c6-lcd147') { document.querySelector('h1').textContent = 'ESP32‑C6 emulator — Waveshare ESP32‑C6‑LCD‑1.47'; $('#lcdpanel').style.display = ''; $('#lcdstat').textContent = 'ST7789 172×320 over SPI2 + GDMA — nothing drawn yet: this firmware has not written the display'; $('#lcd').style.display = 'none'; $('#lcdextras').style.display = ''; } else if (m.name === 'none') { document.querySelector('h1').textContent = 'ESP32‑S3 emulator — bare module'; document.querySelector(`.tabs button[data-src="${window.EmuLink && window.EmuLink.terminal ? 'term' : 'uart0'}"]`).click(); } if (m.name === 'waveshare-cam') { document.querySelector('h1').textContent = 'ESP32‑S3 emulator — Waveshare ESP32‑S3‑CAM‑OV5640'; $('#campanel').style.display = ''; } if (m.name === 'waveshare-lcd4b') { document.querySelector('h1').textContent = 'ESP32‑S3 emulator — Waveshare ESP32‑S3‑Touch‑LCD‑4B'; $('#lcdpanel').style.display = ''; }  syncTitle(); }
+    else if (m.t === 'board') { boardName = m.name; setLcdRotation(new URLSearchParams(location.search).get('rotate') ?? m.rotate ?? (window.EmuLink && window.EmuLink.displayRotate) ?? 0); setPanelControls(m.controls); document.body.classList.toggle('bare', m.name !== 'atech14'); $('#line').placeholder = lineHint(m.name); if (m.name === 'atech14') { document.querySelector('h1').textContent = 'ESP32‑S3 emulator — Atech 14‑port board'; } else if (m.name === 'esp32c3') { document.querySelector('h1').textContent = 'ESP32‑C3 emulator — RISC-V, console only'; } else if (m.name === 'esp32c6') { document.querySelector('h1').textContent = 'ESP32‑C6 emulator — RISC-V, console only'; } else if (m.name === 'waveshare-c6-lcd147') { document.querySelector('h1').textContent = 'ESP32‑C6 emulator — Waveshare ESP32‑C6‑LCD‑1.47'; $('#lcdpanel').style.display = ''; $('#lcdstat').textContent = 'ST7789 172×320 over SPI2 + GDMA — nothing drawn yet: this firmware has not written the display'; $('#lcd').style.display = 'none'; $('#lcdextras').style.display = ''; } else if (m.name === 'none') { document.querySelector('h1').textContent = 'ESP32‑S3 emulator — bare module'; document.querySelector(`.tabs button[data-src="${window.EmuLink && window.EmuLink.terminal ? 'term' : 'uart0'}"]`).click(); } if (m.name === 'waveshare-cam') { document.querySelector('h1').textContent = 'ESP32‑S3 emulator — Waveshare ESP32‑S3‑CAM‑OV5640'; $('#campanel').style.display = ''; } if (m.name === 'waveshare-lcd4b') { document.querySelector('h1').textContent = 'ESP32‑S3 emulator — Waveshare ESP32‑S3‑Touch‑LCD‑4B'; $('#lcdpanel').style.display = ''; }  syncTitle(); }
     if (m.t === 'board' && m.name === 'waveshare-amoled18-v2') { document.querySelector('h1').textContent = 'ESP32‑S3 emulator, Waveshare ESP32‑S3‑Touch‑AMOLED‑1.8 V2'; $('#lcdstat').textContent = 'CO5300 368×448 over QSPI, click or drag to touch'; const lcd = $('#lcd'); const quarter = lcdRotation === 90 || lcdRotation === 270; lcd.style.width = (quarter ? 448 : 368) + 'px'; lcd.style.height = (quarter ? 368 : 448) + 'px'; $('#lcdpanel').style.display = ''; syncTitle(); }
     else if (m.t === 'grid') { drawGrid(m.id, m.leds); }
     else if (m.t === 'net') {
