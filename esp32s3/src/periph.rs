@@ -367,11 +367,12 @@ impl Device for I2cMst {
     fn write(&mut self, off: u32, v: u32) -> WriteEffect { I2cMst::write(self, off, v); WriteEffect::NONE }
 }
 /// The FE (RF front end) block is otherwise unmodelled; the one bit the WiFi blob polls is the
-/// "IQ estimation done" flag at +0x174, set once a virtual AP exists (`pre_access` keeps it current).
+/// "IQ estimation done" flag at +0x174. Calibration is local analog work and must complete even
+/// when no virtual AP is attached, so any command write completes the emulated handshake.
 pub struct FeIq { word: u32, pub done: bool }
 impl Device for FeIq {
     fn read(&mut self, _off: u32) -> u32 { self.word | if self.done { 1 << 16 } else { 0 } }
-    fn write(&mut self, _off: u32, v: u32) -> WriteEffect { self.word = v; WriteEffect::NONE }
+    fn write(&mut self, _off: u32, v: u32) -> WriteEffect { self.word = v; self.done = true; WriteEffect::NONE }
 }
 
 // ------------------------------------------------------------------ External-memory AES-XTS
@@ -504,7 +505,6 @@ impl DeviceSet for Peripherals {
         match block {
             0xc2 if !write => self.intmatrix.status = self.source_status(),   // INTERRUPT_*_STATUS reads the live sources
             0x35 => self.wifi.now_cycles = self.clock.cycles(),               // TSF timestamps
-            0x06 => self.fe.done = self.wifi.ap.is_some(),                    // IQ estimation completes once there is an AP
             _ => {}
         }
     }
@@ -655,5 +655,19 @@ mod flash_encrypt_tests {
         xts.write(0x54, 1);
         assert_eq!(xts.read(0x58), 0);
         assert!(xts.take_ready().is_none());
+    }
+}
+
+#[cfg(test)]
+mod fe_iq_tests {
+    use super::*;
+
+    #[test]
+    fn calibration_completes_without_a_virtual_access_point() {
+        let mut fe = FeIq { word: 0, done: false };
+
+        assert_eq!(fe.read(0), 0);
+        fe.write(0, 1);
+        assert_ne!(fe.read(0) & (1 << 16), 0);
     }
 }
