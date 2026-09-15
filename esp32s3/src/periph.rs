@@ -367,12 +367,12 @@ impl Device for I2cMst {
     fn write(&mut self, off: u32, v: u32) -> WriteEffect { I2cMst::write(self, off, v); WriteEffect::NONE }
 }
 /// The FE (RF front end) block is otherwise unmodelled; the one bit the WiFi blob polls is the
-/// "IQ estimation done" flag at +0x174. Calibration is local analog work and must complete even
-/// when no virtual AP is attached, so any command write completes the emulated handshake.
-pub struct FeIq { word: u32, pub done: bool }
+/// "IQ estimation done" flag at +0x174. The start command lives in a different analog block, so
+/// reads of this status word must report completion independently of writes here or AP presence.
+pub struct FeIq { word: u32 }
 impl Device for FeIq {
-    fn read(&mut self, _off: u32) -> u32 { self.word | if self.done { 1 << 16 } else { 0 } }
-    fn write(&mut self, _off: u32, v: u32) -> WriteEffect { self.word = v; self.done = true; WriteEffect::NONE }
+    fn read(&mut self, _off: u32) -> u32 { self.word | (1 << 16) }
+    fn write(&mut self, _off: u32, v: u32) -> WriteEffect { self.word = v; WriteEffect::NONE }
 }
 
 // ------------------------------------------------------------------ External-memory AES-XTS
@@ -516,7 +516,7 @@ impl Peripherals {
             usb: UsbSerialJtag::new(CPU_HZ), uart: [Uart::new(UartLayout::S3), Uart::new(UartLayout::S3), Uart::new(UartLayout::S3)], systimer: Systimer::new(),
             timg: [TimerGroup::new(), TimerGroup::new()], intmatrix: IntMatrix::new(), gpio: Gpio::new(), rtc: RtcCntl::new(),
             efuse: Efuse::new(mac), system: SystemRegs::new(0x30), extmem: Extmem::new(), spi0: SpiMem::new(false), spi1: SpiMem::new(true),
-            i2c: [crate::i2c::I2c::new(), crate::i2c::I2c::new()], lcd_cam: LcdCam::new(), spi2: GpSpi::new(), pcnt: Pcnt::new(), wifi: WifiMac::new(), fe: FeIq { word: 0, done: false },
+            i2c: [crate::i2c::I2c::new(), crate::i2c::I2c::new()], lcd_cam: LcdCam::new(), spi2: GpSpi::new(), pcnt: Pcnt::new(), wifi: WifiMac::new(), fe: FeIq { word: 0 },
             aes: Aes::new(), rsa: Rsa::new(), sha: Sha::new(), flash_encrypt: FlashEncrypt::new(), wdev: Wdev::new(), i2c_mst: I2cMst::new(), gdma: Gdma::new(), i2s0: I2s::new(CPU_HZ), i2s1: I2s::new(CPU_HZ), rmt: Rmt::new(CPU_HZ),
             io_mux: RegRam::new(), misc: Misc::new(), fake_reads: std::env::var("ESP_EMU_FAKE_READ").ok().map(|v| v.split(',').filter_map(|e| { let mut p = e.split(':'); let a = u32::from_str_radix(p.next()?.trim_start_matches("0x"), 16).ok()?; let o = u32::from_str_radix(p.next().unwrap_or("0").trim_start_matches("0x"), 16).ok()?; let m = u32::from_str_radix(p.next().unwrap_or("ffffffff").trim_start_matches("0x"), 16).ok()?; Some((a, (o, m))) }).collect()).unwrap_or_default(),
             clock: Self::new_clock(),
@@ -664,10 +664,8 @@ mod fe_iq_tests {
 
     #[test]
     fn calibration_completes_without_a_virtual_access_point() {
-        let mut fe = FeIq { word: 0, done: false };
+        let mut fe = FeIq { word: 0 };
 
-        assert_eq!(fe.read(0), 0);
-        fe.write(0, 1);
         assert_ne!(fe.read(0) & (1 << 16), 0);
     }
 }
