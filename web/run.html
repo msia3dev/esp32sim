@@ -224,7 +224,11 @@ function setLcdRotation(deg) {
 function drawFrame(buf) {
   const dv = new DataView(buf); const w = dv.getUint16(1, true), h = dv.getUint16(3, true);
   if (w > 160) {   // a panel, not the Atech TFT
-    const c = $('#lcd'); if (c.style.display === 'none') { c.style.display = ''; $('#lcdstat').textContent = 'ST7789 172×320 over SPI2 + GDMA'; }   // the first frame: the firmware drives it after all
+    // A native/custom board may not be in the dashboard's presentation-only board list. The
+    // framebuffer itself is authoritative: receiving one must reveal its parent panel too.
+    $('#lcdpanel').style.display = '';
+    const c = $('#lcd'); if (c.style.display === 'none') c.style.display = '';
+    if (!['waveshare-c6-lcd147', 'waveshare-lcd4b', 'waveshare-amoled18-v2'].includes(boardName)) $('#lcdstat').textContent = `RGB565 framebuffer ${w}×${h}`;
     if (lcdRaw.width !== w || lcdRaw.height !== h) { lcdRaw.width = w; lcdRaw.height = h; }
     const rctx = lcdRaw.getContext('2d'); const im = rctx.createImageData(w, h); const d = im.data;
     for (let i = 0; i < w * h; i++) { const p = dv.getUint16(5 + i * 2, true); d[i*4] = (p >> 11) * 255 / 31; d[i*4+1] = ((p >> 5) & 63) * 255 / 63; d[i*4+2] = (p & 31) * 255 / 31; d[i*4+3] = 255; }
