@@ -42,6 +42,9 @@ pub trait BoardModel {
     fn lcd_frame(&mut self, _w: u32, _h: u32, _rgb565: &[u8]) {}
     /// The board's display for the UI/PNG: (width, height, RGB565 pixels, change counter).
     fn display(&self) -> Option<(u32, u32, Vec<u16>, u64)> { None }
+    /// Preferred clockwise presentation rotation for the dashboard. Raw framebuffer/PNG data
+    /// remains in controller coordinates; a URL `?rotate=` selection overrides this hint.
+    fn display_rotation(&self) -> u16 { 0 }
     /// Completed display frames (for the UI's statistics line).
     fn display_frames(&self) -> u64 { 0 }
     /// Cheap change counter of the display (`display().3` without building the frame).

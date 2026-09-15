@@ -22,6 +22,7 @@ trait MachineApi {
     fn write_flash(&mut self, off: usize, d: &[u8]) -> Result<(), String>;
     fn boot(&mut self, app_direct: bool) -> Result<(), String>;
     fn board_name(&self) -> String;
+    fn board_rotation(&self) -> u16;
     fn web(&self) -> Option<&WebServer>;
     fn run_slice(&mut self, cycles: u32) -> u32;
     fn cpu_hz(&self) -> f64;
@@ -49,6 +50,7 @@ impl<S: Soc> MachineApi for Machine<S> {
     fn write_flash(&mut self, off: usize, d: &[u8]) -> Result<(), String> { Machine::write_flash(self, off, d) }
     fn boot(&mut self, app_direct: bool) -> Result<(), String> { if app_direct { self.boot_app(0x10000).map(|_| ()) } else { self.boot_rom(); Ok(()) } }
     fn board_name(&self) -> String { self.bus.board_ref().name().to_string() }
+    fn board_rotation(&self) -> u16 { self.bus.board_ref().display_rotation() }
     fn web(&self) -> Option<&WebServer> { self.web.as_ref() }
     fn run_slice(&mut self, cycles: u32) -> u32 {
         self.max_cycles = self.bus.cycles() + cycles as u64;
@@ -367,7 +369,8 @@ pub unsafe extern "C" fn esp32sim_boot(e: *mut Emu, app_direct: u32) -> u32 {
     if let Err(msg) = e.m.boot(app_direct != 0) { log(&format!("[emu] boot: {}", msg)); return 1; }
     // the WebSocket server announces the board in its per-client hello; here there is one client
     let name = e.m.board_name();
-    if let Some(w) = e.m.web() { w.send_text(&format!("{{\"t\":\"board\",\"name\":\"{}\"}}", name)); }
+    let rotation = e.m.board_rotation();
+    if let Some(w) = e.m.web() { w.send_text(&format!("{{\"t\":\"board\",\"name\":\"{}\",\"rotate\":{}}}", name, rotation)); }
     e.booted = true; 0
 }
 
