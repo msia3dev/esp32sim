@@ -10,7 +10,7 @@ use std::path::PathBuf;
 pub mod cooja;
 
 fn usage(chip: &str) -> ! {
-    eprintln!("usage: esp32sim [--chip s3|c3|c6] --boot rom|app --bootloader B.bin --ptable P.bin --app A.bin [--elf X.elf]... [options]");
+    eprintln!("usage: esp32sim [--chip s3|c3|c6] --boot rom|app --bootloader B.bin --ptable P.bin [--ptable-offset 0xNNNN] --app A.bin [--app-offset 0xNNNN] [--elf X.elf]... [options]");
     eprintln!("       see docs/cli.md for every flag (default chip here: {})", chip);
     std::process::exit(2)
 }
@@ -22,7 +22,7 @@ fn pair(s: &str, dflt: usize) -> (u32, usize) { match s.split_once(',') { Some((
 #[derive(Default)]
 pub struct Opts {
     pub chip: String,
-    pub rom: Option<PathBuf>, pub bootloader: Option<String>, pub ptable: Option<String>, pub app: Option<String>, pub elfs: Vec<String>,
+    pub rom: Option<PathBuf>, pub bootloader: Option<String>, pub ptable: Option<String>, pub ptable_offset: Option<u32>, pub app: Option<String>, pub app_offset: Option<u32>, pub elfs: Vec<String>,
     pub flash_image: Option<String>, pub flash_at: Vec<String>, pub boot: Option<String>, pub flash_mb: Option<usize>, pub psram_mb: Option<usize>,
     pub mac: Option<[u8; 6]>, pub strap: Option<u32>, pub reset_cause: Option<u32>, pub efuse_regs: Option<String>, pub regs_init: Option<String>,
     pub board: String, pub wifi: Option<String>, pub net: String, pub cam_image: Option<String>, pub cam_fps: f64,
@@ -48,6 +48,8 @@ pub fn parse(args: &[String], default_chip: &str) -> Opts {
             "--rom" => o.rom = Some(PathBuf::from(next())),
             "--bootloader" => o.bootloader = Some(next()),
             "--ptable" => o.ptable = Some(next()),
+            "--ptable-offset" => o.ptable_offset = Some(hex(&next(), "ptable-offset")),
+            "--app-offset" => o.app_offset = Some(hex(&next(), "app-offset")),
             "--app" => o.app = Some(next()),
             "--elf" => o.elfs.push(next()),
             "--flash-image" => o.flash_image = Some(next()),
@@ -276,8 +278,8 @@ fn prepare<S: Soc>(m: &mut Machine<S>, o: &Opts) -> String {
     }
     if let Some(p) = &o.flash_image { m.write_flash(0, &std::fs::read(p).expect("flash image")).unwrap(); }
     if let Some(p) = &o.bootloader { m.write_flash(0x0, &std::fs::read(p).expect("bootloader")).unwrap(); }
-    if let Some(p) = &o.ptable { m.write_flash(0x8000, &std::fs::read(p).expect("ptable")).unwrap(); }
-    if let Some(p) = &o.app { m.write_flash(0x10000, &std::fs::read(p).expect("app")).unwrap(); }
+    if let Some(p) = &o.ptable { m.write_flash(o.ptable_offset.unwrap_or(0x8000) as usize, &std::fs::read(p).expect("ptable")).unwrap(); }
+    if let Some(p) = &o.app { m.write_flash(o.app_offset.unwrap_or(0x10000) as usize, &std::fs::read(p).expect("app")).unwrap(); }
     for spec in &o.flash_at {
         let (off, path) = spec.split_once('=').unwrap_or_else(|| { eprintln!("--flash-at needs OFFSET=FILE"); std::process::exit(2) });
         let off = usize::from_str_radix(off.trim_start_matches("0x"), 16).unwrap_or_else(|_| { eprintln!("--flash-at: bad offset {}", off); std::process::exit(2) });
@@ -300,7 +302,7 @@ fn prepare<S: Soc>(m: &mut Machine<S>, o: &Opts) -> String {
     }
     if o.no_jit { for c in &mut m.cores { c.set_jit(false); } }
     match boot.as_str() {
-        "app" => match m.boot_app(0x10000) { Ok(entry) => eprintln!("[emu] app boot: entry {:#010x} {}", entry, m.sym(entry)), Err(e) => { eprintln!("[emu] {}", e); std::process::exit(2) } },
+        "app" => match m.boot_app(o.app_offset.unwrap_or(0x10000) as usize) { Ok(entry) => eprintln!("[emu] app boot: entry {:#010x} {}", entry, m.sym(entry)), Err(e) => { eprintln!("[emu] {}", e); std::process::exit(2) } },
         "rom" => { m.boot_rom(); eprintln!("[emu] ROM boot from reset vector {:#010x}", m.cores[0].pc()); }
         _ => { eprintln!("--boot app|rom"); std::process::exit(2); }
     }

@@ -15,6 +15,8 @@ register presets).
 | --- | --- |
 | `--boot rom\|app` | `rom`: start at the mask ROM reset vector (real boot chain). `app`: load the app image segments and jump to its entry |
 | `--bootloader F`, `--ptable F`, `--app F` | written to flash at 0x0 / 0x8000 / 0x10000 |
+| `--ptable-offset 0xNNNN` | where `--ptable` (and thus the partition table itself) is written, default 0x8000 — match your project's `CONFIG_PARTITION_TABLE_OFFSET` if it isn't the default (a bootloader built with Secure Boot V2 + Flash Encryption is often larger than the default 0x8000 gap and needs this pushed out, or it'll silently overlap and corrupt the tail of the bootloader image) |
+| `--app-offset 0xNNNN` | where `--app` is written (and, in `--boot app`, where its image is read from), default 0x10000 — match the offset of the partition you're booting (e.g. the `factory` app partition's actual offset from your partition table), which can differ once earlier partitions have been resized or reordered |
 | `--flash-image F` | whole flash dump written at 0 |
 | `--chip s3\|c3\|c6` | which chip (default s3) |
 | `--rom F` | mask ROM ELF (default: the chip's in `~/.espressif/tools/esp-rom-elfs/*/`) |
