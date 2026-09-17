@@ -34,7 +34,9 @@ impl Efuse {
 
     pub fn load_state(&mut self, data: &[u8]) -> Result<(), String> {
         if data.len() != EFUSE_STATE_BYTES { return Err(format!("eFuse state is {} bytes, expected {}", data.len(), EFUSE_STATE_BYTES)); }
-        for (word, bytes) in self.physical.iter_mut().zip(data.chunks_exact(4)) { *word = u32::from_le_bytes(bytes.try_into().unwrap()); }
+        let (words, remainder) = data.as_chunks::<4>();
+        debug_assert!(remainder.is_empty());
+        for (word, bytes) in self.physical.iter_mut().zip(words) { *word = u32::from_le_bytes(*bytes); }
         self.rebuild_shadows(); self.dirty = false; Ok(())
     }
 
