@@ -82,13 +82,16 @@ with production flash ciphertext.
 
 ### eFuse
 
-The ESP32-S3 eFuse-state file is exactly 336 bytes: 84 little-endian words in
+The native ESP32-S3 eFuse-state file is 336 bytes: 84 little-endian words in
 physical block order. Program staging and derived read-shadow registers are not
 serialized. One-way programming, whole-block write protection and protected-key
 read hiding are enforced by the device model.
 
-The format is intentionally described as esp32sim ESP32-S3 state. QEMU file
-compatibility is not claimed until a byte-for-byte compatibility fixture exists.
+This 336-byte payload matches Espressif QEMU's `ESPEfuseBlocks` byte for byte:
+blocks 0 and 1 contain six words each and blocks 2 through 10 contain eight.
+esp32sim also accepts QEMU's commonly used 1 KiB backing file and reads/writes
+the compatible 336-byte payload at offset zero while preserving its padding.
+New esp32sim state files remain the compact 336-byte form.
 
 eFuse state may contain security-sensitive material if firmware burns it. Keep
 state files private, never commit production keys, and avoid printing or sharing
@@ -121,7 +124,7 @@ to one ESP32-S3 machine, not C3/C6 or multi-node network manifests.
 - **My new firmware did not load:** an existing flash state took precedence.
   Select a fresh state path or delete the old state intentionally.
 - **State size error:** `--flash-mb` and the flash-state file must agree; eFuse
-  state must be exactly 336 bytes.
+  state must be either the native 336-byte payload or a 1 KiB QEMU backing file.
 - **NVS disappeared:** both runs must use the same `--flash-state` path or the
   same browser profile and origin.
 - **An eFuse bit will not clear:** physical eFuses are one-time programmable;

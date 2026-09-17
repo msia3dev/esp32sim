@@ -152,8 +152,8 @@ impl SocBus {
 
     pub fn configure_efuse_state(&mut self, path: impl Into<PathBuf>) -> Result<bool, String> {
         let path = path.into();
-        match StateFile::open(&path, crate::periph::EFUSE_STATE_BYTES)? {
-            Some((file, bytes)) => { self.periph.efuse.load_state(&bytes)?; self.efuse_state = Some(StateSlot { path, file: Some(file), loaded: true }); Ok(true) }
+        match StateFile::open_sizes(&path, &[crate::periph::EFUSE_STATE_BYTES, 1024])? {
+            Some((file, bytes)) => { self.periph.efuse.load_state(&bytes[..crate::periph::EFUSE_STATE_BYTES])?; self.efuse_state = Some(StateSlot { path, file: Some(file), loaded: true }); Ok(true) }
             None => { self.efuse_state = Some(StateSlot { path, file: None, loaded: false }); Ok(false) }
         }
     }
@@ -1262,6 +1262,17 @@ mod gp_spi_board_tests {
         }
         let mut bus = SocBus::new(1024, 0, [0; 6]); assert!(bus.configure_efuse_state(&path).unwrap());
         assert_eq!(bus.periph.efuse.read(0x9c), 0x55); std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn qemu_sized_efuse_backing_preserves_padding() {
+        const EFUSE: u32 = 0x6000_7000;
+        let path = state_path("qemu-efuse.bin"); let _ = std::fs::remove_file(&path);
+        let mut backing = vec![0u8; 1024]; backing[esp_periph::EFUSE_STATE_BYTES..].fill(0xa5); std::fs::write(&path, &backing).unwrap();
+        let mut bus = SocBus::new(1024, 0, [0; 6]); assert!(bus.configure_efuse_state(&path).unwrap());
+        bus.write32(EFUSE, 0x55).unwrap(); bus.write32(EFUSE + 0x1d4, (4 << 2) | 2).unwrap(); bus.flush_storage().unwrap(); drop(bus);
+        let saved = std::fs::read(&path).unwrap(); assert_eq!(saved.len(), 1024); assert!(saved[esp_periph::EFUSE_STATE_BYTES..].iter().all(|byte| *byte == 0xa5));
+        std::fs::remove_file(path).unwrap();
     }
 
     struct ProbeBoard {

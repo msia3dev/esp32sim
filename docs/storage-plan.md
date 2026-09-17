@@ -102,10 +102,10 @@ The canonical in-memory representation is the physical eFuse blocks, not the
 program staging registers or derived read-shadow registers. Serialization uses
 little-endian words in physical block order.
 
-The current format is esp32sim's 336-byte ESP32-S3 physical payload. The
-physical payload and QEMU's backing-file extent are treated separately; QEMU
-compatibility is not claimed because no byte-for-byte compatibility fixture has
-yet been established.
+The native format is esp32sim's 336-byte ESP32-S3 physical payload. A fixture
+verifies the same block boundaries as Espressif QEMU's `ESPEfuseBlocks`, and the
+loader also accepts QEMU's commonly used 1 KiB backing file while preserving
+the bytes beyond the compatible payload.
 
 The loader must reject truncated, oversized or unsupported layouts. It must
 never print the contents of key-purpose blocks or other fuse data. Diagnostics

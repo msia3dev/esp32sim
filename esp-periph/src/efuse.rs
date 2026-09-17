@@ -120,4 +120,15 @@ mod tests {
         efuse.write(0, 0x55); efuse.write(0x1d4, (4 << 2) | 2); assert_eq!(efuse.read(0x9c), 0);
         let mut state = efuse.state_bytes(); state[4] |= 1; efuse.load_state(&state).unwrap(); assert_eq!(efuse.read(0x9c), 0);
     }
+    #[test]
+    fn serialized_block_offsets_match_espressif_qemu() {
+        let mut data = Vec::with_capacity(EFUSE_STATE_BYTES);
+        for word in 0..EFUSE_STATE_WORDS as u32 { data.extend_from_slice(&(if word == 1 { 0 } else { word }).to_le_bytes()); }
+        let mut efuse = Efuse::new([0; 6]); efuse.load_state(&data).unwrap();
+        for block in 0..11 {
+            assert_eq!(efuse.read(SHADOW_BASE[block]), BLOCK_BASE[block] as u32, "block {block} start");
+            assert_eq!(efuse.read(SHADOW_BASE[block] + (BLOCK_WORDS[block] as u32 - 1) * 4), (BLOCK_BASE[block] + BLOCK_WORDS[block] - 1) as u32, "block {block} end");
+        }
+        assert_eq!(efuse.state_bytes(), data);
+    }
 }

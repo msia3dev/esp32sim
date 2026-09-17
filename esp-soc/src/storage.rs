@@ -9,6 +9,11 @@ pub struct StateFile { path: PathBuf, file: File }
 impl StateFile {
     /// Open an existing exact-sized state file. `Ok(None)` means it does not exist yet.
     pub fn open(path: impl AsRef<Path>, expected: usize) -> Result<Option<(Self, Vec<u8>)>, String> {
+        Self::open_sizes(path, &[expected])
+    }
+
+    /// Open an existing state file whose length is one of `expected`.
+    pub fn open_sizes(path: impl AsRef<Path>, expected: &[usize]) -> Result<Option<(Self, Vec<u8>)>, String> {
         let path = path.as_ref();
         let mut file = match OpenOptions::new().read(true).write(true).open(path) {
             Ok(file) => file,
@@ -16,8 +21,11 @@ impl StateFile {
             Err(e) => return Err(format!("open {}: {}", path.display(), e)),
         };
         let actual = file.metadata().map_err(|e| format!("stat {}: {}", path.display(), e))?.len() as usize;
-        if actual != expected { return Err(format!("{}: state size is {} bytes, expected {}", path.display(), actual, expected)); }
-        let mut bytes = vec![0; expected];
+        if !expected.contains(&actual) {
+            let sizes = expected.iter().map(usize::to_string).collect::<Vec<_>>().join(" or ");
+            return Err(format!("{}: state size is {} bytes, expected {}", path.display(), actual, sizes));
+        }
+        let mut bytes = vec![0; actual];
         file.read_exact(&mut bytes).map_err(|e| format!("read {}: {}", path.display(), e))?;
         Ok(Some((StateFile { path: path.to_path_buf(), file }, bytes)))
     }
@@ -64,5 +72,10 @@ mod tests {
     fn rejects_wrong_size() {
         let path = path("size.bin"); let _ = std::fs::remove_file(&path); std::fs::write(&path, [0u8; 3]).unwrap();
         assert!(StateFile::open(&path, 4).unwrap_err().contains("expected 4")); std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn accepts_one_of_multiple_sizes() {
+        let path = path("sizes.bin"); let _ = std::fs::remove_file(&path); std::fs::write(&path, [0u8; 8]).unwrap();
+        assert_eq!(StateFile::open_sizes(&path, &[4, 8]).unwrap().unwrap().1.len(), 8); std::fs::remove_file(path).unwrap();
     }
 }

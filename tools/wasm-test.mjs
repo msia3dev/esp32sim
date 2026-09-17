@@ -136,6 +136,37 @@ async function testJitHandoff() {
   console.log('ok   wasm JIT handoff: shared-memory block committed at a scheduler boundary');
 }
 
+async function testPersistentStateHandoff() {
+  const logs = [];
+  let w;
+  const blockJit = createJitHost(() => w);
+  const { instance } = await WebAssembly.instantiate(wasmBytes, { env: { ...blockJit.imports, host_log: (p, n) => logs.push(dec.decode(mem().subarray(p, p + n))) } });
+  w = instance.exports;
+  const mem = () => new Uint8Array(w.memory.buffer);
+  const withBytes = (bytes, f) => { const p = w.esp32sim_alloc(bytes.length); mem().set(bytes, p); try { return f(p, bytes.length); } finally { w.esp32sim_free(p, bytes.length); } };
+  const create = () => withBytes(enc.encode('none'), (p, n) => w.esp32sim_new(p, n, 1, 0));
+  const take = (emu, kind) => { const len = w.esp32sim_state_export(emu, kind); const p = w.esp32sim_state_ptr(emu); return mem().slice(p, p + len); };
+  const put = (emu, kind, bytes) => withBytes(bytes, (p, n) => w.esp32sim_state_import(emu, kind, p, n));
+
+  const first = create();
+  const flash = take(first, 0), efuse = take(first, 1);
+  if (flash.length !== 1 << 20 || efuse.length !== 336) throw new Error(`unexpected state sizes ${flash.length}/${efuse.length}`);
+  flash[0x1234] = 0x42;
+  if (put(first, 0, flash) !== 0) throw new Error('flash import into first profile failed');
+
+  const second = create();
+  if (put(second, 0, take(first, 0)) !== 0 || put(second, 1, efuse) !== 0) throw new Error('profile reload failed');
+  if (take(second, 0)[0x1234] !== 0x42) throw new Error('reloaded profile lost flash state');
+  const beforeBadImport = take(second, 0);
+  if (put(second, 0, new Uint8Array(3)) === 0) throw new Error('malformed flash import was accepted');
+  if (take(second, 0)[0x1234] !== beforeBadImport[0x1234]) throw new Error('malformed import changed good state');
+
+  const cleared = create();
+  if (take(cleared, 0)[0x1234] !== 0xff) throw new Error('fresh profile was not erased after clear');
+  for (const emu of [first, second, cleared]) w.esp32sim_delete(emu);
+  console.log('ok   wasm persistent state: export, reload, malformed import and clear');
+}
+
 async function runManifest(name) {
   const m = JSON.parse(readFileSync(join(fwDir, `${name}.json`), 'utf8'));
   if (m.nodes) return runNetwork(name, m);
@@ -196,5 +227,6 @@ async function runManifest(name) {
 }
 
 try { await testJitHandoff(); } catch (e) { failures++; console.error(`FAIL wasm JIT handoff: ${e.message}`); }
+try { await testPersistentStateHandoff(); } catch (e) { failures++; console.error(`FAIL wasm persistent state: ${e.message}`); }
 for (const n of names) { try { await runManifest(n); } catch (e) { failures++; console.error(`FAIL ${n}: ${e.message}`); } }
 process.exit(failures ? 1 : 0);
