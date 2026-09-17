@@ -104,6 +104,22 @@ fn wake_retires_at_its_documented_cost_and_continues_execution() {
 }
 
 #[test]
+fn prefetched_execution_matches_the_reference_step() {
+    let words = [0x7481_2340, 0x7080_0001, 0x7000_0012, 0xb000_0000];
+    let mut reference_ram = Ram::new(&words);
+    let mut prefetched_ram = reference_ram.clone();
+    let mut reference = Cpu::new(0);
+    let mut prefetched = Cpu::new(0);
+
+    for raw in words {
+        let reference_event = step(&mut reference, &mut reference_ram);
+        let prefetched_event = ulp_fsm::execute(&mut prefetched, &mut prefetched_ram, decode(raw));
+        assert_eq!(prefetched_event, reference_event);
+        assert_eq!(prefetched, reference);
+    }
+}
+
+#[test]
 fn arithmetic_flags_drive_absolute_branches() {
     let mut ram = Ram::new(&[
         0x7420_0013,

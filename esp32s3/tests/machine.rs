@@ -211,6 +211,67 @@ fn main_cpu_rtc_access_orders_after_ulp_completion_at_the_same_cycle() {
 }
 
 #[test]
+fn ulp_decode_cache_follows_rtc_page_versions() {
+    let mut m = machine();
+    m.bus.write32(esp32s3::bus::RTC_SLOW_LOW, 0x8400_0000).unwrap(); // jump 0
+    m.bus.write32(RTC_CNTL + 0x104, (1 << 27) | (1 << 23)).unwrap();
+    m.bus.write32(RTC_CNTL + 0x100, (1 << 30) | (1 << 28) | (512 << 11) | 512).unwrap();
+    m.bus.tick(48_000);
+    assert_eq!(m.bus.ulp_fsm.cpu.insn_count, 1_000);
+    assert_eq!(m.bus.ulp_fsm.decode_misses, 1);
+    assert_eq!(m.bus.ulp_fsm.decode_hits, 1_000);
+
+    m.bus.write32(esp32s3::bus::RTC_SLOW_LOW, 0xb000_0000).unwrap(); // replace loop with HALT
+    m.bus.tick(72);
+    assert!(m.bus.ulp_fsm.cpu.halted);
+    assert_eq!(m.bus.ulp_fsm.decode_misses, 2, "the main-CPU write invalidates cached ULP decode");
+}
+
+#[test]
+fn long_ulp_wait_uses_one_retirement_and_one_deadline() {
+    let mut m = machine();
+    let words = [0x4000_ffff_u32, 0xb000_0000]; // WAIT 65535; HALT
+    let program: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    esp_soc::SocBus::load_bytes(&mut m.bus, esp32s3::bus::RTC_SLOW_LOW, &program).unwrap();
+    m.bus.write32(RTC_CNTL + 0x104, (1 << 27) | (1 << 23)).unwrap();
+    m.bus.write32(RTC_CNTL + 0x100, (1 << 30) | (1 << 28) | (512 << 11) | 512).unwrap();
+    let fast_hz = esp32s3::ulp::UlpFsmEngine::rtc_fast_hz(&m.bus.periph.rtc);
+    assert_eq!(m.bus.ulp_fsm.cpu_cycles_until_deadline(fast_hz), Some(65_541 * 12));
+    assert_eq!(m.bus.next_deadline(), 256, "the generic device backstop remains conservative");
+    m.cores[0].waiting = true;
+    m.cores[0].ps = 0;
+    m.max_cycles = 65_541 * 12 + 24;
+    assert!(matches!(m.run(u64::MAX), Stop::Halted));
+    assert_eq!((m.bus.ulp_fsm.cpu.insn_count, m.bus.ulp_fsm.cpu.cycle_count), (2, 65_543));
+}
+
+#[test]
+fn ulp_results_are_independent_of_main_cpu_jit_mode() {
+    fn run(jit: bool) -> esp32s3::Machine {
+        let mut m = machine();
+        let words = [0x7481_2340_u32, 0x7480_00a1, 0x6800_0184, 0x9000_0001, 0xb000_0000];
+        let program: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        esp_soc::SocBus::load_bytes(&mut m.bus, esp32s3::bus::RTC_SLOW_LOW, &program).unwrap();
+        park(&mut m, 0, IRAM, &SPIN);
+        for core in &mut m.cores { core.set_jit(jit); }
+        m.bus.write32(RTC_CNTL + 0x104, (1 << 27) | (1 << 23)).unwrap();
+        m.bus.write32(RTC_CNTL + 0x100, (1 << 30) | (1 << 28) | (512 << 11) | 512).unwrap();
+        m.max_cycles = 1_000;
+        assert!(matches!(m.run(u64::MAX), Stop::Halted));
+        m
+    }
+    let (interpreted, jitted) = (run(false), run(true));
+    assert_eq!(interpreted.bus.cycles, jitted.bus.cycles);
+    assert_eq!(interpreted.bus.rtc_slow, jitted.bus.rtc_slow);
+    assert_eq!(interpreted.bus.ulp_fsm.cpu, jitted.bus.ulp_fsm.cpu);
+    assert_eq!(interpreted.bus.ulp_fsm.wake_requests, jitted.bus.ulp_fsm.wake_requests);
+    assert_eq!(interpreted.bus.ulp_fsm.traps, jitted.bus.ulp_fsm.traps);
+    assert_eq!(interpreted.bus.ulp_fsm.decode_hits, jitted.bus.ulp_fsm.decode_hits);
+    assert_eq!(interpreted.bus.ulp_fsm.decode_misses, jitted.bus.ulp_fsm.decode_misses);
+    assert_eq!(interpreted.bus.periph.rtc.interrupt_status(), jitted.bus.periph.rtc.interrupt_status());
+}
+
+#[test]
 fn ulp_register_write_can_stop_its_timer_before_halt() {
     let mut m = machine();
     let words = [0x1ffc_003f_u32, 0xb000_0000]; // I_END(); HALT

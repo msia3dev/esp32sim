@@ -81,9 +81,20 @@ pub fn step<B: Bus>(cpu: &mut Cpu, bus: &mut B) -> Result<Event, Trap<B::Error>>
     if cpu.halted {
         return Ok(Event::Halt);
     }
+    let raw = bus.read_word(cpu.pc).map_err(Trap::Bus)?;
+    execute(cpu, bus, decode(raw))
+}
+
+/// Execute an instruction which the SoC integration has already fetched and decoded.
+///
+/// This is semantically identical to `step` after its fetch. It lets a scheduler cache decoded
+/// RTC-memory words while keeping the one-instruction interpreter as the reference path.
+pub fn execute<B: Bus>(cpu: &mut Cpu, bus: &mut B, insn: Insn) -> Result<Event, Trap<B::Error>> {
+    if cpu.halted {
+        return Ok(Event::Halt);
+    }
     let pc = cpu.pc;
-    let raw = bus.read_word(pc).map_err(Trap::Bus)?;
-    let insn = decode(raw);
+    let raw = insn.raw;
     if insn.is_illegal() {
         return Err(Trap::Illegal { pc, raw });
     }

@@ -8,5 +8,5 @@ pub mod exec;
 pub mod state;
 
 pub use decode::{decode, AluOp, BranchCond, Effects, Insn, Kind, StoreKind, StoreMode, Target};
-pub use exec::{step, Bus, Event, Trap};
+pub use exec::{execute, step, Bus, Event, Trap};
 pub use state::Cpu;

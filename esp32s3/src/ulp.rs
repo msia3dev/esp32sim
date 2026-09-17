@@ -1,12 +1,19 @@
 //! ESP32-S3 ULP-FSM RTC-memory adapter and instruction scheduler.
 
 use esp_periph::{RtcCntl, UlpArchitecture, UlpState};
-use ulp_fsm::{decode, step, Bus, Cpu, Event, Insn, Kind};
+use ulp_fsm::{decode, execute, Bus, Cpu, Event, Insn, Kind};
 
 const RC_FAST_HZ: u64 = 17_500_000;
 const XTAL_D2_HZ: u64 = 20_000_000;
 const CPU_HZ: u64 = crate::periph::CPU_HZ;
 const VPAGE_SHIFT: usize = xtensa_lx7::bus::VPAGE_SHIFT as usize;
+const ULP_WORDS: usize = 2048;
+
+#[derive(Clone, Copy, Debug)]
+struct CachedInsn {
+    version: u32,
+    insn: Insn,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryError {
@@ -39,6 +46,11 @@ impl<'a> RtcSlowBus<'a> {
 
     pub(crate) fn take_gpio_changes(&mut self) -> Vec<(u8, bool)> {
         std::mem::take(&mut self.gpio_changes)
+    }
+
+    fn code_version(&self, address: u16) -> Option<u32> {
+        let offset = address as usize * 4;
+        self.versions.get(self.version_base + (offset >> VPAGE_SHIFT)).copied()
     }
 }
 
@@ -161,10 +173,14 @@ pub struct UlpFsmEngine {
     pub cpu: Cpu,
     pub traps: u64,
     pub wake_requests: u64,
+    pub decode_hits: u64,
+    pub decode_misses: u64,
     pub last_trap: Option<String>,
     active: bool,
     remaining_ulp_cycles: u32,
     phase: u64,
+    current: Option<Insn>,
+    decode_cache: Vec<Option<CachedInsn>>,
 }
 
 impl UlpFsmEngine {
@@ -173,10 +189,14 @@ impl UlpFsmEngine {
             cpu: Cpu::new(0),
             traps: 0,
             wake_requests: 0,
+            decode_hits: 0,
+            decode_misses: 0,
             last_trap: None,
             active: false,
             remaining_ulp_cycles: 0,
             phase: 0,
+            current: None,
+            decode_cache: Vec::new(),
         }
     }
 
@@ -199,6 +219,7 @@ impl UlpFsmEngine {
             self.active = false;
             self.remaining_ulp_cycles = 0;
             self.phase = 0;
+            self.current = None;
             return;
         }
         if self.active {
@@ -223,7 +244,11 @@ impl UlpFsmEngine {
         while self.active && available >= self.remaining_ulp_cycles {
             available -= self.remaining_ulp_cycles;
             self.remaining_ulp_cycles = 0;
-            match step(&mut self.cpu, bus) {
+            let Some(insn) = self.current.take() else {
+                self.trap_before_execute(bus, "scheduled instruction is missing".into());
+                break;
+            };
+            match execute(&mut self.cpu, bus, insn) {
                 Ok(Event::Continue) => self.prime(bus),
                 Ok(Event::Wake) => {
                     self.wake_requests += 1;
@@ -257,15 +282,28 @@ impl UlpFsmEngine {
     }
 
     fn prime(&mut self, bus: &mut RtcSlowBus<'_>) {
-        match bus.read_word(self.cpu.pc) {
-            Ok(raw) => match bus.instruction_cycles(decode(raw)) {
-                Some(cycles) => self.remaining_ulp_cycles = cycles,
+        if self.decode_cache.is_empty() { self.decode_cache.resize(ULP_WORDS, None); }
+        let pc = self.cpu.pc as usize;
+        let version = bus.code_version(self.cpu.pc);
+        let cached = version.and_then(|version| self.decode_cache[pc].filter(|entry| entry.version == version));
+        let insn = match cached {
+            Some(entry) => { self.decode_hits += 1; entry.insn }
+            None => match bus.read_word(self.cpu.pc) {
+                Ok(raw) => {
+                    let insn = decode(raw);
+                    if let Some(version) = version { self.decode_cache[pc] = Some(CachedInsn { version, insn }); }
+                    self.decode_misses += 1;
+                    insn
+                }
+                Err(error) => { self.trap_before_execute(bus, format!("{error:?}")); return; }
+            },
+        };
+        match bus.instruction_cycles(insn) {
+                Some(cycles) => { self.remaining_ulp_cycles = cycles; self.current = Some(insn); }
                 None => self.trap_before_execute(
                     bus,
-                    format!("unsupported instruction {raw:#010x} at pc {}", self.cpu.pc),
+                    format!("unsupported instruction {:#010x} at pc {}", insn.raw, self.cpu.pc),
                 ),
-            },
-            Err(error) => self.trap_before_execute(bus, format!("{error:?}")),
         }
     }
 
@@ -276,6 +314,7 @@ impl UlpFsmEngine {
         bus.rtc.ulp.halt();
         self.active = false;
         self.remaining_ulp_cycles = 0;
+        self.current = None;
     }
 }
 
@@ -325,5 +364,22 @@ mod tests {
         assert_eq!((engine.cpu.pc, engine.cpu.stage), (7, 0));
         assert!(!engine.cpu.overflow);
         assert_eq!((engine.cpu.insn_count, engine.cpu.cycle_count), (12, 34));
+    }
+
+    #[test]
+    fn decode_cache_is_not_allocated_until_the_ulp_starts() {
+        let mut engine = UlpFsmEngine::new();
+        assert!(engine.decode_cache.is_empty());
+        let mut rtc = RtcCntl::new();
+        rtc.ulp.configure_cocpu((1 << 27) | (1 << 23));
+        rtc.ulp.configure_control((1 << 30) | (1 << 28));
+        let mut memory = vec![0u8; 8192];
+        memory[..4].copy_from_slice(&0xb000_0000_u32.to_le_bytes());
+        let mut versions = vec![0u32; 64];
+        let mut bus = RtcSlowBus::new(&mut rtc, &mut memory, &mut versions, 4);
+
+        engine.reconcile(&mut bus);
+
+        assert_eq!(engine.decode_cache.len(), ULP_WORDS);
     }
 }

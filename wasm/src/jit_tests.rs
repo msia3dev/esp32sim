@@ -49,6 +49,13 @@ fn same(a: &esp32s3::Machine, b: &esp32s3::Machine) {
         assert_eq!(a.windowbase, b.windowbase);
         assert_eq!(a.epc, b.epc);
     }
+    assert_eq!(a.bus.rtc_slow, b.bus.rtc_slow);
+    assert_eq!(a.bus.ulp_fsm.cpu, b.bus.ulp_fsm.cpu);
+    assert_eq!(a.bus.ulp_fsm.wake_requests, b.bus.ulp_fsm.wake_requests);
+    assert_eq!(a.bus.ulp_fsm.traps, b.bus.ulp_fsm.traps);
+    assert_eq!(a.bus.ulp_fsm.decode_hits, b.bus.ulp_fsm.decode_hits);
+    assert_eq!(a.bus.ulp_fsm.decode_misses, b.bus.ulp_fsm.decode_misses);
+    assert_eq!(a.bus.periph.rtc.interrupt_status(), b.bus.periph.rtc.interrupt_status());
 }
 pub fn run() -> u32 {
     let (mut a, mut b) = (machine(false), machine(true));
@@ -94,5 +101,17 @@ pub fn run() -> u32 {
         }
         same(&a, &b);
     }
-    3
+    let (mut a, mut b) = (machine(false), machine(true));
+    let words = [0x7481_2340_u32, 0x7480_00a1, 0x6800_0184, 0x9000_0001, 0xb000_0000];
+    let program: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    for m in [&mut a, &mut b] {
+        SocBus::load_bytes(&mut m.bus, esp32s3::bus::RTC_SLOW_LOW, &program).unwrap();
+        m.bus.periph.rtc.write(0x104, (1 << 27) | (1 << 23));
+        m.bus.periph.rtc.write(0x100, (1 << 30) | (1 << 28) | (512 << 11) | 512);
+        m.max_cycles = m.bus.cycles + 1_000;
+        assert!(matches!(m.run(u64::MAX), Stop::Halted));
+    }
+    same(&a, &b);
+    assert_eq!(a.bus.ulp_fsm.wake_requests, 1);
+    4
 }
