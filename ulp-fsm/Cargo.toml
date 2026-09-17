@@ -1,0 +1,6 @@
+[package]
+name = "ulp-fsm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ESP32-S2/S3 ULP-FSM instruction decoder, disassembler, and interpreter core"
