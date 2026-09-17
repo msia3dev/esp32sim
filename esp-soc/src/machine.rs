@@ -9,6 +9,8 @@ use crate::{elf, png};
 use emu_core::core::pc_bit;
 use emu_core::{Bus, Core, CostModel, LifecycleFacts, LifecycleKind, MemoryAccess, Trap};
 use std::collections::{BTreeMap, HashMap};
+#[cfg(not(target_arch = "wasm32"))]
+use std::collections::VecDeque;
 
 mod modeled;
 mod web;
@@ -85,6 +87,10 @@ pub struct Machine<S: Soc> {
     pub console: Console,
     /// live web UI
     pub web: Option<WebServer>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub uart_tcp: Option<crate::uart_tcp::UartTcp>,
+    #[cfg(not(target_arch = "wasm32"))]
+    uart_tcp_pending: VecDeque<u8>,
     /// The page's Restart (`reset` on the WebSocket) is honoured: the front-end sets this when it
     /// can bring the machine back up after the reset. Otherwise the message is ignored, so a run
     /// that stops at a chip reset is not ended from the page.
@@ -148,6 +154,10 @@ impl<S: Soc> Machine<S> {
             script: Script { events: Vec::new(), pos: 0, log: true, knob_next: 0 }, max_cycles: u64::MAX,
             console: Console { all: Vec::new(), usb: Vec::new(), uart0: Vec::new(), mask: 3, prefix: false, capture: false },
             web: None, ws: WebState { last_push_cycles: 0, push_interval: 0, audio_sent: 0, ring_updates: 0, grid_updates: Vec::new(), px_pending: 0, px_sent: 0, px_deferred: false, cam_pushed: u64::MAX, cam_sent: false },
+            #[cfg(not(target_arch = "wasm32"))]
+            uart_tcp: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            uart_tcp_pending: VecDeque::new(),
             rt: Realtime { enabled: false, wall_start: None, last_check: 0, behind: 0.0, resyncs: 0, speed: None, speed_mark: None, log: false, log_last: None, log_insns: (0, 0) },
             debug_rom: false, cost: None, model_accesses: Vec::new(), approximate_jit_timing: None, approximate_jit_frontiers: false, model_ready_at: vec![0; S::CORES], model_stop: None, model_attach_error: None,
         }
@@ -315,6 +325,8 @@ impl<S: Soc> Machine<S> {
     pub fn drain_console(&mut self) {
         use std::io::Write;
         let streams = self.bus.console_take();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.uart_tcp_output(&streams[1]);
         let mut o = std::io::stdout();
         let (mask, prefix, capture) = (self.console.mask, self.console.prefix, self.console.capture);
         let mut emit = |bit: u32, tag: &str, d: Vec<u8>, all: &mut Vec<u8>| {
@@ -474,6 +486,8 @@ impl<S: Soc> Machine<S> {
     /// `quantum - 1` steps. The modeled path schedules one priced event at a time.
     pub fn run(&mut self, max_insns: u64) -> Stop {
         self.web_poll_input();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.uart_tcp_poll_input();
         self.refresh_irq();
         if self.cost.is_some() { self.run_modeled(max_insns) } else if self.approximate_jit_frontiers { self.run_approximate_jit_frontiers(max_insns) } else if self.approximate_jit_timing.is_some() { self.run_unmodeled::<true>(max_insns) } else { self.run_unmodeled::<false>(max_insns) }
     }
@@ -994,6 +1008,8 @@ impl<S: Soc> Machine<S> {
     #[inline]
     fn after_round_rest(&mut self) -> bool {
         let stopped = self.apply_script_events();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.uart_tcp_poll_input();
         // EX170: the cached interval filters the common not-yet-due round without the board call and
         // division; a due round re-derives it from the board before deciding, as before.
         // EX168 s4: the per-round test is two loads and a compare; the re-derivation, the push and the
@@ -1039,6 +1055,11 @@ impl<S: Soc> Machine<S> {
             } else { self.rt.behind = 0.0; }
         }
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn uart_tcp_poll_input(&mut self) { let Some(tcp) = self.uart_tcp.clone() else { return }; let room = self.bus.uart_rx_capacity(0); if room > 0 { let data = tcp.take_input(room); if !data.is_empty() { self.bus.uart_input(0, &data); } } }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn uart_tcp_output(&mut self, data: &[u8]) { const LIMIT: usize = 1 << 20; let Some(tcp) = self.uart_tcp.clone() else { return }; if !tcp.connected() { self.uart_tcp_pending.clear(); return; } self.uart_tcp_pending.extend(data); if self.uart_tcp_pending.len() > LIMIT { tcp.disconnect(); self.uart_tcp_pending.clear(); return; } while !self.uart_tcp_pending.is_empty() { let accepted = tcp.queue_output(self.uart_tcp_pending.make_contiguous()); if accepted == 0 { break; } self.uart_tcp_pending.drain(..accepted); } }
 
     /// One encoder detent as (pin, level) edges, 2 ms apart. Idle is (1,1); CW: CLK falls while
     /// DT=1, then DT falls, CLK rises, DT rises. CCW: DT first.
