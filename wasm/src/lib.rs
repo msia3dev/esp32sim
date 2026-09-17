@@ -8,7 +8,7 @@
 //! feeding the page's inputs.
 use esp_soc::observers::{BlockProfile, Coverage, IrqLatency};
 use esp_soc::web::{json_escape, WebServer};
-use esp_soc::{Machine, Soc, SocBus, Stop};
+use esp_soc::{Machine, PanelControl, Soc, SocBus, Stop};
 use std::any::Any;
 
 #[cfg(target_arch = "wasm32")]
@@ -22,6 +22,8 @@ trait MachineApi {
     fn write_flash(&mut self, off: usize, d: &[u8]) -> Result<(), String>;
     fn boot(&mut self, app_direct: bool) -> Result<(), String>;
     fn board_name(&self) -> String;
+    fn board_rotation(&self) -> u16;
+    fn panel_controls(&self) -> Vec<PanelControl>;
     fn web(&self) -> Option<&WebServer>;
     fn run_slice(&mut self, cycles: u32) -> u32;
     fn cpu_hz(&self) -> f64;
@@ -31,6 +33,9 @@ trait MachineApi {
     fn observer(&mut self, name: &str, arg: &str) -> u32;
     fn reports(&mut self) -> String;
     fn set_jit(&mut self, enabled: bool);
+    fn storage_generation(&self) -> u64;
+    fn export_storage(&self, kind: u32) -> Option<Vec<u8>>;
+    fn import_storage(&mut self, kind: u32, data: &[u8]) -> Result<(), String>;
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
@@ -49,6 +54,8 @@ impl<S: Soc> MachineApi for Machine<S> {
     fn write_flash(&mut self, off: usize, d: &[u8]) -> Result<(), String> { Machine::write_flash(self, off, d) }
     fn boot(&mut self, app_direct: bool) -> Result<(), String> { if app_direct { self.boot_app(0x10000).map(|_| ()) } else { self.boot_rom(); Ok(()) } }
     fn board_name(&self) -> String { self.bus.board_ref().name().to_string() }
+    fn board_rotation(&self) -> u16 { self.bus.board_ref().display_rotation() }
+    fn panel_controls(&self) -> Vec<PanelControl> { self.bus.board_ref().panel_controls() }
     fn web(&self) -> Option<&WebServer> { self.web.as_ref() }
     fn run_slice(&mut self, cycles: u32) -> u32 {
         self.max_cycles = self.bus.cycles() + cycles as u64;
@@ -93,6 +100,9 @@ impl<S: Soc> MachineApi for Machine<S> {
     }
     fn reports(&mut self) -> String { Machine::reports(self) }
     fn set_jit(&mut self, enabled: bool) { for core in &mut self.cores { xtensa_lx7::Core::set_jit(core, enabled); } }
+    fn storage_generation(&self) -> u64 { self.bus.storage_generation() }
+    fn export_storage(&self, kind: u32) -> Option<Vec<u8>> { self.bus.export_storage(kind) }
+    fn import_storage(&mut self, kind: u32, data: &[u8]) -> Result<(), String> { self.bus.import_storage(kind, data) }
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
 }
 
@@ -116,6 +126,7 @@ pub struct Emu {
     /// the last drained outbox: (1 text | 2 binary, payload), addressed by index from JS
     out: Vec<(u8, Vec<u8>)>,
     booted: bool,
+    state_out: Vec<u8>,
     #[cfg(target_arch = "wasm32")]
     jit: BrowserJit,
 }
@@ -229,6 +240,7 @@ pub unsafe extern "C" fn esp32sim_new(board: *const u8, board_len: usize, flash_
         m,
         out: Vec::new(),
         booted: false,
+        state_out: Vec::new(),
         #[cfg(target_arch = "wasm32")]
         jit: BrowserJit {
             state: Box::new([0; JIT_STATE_LEN]),
@@ -236,6 +248,40 @@ pub unsafe extern "C" fn esp32sim_new(board: *const u8, board_len: usize, flash_
             ticket: None,
         },
     }))
+}
+
+#[no_mangle]
+/// Return the generation of mutable persistent storage.
+///
+/// # Safety
+/// `e` must point to a live emulator and remain valid for this call.
+pub unsafe extern "C" fn esp32sim_state_generation(e: *mut Emu) -> f64 { unsafe { &*e }.m.storage_generation() as f64 }
+
+/// Export kind 0 (logical flash) or 1 (physical ESP32-S3 eFuse blocks) into the ABI state buffer.
+///
+/// # Safety
+/// `e` must point to a live emulator with exclusive access for this call.
+#[no_mangle]
+pub unsafe extern "C" fn esp32sim_state_export(e: *mut Emu, kind: u32) -> usize {
+    let e = unsafe { &mut *e }; e.state_out = e.m.export_storage(kind).unwrap_or_default(); e.state_out.len()
+}
+/// Return the state buffer created by `esp32sim_state_export`.
+///
+/// # Safety
+/// `e` must point to a live emulator. The pointer remains valid only until the next export or
+/// emulator deletion.
+#[no_mangle]
+pub unsafe extern "C" fn esp32sim_state_ptr(e: *const Emu) -> *const u8 { unsafe { &*e }.state_out.as_ptr() }
+
+/// Import kind 0 (logical flash) or 1 (physical ESP32-S3 eFuse blocks).
+///
+/// # Safety
+/// `e` must point to a live emulator with exclusive access. For nonzero `len`, `ptr` must be
+/// readable for `len` bytes throughout this call.
+#[no_mangle]
+pub unsafe extern "C" fn esp32sim_state_import(e: *mut Emu, kind: u32, ptr: *const u8, len: usize) -> u32 {
+    let e = unsafe { &mut *e }; let data = unsafe { bytes(ptr, len) };
+    match e.m.import_storage(kind, data) { Ok(()) => 0, Err(message) => { log(&format!("[emu] state import: {}", message)); 1 } }
 }
 
 /// The page is the one client: messages queue in a `WebServer` sink; the worker paces the run.
@@ -367,7 +413,9 @@ pub unsafe extern "C" fn esp32sim_boot(e: *mut Emu, app_direct: u32) -> u32 {
     if let Err(msg) = e.m.boot(app_direct != 0) { log(&format!("[emu] boot: {}", msg)); return 1; }
     // the WebSocket server announces the board in its per-client hello; here there is one client
     let name = e.m.board_name();
-    if let Some(w) = e.m.web() { w.send_text(&format!("{{\"t\":\"board\",\"name\":\"{}\"}}", name)); }
+    let rotation = e.m.board_rotation();
+    let controls = e.m.panel_controls().iter().map(|control| format!("{{\"name\":\"{}\",\"label\":\"{}\",\"x\":{},\"y\":{}}}", json_escape(control.name), json_escape(control.label), control.x, control.y)).collect::<Vec<_>>().join(",");
+    if let Some(w) = e.m.web() { w.send_text(&format!("{{\"t\":\"board\",\"name\":\"{}\",\"rotate\":{},\"controls\":[{}]}}", name, rotation, controls)); }
     e.booted = true; 0
 }
 

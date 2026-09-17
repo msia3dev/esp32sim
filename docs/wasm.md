@@ -23,6 +23,25 @@ for the mask-ROM ELF, `bootloader.bin`, `partition-table.bin`, the app image, it
 — needed for stubs) and a script. **Boot** starts it; the rest of the page — console tabs,
 display, touch, buttons, knob, audio, camera — is the same UI the native emulator serves.
 
+### Persistent browser state
+
+For a single ESP32-S3 machine, the firmware panel can preserve logical flash
+(including ESP-IDF NVS) and physical eFuses in IndexedDB. Enable **persist
+state** and choose a **profile** name. On later visits using the same browser
+origin, board, flash size and profile, the saved device state replaces the
+manifest or uploaded flash seeds.
+
+**Export state** downloads flash and eFuse files separately. **Import** checks
+the selected type and exact length before replacing it; reload afterward to
+boot from the imported state. **Clear state** confirms and removes only the
+selected profile. IndexedDB is origin-scoped, so `localhost`, `127.0.0.1`,
+different ports and GitHub Pages do not share profiles. Persistence is not yet
+available for C3/C6 or multi-node network manifests.
+
+The browser uses the same formats as native esp32sim: flash is logical,
+CPU-visible data, while ESP32-S3 eFuse state is exactly 336 bytes. See
+[storage.md](storage.md) for lifecycle, precedence and security details.
+
 For your own demos, `?wasm&fw=<name>` loads `web/wasm/fw/<name>.json` and boots it without
 clicking (format in `web/wasm/fw/README.md`). Everything in that directory except the manifests
 and `public/` (our own demo firmware) is git-ignored: the mask ROM is Espressif's and other firmware
@@ -183,7 +202,9 @@ Normal builds contain neither the sampling code nor the clock import.
   gets a DHCP lease, resolves names and syncs time against the emulated subnet, but connections
   past the gateway are refused (the `--net none` behaviour). A WebSocket relay to a small host
   helper is the planned way out (`wasm-plan.md`).
-- **No file outputs**: `--wav`, `--tft-png`, register traces — the page is the output.
+- **No emulator capture files**: `--wav`, `--tft-png` and register traces are
+  unavailable because the page is the output. Persistent-state Export is the
+  exception: it deliberately downloads flash and eFuse state files.
 - **Emulator log lines** (`[emu] …`) that the native build prints to stderr do not exist here,
   except the ones the wasm glue forwards (stubs, resets, load errors) to the console tab and the
   browser console.

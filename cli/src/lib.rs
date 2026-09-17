@@ -10,7 +10,7 @@ use std::path::PathBuf;
 pub mod cooja;
 
 fn usage(chip: &str) -> ! {
-    eprintln!("usage: esp32sim [--chip s3|c3|c6] --boot rom|app --bootloader B.bin --ptable P.bin --app A.bin [--elf X.elf]... [options]");
+    eprintln!("usage: esp32sim [--chip s3|c3|c6] --boot rom|app --bootloader B.bin --ptable P.bin [--ptable-offset 0xNNNN] --app A.bin [--app-offset 0xNNNN] [--elf X.elf]... [options]");
     eprintln!("       see docs/cli.md for every flag (default chip here: {})", chip);
     std::process::exit(2)
 }
@@ -22,8 +22,8 @@ fn pair(s: &str, dflt: usize) -> (u32, usize) { match s.split_once(',') { Some((
 #[derive(Default)]
 pub struct Opts {
     pub chip: String,
-    pub rom: Option<PathBuf>, pub bootloader: Option<String>, pub ptable: Option<String>, pub app: Option<String>, pub elfs: Vec<String>,
-    pub flash_image: Option<String>, pub flash_at: Vec<String>, pub boot: Option<String>, pub flash_mb: Option<usize>, pub psram_mb: Option<usize>,
+    pub rom: Option<PathBuf>, pub bootloader: Option<String>, pub ptable: Option<String>, pub ptable_offset: Option<u32>, pub app: Option<String>, pub app_offset: Option<u32>, pub elfs: Vec<String>,
+    pub flash_image: Option<String>, pub flash_at: Vec<String>, pub flash_state: Option<String>, pub efuse_state: Option<String>, pub boot: Option<String>, pub flash_mb: Option<usize>, pub psram_mb: Option<usize>,
     pub mac: Option<[u8; 6]>, pub strap: Option<u32>, pub reset_cause: Option<u32>, pub efuse_regs: Option<String>, pub regs_init: Option<String>,
     pub board: String, pub wifi: Option<String>, pub net: String, pub cam_image: Option<String>, pub cam_fps: f64,
     pub max_insns: u64, pub max_seconds: Option<f64>, pub script: Option<String>, pub serial: Option<String>,
@@ -48,10 +48,14 @@ pub fn parse(args: &[String], default_chip: &str) -> Opts {
             "--rom" => o.rom = Some(PathBuf::from(next())),
             "--bootloader" => o.bootloader = Some(next()),
             "--ptable" => o.ptable = Some(next()),
+            "--ptable-offset" => o.ptable_offset = Some(hex(&next(), "ptable-offset")),
+            "--app-offset" => o.app_offset = Some(hex(&next(), "app-offset")),
             "--app" => o.app = Some(next()),
             "--elf" => o.elfs.push(next()),
             "--flash-image" => o.flash_image = Some(next()),
             "--flash-at" => o.flash_at.push(next()),
+            "--flash-state" => o.flash_state = Some(next()),
+            "--efuse-state" => o.efuse_state = Some(next()),
             "--boot" => o.boot = Some(next()),
             "--flash-mb" => o.flash_mb = Some(next().parse().expect("mb")),
             "--psram-mb" => o.psram_mb = Some(next().parse().expect("mb")),
@@ -194,14 +198,23 @@ fn setup_s3(o: &Opts) -> esp32s3::Machine {
     m.bus.periph.lcd_cam.frame_cycles = (esp32s3::periph::CPU_HZ as f64 / o.cam_fps) as u64;
     if let Some(mb) = o.flash_mb { if mb != 8 { m.bus.set_flash_size(mb << 20); } }
     if let Some(mb) = o.psram_mb { if mb != 2 { m.bus.set_psram_size(mb << 20).unwrap(); } }
+    if let Some(path) = &o.flash_state {
+        let loaded = m.bus.configure_flash_state(path).unwrap_or_else(|e| { eprintln!("--flash-state: {}", e); std::process::exit(2) });
+        eprintln!("[emu] flash state: {} ({})", path, if loaded { "loaded" } else { "new" });
+    }
+    if let Some(path) = &o.efuse_state {
+        let loaded = m.bus.configure_efuse_state(path).unwrap_or_else(|e| { eprintln!("--efuse-state: {}", e); std::process::exit(2) });
+        eprintln!("[emu] eFuse state: {} ({})", path, if loaded { "loaded" } else { "new" });
+    }
     if let Some(p) = &o.efuse_regs {
+        if m.bus.persistent_efuse_loaded() { eprintln!("[emu] existing eFuse state takes precedence over --efuse-regs"); }
         let txt = std::fs::read_to_string(p).expect("efuse file");
         let mut n = 0;
         for line in txt.lines() {
             let line = line.trim(); if line.is_empty() { continue; }
             let (addr_s, rest) = match line.split_once(':') { Some(x) => x, None => continue };
             let Ok(mut a) = u32::from_str_radix(addr_s.trim().trim_start_matches("0x"), 16) else { continue };
-            for w in rest.split_whitespace() { if let Ok(v) = u32::from_str_radix(w, 16) { let off = if a >= 0x6000_7000 { a - 0x6000_7000 } else { a }; m.bus.periph.efuse.ram.write(off, v); a += 4; n += 1; } }
+            for w in rest.split_whitespace() { if let Ok(v) = u32::from_str_radix(w, 16) { let off = if a >= 0x6000_7000 { a - 0x6000_7000 } else { a }; if !m.bus.persistent_efuse_loaded() && !m.bus.periph.efuse.import_shadow(off, v) { m.bus.periph.efuse.ram.write(off, v); } a += 4; n += 1; } }
         }
         eprintln!("[emu] loaded {} efuse words from {}", n, p);
     }
@@ -223,7 +236,7 @@ fn setup_c3(o: &Opts) -> esp32c3::Machine {
     let mut m = esp32c3::machine(o.mac.unwrap_or([0x60, 0x55, 0xf9, 0x00, 0x11, 0x22]), o.flash_mb.unwrap_or(4) << 20);
     m.bus.set_flash_size(o.flash_mb.unwrap_or(4) << 20);   // the JEDEC capacity follows the size
     if !o.debug.is_empty() { let mut f = esp_soc::DebugFlags::from_env(); for d in &o.debug { f.parse(d); } m.set_debug(&f); }
-    for (flag, on) in [("--board", o.board != "atech14" && o.board != "none"), ("--wifi", o.wifi.is_some()), ("--cam-image", o.cam_image.is_some()), ("--psram-mb", o.psram_mb.is_some()), ("--efuse-regs", o.efuse_regs.is_some()), ("--regs-init", o.regs_init.is_some()), ("--regstat", o.regstat.is_some())] {
+    for (flag, on) in [("--board", o.board != "atech14" && o.board != "none"), ("--wifi", o.wifi.is_some()), ("--cam-image", o.cam_image.is_some()), ("--psram-mb", o.psram_mb.is_some()), ("--efuse-regs", o.efuse_regs.is_some()), ("--efuse-state", o.efuse_state.is_some()), ("--flash-state", o.flash_state.is_some()), ("--regs-init", o.regs_init.is_some()), ("--regstat", o.regstat.is_some())] {
         if on { eprintln!("{} is not available on the C3", flag); std::process::exit(2); }
     }
     m
@@ -235,7 +248,7 @@ fn setup_c6(o: &Opts) -> esp32c6::Machine {
     if !o.debug.is_empty() { let mut f = esp_soc::DebugFlags::from_env(); for d in &o.debug { f.parse(d); } m.set_debug(&f); }
     let name = if o.board == "atech14" { "none" } else { o.board.as_str() };   // the S3 default means "bare module" here
     match esp32c6::board::make_board(name) { Some(b) => m.bus.board = b, None => { eprintln!("--board {}: none or waveshare-c6-lcd147 on the C6", name); std::process::exit(2) } }
-    for (flag, on) in [("--wifi", o.wifi.is_some()), ("--cam-image", o.cam_image.is_some()), ("--psram-mb", o.psram_mb.is_some()), ("--efuse-regs", o.efuse_regs.is_some()), ("--regs-init", o.regs_init.is_some()), ("--regstat", o.regstat.is_some())] {
+    for (flag, on) in [("--wifi", o.wifi.is_some()), ("--cam-image", o.cam_image.is_some()), ("--psram-mb", o.psram_mb.is_some()), ("--efuse-regs", o.efuse_regs.is_some()), ("--efuse-state", o.efuse_state.is_some()), ("--flash-state", o.flash_state.is_some()), ("--regs-init", o.regs_init.is_some()), ("--regstat", o.regstat.is_some())] {
         if on { eprintln!("{} is not available on the C6", flag); std::process::exit(2); }
     }
     m
@@ -244,10 +257,12 @@ fn setup_c6(o: &Opts) -> esp32c6::Machine {
 /// Everything after the chip is set up: images, boot, observers, the run, the reports.
 fn run<S: Soc>(mut m: Machine<S>, o: &Opts) {
     let boot = prepare(&mut m, o);
+    m.bus.initialize_storage().unwrap_or_else(|e| { eprintln!("[emu] storage: {}", e); std::process::exit(2) });
     let t0 = std::time::Instant::now();
     let stop = loop {
         let stop = m.run(o.max_insns);
         if let Stop::SwReset = stop {
+            m.bus.flush_storage().unwrap_or_else(|e| { eprintln!("[emu] storage: {}", e); std::process::exit(1) });
             let cause = m.bus.reset_cause();
             eprintln!("[emu] chip reset at t={:.3}s: cause {:#x} ({})", m.seconds(), cause, esp_periph::reset_cause_name(cause));
             if o.no_reboot || boot != "rom" { break stop; }
@@ -256,6 +271,7 @@ fn run<S: Soc>(mut m: Machine<S>, o: &Opts) {
         }
         break stop;
     };
+    m.bus.flush_storage().unwrap_or_else(|e| { eprintln!("[emu] storage: {}", e); std::process::exit(1) });
     let dt = t0.elapsed().as_secs_f64();
     report(&mut m, o, stop, dt);
 }
@@ -274,16 +290,20 @@ fn prepare<S: Soc>(m: &mut Machine<S>, o: &Opts) -> String {
         None if boot == "rom" => { eprintln!("[emu] no {} mask ROM ELF found (pass --rom, or use --boot app)", S::NAME); std::process::exit(2) }
         None => {}
     }
-    if let Some(p) = &o.flash_image { m.write_flash(0, &std::fs::read(p).expect("flash image")).unwrap(); }
-    if let Some(p) = &o.bootloader { m.write_flash(0x0, &std::fs::read(p).expect("bootloader")).unwrap(); }
-    if let Some(p) = &o.ptable { m.write_flash(0x8000, &std::fs::read(p).expect("ptable")).unwrap(); }
-    if let Some(p) = &o.app { m.write_flash(0x10000, &std::fs::read(p).expect("app")).unwrap(); }
-    for spec in &o.flash_at {
-        let (off, path) = spec.split_once('=').unwrap_or_else(|| { eprintln!("--flash-at needs OFFSET=FILE"); std::process::exit(2) });
-        let off = usize::from_str_radix(off.trim_start_matches("0x"), 16).unwrap_or_else(|_| { eprintln!("--flash-at: bad offset {}", off); std::process::exit(2) });
-        let data = std::fs::read(path).unwrap_or_else(|e| { eprintln!("--flash-at: {}: {}", path, e); std::process::exit(2) });
-        m.write_flash(off, &data).unwrap_or_else(|e| { eprintln!("--flash-at: {}", e); std::process::exit(2) });
-        eprintln!("[emu] flash {:#x}: {} ({} bytes)", off, path, data.len());
+    if m.bus.persistent_flash_loaded() {
+        if o.flash_image.is_some() || o.bootloader.is_some() || o.ptable.is_some() || o.app.is_some() || !o.flash_at.is_empty() { eprintln!("[emu] existing flash state takes precedence over seed images"); }
+    } else {
+        if let Some(p) = &o.flash_image { m.write_flash(0, &std::fs::read(p).expect("flash image")).unwrap(); }
+        if let Some(p) = &o.bootloader { m.write_flash(0x0, &std::fs::read(p).expect("bootloader")).unwrap(); }
+        if let Some(p) = &o.ptable { m.write_flash(o.ptable_offset.unwrap_or(0x8000) as usize, &std::fs::read(p).expect("ptable")).unwrap(); }
+        if let Some(p) = &o.app { m.write_flash(o.app_offset.unwrap_or(0x10000) as usize, &std::fs::read(p).expect("app")).unwrap(); }
+        for spec in &o.flash_at {
+            let (off, path) = spec.split_once('=').unwrap_or_else(|| { eprintln!("--flash-at needs OFFSET=FILE"); std::process::exit(2) });
+            let off = usize::from_str_radix(off.trim_start_matches("0x"), 16).unwrap_or_else(|_| { eprintln!("--flash-at: bad offset {}", off); std::process::exit(2) });
+            let data = std::fs::read(path).unwrap_or_else(|e| { eprintln!("--flash-at: {}: {}", path, e); std::process::exit(2) });
+            m.write_flash(off, &data).unwrap_or_else(|e| { eprintln!("--flash-at: {}", e); std::process::exit(2) });
+            eprintln!("[emu] flash {:#x}: {} ({} bytes)", off, path, data.len());
+        }
     }
     for p in &o.elfs { m.add_symbols(&std::fs::read(p).expect("elf")).expect("elf symbols"); }
     if let Some(s) = &o.serial { m.bus.serial_input(s.as_bytes()); }
@@ -300,7 +320,7 @@ fn prepare<S: Soc>(m: &mut Machine<S>, o: &Opts) -> String {
     }
     if o.no_jit { for c in &mut m.cores { c.set_jit(false); } }
     match boot.as_str() {
-        "app" => match m.boot_app(0x10000) { Ok(entry) => eprintln!("[emu] app boot: entry {:#010x} {}", entry, m.sym(entry)), Err(e) => { eprintln!("[emu] {}", e); std::process::exit(2) } },
+        "app" => match m.boot_app(o.app_offset.unwrap_or(0x10000) as usize) { Ok(entry) => eprintln!("[emu] app boot: entry {:#010x} {}", entry, m.sym(entry)), Err(e) => { eprintln!("[emu] {}", e); std::process::exit(2) } },
         "rom" => { m.boot_rom(); eprintln!("[emu] ROM boot from reset vector {:#010x}", m.cores[0].pc()); }
         _ => { eprintln!("--boot app|rom"); std::process::exit(2); }
     }

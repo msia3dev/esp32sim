@@ -48,6 +48,8 @@ dependencies = [
  "emu-core",
  "esp-periph",
  "esp-soc",
+ "riscv-rv32",
+ "ulp-fsm",
  "xtensa-lx7",
 ]
 
@@ -92,6 +94,10 @@ version = "0.2.0"
 dependencies = [
  "emu-core",
 ]
+
+[[package]]
+name = "ulp-fsm"
+version = "0.2.0"
 
 [[package]]
 name = "xtensa-lx7"

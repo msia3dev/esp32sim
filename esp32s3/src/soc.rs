@@ -64,6 +64,12 @@ impl esp_soc::SocBus for SocBus {
         self.note_written(SRC_FLASH, offset, data.len());
         Ok(())
     }
+    fn persistent_flash_loaded(&self) -> bool { SocBus::persistent_flash_loaded(self) }
+    fn initialize_storage(&mut self) -> Result<(), String> { SocBus::initialize_storage(self) }
+    fn flush_storage(&mut self) -> Result<(), String> { SocBus::flush_storage(self) }
+    fn storage_generation(&self) -> u64 { SocBus::storage_generation(self) }
+    fn export_storage(&self, kind: u32) -> Option<Vec<u8>> { SocBus::export_storage(self, kind) }
+    fn import_storage(&mut self, kind: u32, data: &[u8]) -> Result<(), String> { SocBus::import_storage(self, kind, data) }
     /// Copy IRAM/DRAM segments, map IROM/DROM through the MMU, as the 2nd-stage bootloader would.
     fn boot_app(&mut self, app_off: usize) -> Result<u32, String> {
         self.periph.system.preset_after_bootloader();
@@ -99,10 +105,13 @@ impl esp_soc::SocBus for SocBus {
         let old = std::mem::replace(&mut self.periph, periph::Peripherals::new(mac));
         let p = &mut self.periph;
         p.efuse = old.efuse;
+        p.efuse.reset_controller();
         p.gpio.strap = old.gpio.strap;
         p.misc.log_unknown = old.misc.log_unknown; p.spi1.log = old.spi1.log;
         p.spi0.jedec = old.spi0.jedec; p.spi1.jedec = old.spi1.jedec;   // the flash chip is not reset: its ID keeps the --flash-mb capacity
-        p.rtc.ram = old.rtc.ram; p.rtc.slow_ticks = old.rtc.slow_ticks;
+        p.rtc.ram = old.rtc.ram; p.rtc.slow_ticks = old.rtc.slow_ticks; p.rtc.ulp = old.rtc.ulp;
+        p.rtc.ulp_adc = old.rtc.ulp_adc; p.rtc.ulp_tsens = old.rtc.ulp_tsens; p.rtc.ulp_i2c = old.rtc.ulp_i2c;
+        p.rtc.ulp_adc_sample_cycle = old.rtc.ulp_adc_sample_cycle; p.rtc.ulp_adc_sample_bits = old.rtc.ulp_adc_sample_bits;
         p.rtc.ram.write(0x38, cause | (cause << 6));
         p.rtc.ram.write(0x98, 0);                       // watchdog disarmed by the reset; the ROM re-arms it
         p.i2s0.pcm = old.i2s0.pcm; p.i2s0.frames_out = old.i2s0.frames_out; p.i2s1.pcm = old.i2s1.pcm; p.i2s1.frames_out = old.i2s1.frames_out;   // keep the captured audio continuous
@@ -154,6 +163,9 @@ impl esp_soc::SocBus for SocBus {
             if let Some(t) = &n.nat { s += &format!("[emu] nat: {} TCP connections ({} failed), {} UDP flows, {} bytes out, {} bytes in\n", t.tcp_opened, t.tcp_refused, t.udp_flows, t.bytes_to_host, t.bytes_to_guest); } } }
         { let (a, sh, r) = (&p.aes, &p.sha, &p.rsa);
           if a.blocks + sh.blocks + r.ops > 0 { s += &format!("[emu] crypto: {} AES blocks, {} SHA blocks, {} RSA/MPI operations\n", a.blocks, sh.blocks, r.ops); } }
+        if let Some(r) = p.rtc.ulp.report() { s += &r; s += "\n"; }
+        if self.ulp_fsm.cpu.insn_count + self.ulp_fsm.traps > 0 { s += &format!("[emu] ulp-fsm: {} instructions, {} cycles, {} traps, {} wake requests\n", self.ulp_fsm.cpu.insn_count, self.ulp_fsm.cpu.cycle_count, self.ulp_fsm.traps, self.ulp_fsm.wake_requests); }
+        if self.ulp_riscv.cpu.insn_count + self.ulp_riscv.traps > 0 { s += &format!("[emu] ulp-riscv: {} instructions, {} cycles, {} traps, {} wake requests\n", self.ulp_riscv.cpu.insn_count, self.ulp_riscv.cpu.cycle_count, self.ulp_riscv.traps, self.ulp_riscv.wake_requests); }
         if p.lcd_cam.lcd_frames > 0 { s += &format!("[emu] lcd: {} RGB frames\n", p.lcd_cam.lcd_frames); }
         if p.lcd_cam.frames + p.lcd_cam.dropped > 0 { s += &format!("[emu] camera: {} frames delivered, {} dropped (no DMA/no picture)\n", p.lcd_cam.frames, p.lcd_cam.dropped); }
         if p.rmt.tx_count > 0 { s += &format!("[emu] rmt tx {}\n", p.rmt.tx_count); }
@@ -162,6 +174,7 @@ impl esp_soc::SocBus for SocBus {
     fn set_debug(&mut self, f: &esp_soc::DebugFlags) {
         self.debug = f.clone();
         for area in f.iter() { esp_periph::Dispatch::debug(&mut self.periph, area, true); }
+        if f.has("ulp") { self.periph.rtc.ulp.debug(true); }
         self.periph.misc.log_all = f.has("mmio");
     }
     fn observe_gpio(&mut self, on: bool) { self.gpio_events = if on { Some(Vec::new()) } else { None }; }
@@ -169,7 +182,10 @@ impl esp_soc::SocBus for SocBus {
     fn gpio_input(&self) -> u64 { self.periph.gpio.input }
     fn board(&mut self) -> &mut dyn BoardModel { &mut *self.board }
     fn board_ref(&self) -> &dyn BoardModel { &*self.board }
-    fn audio(&self) -> (&[i16], u32) { let a = self.periph.audio(); (&a.pcm, a.sample_rate) }
+    fn audio(&self) -> (&[i16], u32) {
+        if let Some(audio) = self.board.audio() { return audio; }
+        let a = self.periph.audio(); (&a.pcm, a.sample_rate)
+    }
     fn camera_frames(&self) -> u64 { self.periph.lcd_cam.frames }
     fn irq_sources_of(&self, core: usize, line: u32) -> Vec<usize> { (0..NUM_SOURCES).filter(|&s| self.periph.intmatrix.map[core][s] == line).collect() }
 }

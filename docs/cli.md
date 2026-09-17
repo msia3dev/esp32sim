@@ -15,7 +15,11 @@ register presets).
 | --- | --- |
 | `--boot rom\|app` | `rom`: start at the mask ROM reset vector (real boot chain). `app`: load the app image segments and jump to its entry |
 | `--bootloader F`, `--ptable F`, `--app F` | written to flash at 0x0 / 0x8000 / 0x10000 |
+| `--ptable-offset 0xNNNN` | where `--ptable` (and thus the partition table itself) is written, default 0x8000 — match your project's `CONFIG_PARTITION_TABLE_OFFSET` if it isn't the default (a bootloader built with Secure Boot V2 + Flash Encryption is often larger than the default 0x8000 gap and needs this pushed out, or it'll silently overlap and corrupt the tail of the bootloader image) |
+| `--app-offset 0xNNNN` | where `--app` is written (and, in `--boot app`, where its image is read from), default 0x10000 — match the offset of the partition you're booting (e.g. the `factory` app partition's actual offset from your partition table), which can differ once earlier partitions have been resized or reordered |
 | `--flash-image F` | whole flash dump written at 0 |
+| `--flash-state F` | persistent mutable ESP32-S3 logical flash; create from seed images when missing, otherwise load it and ignore the seeds |
+| `--efuse-state F` | persistent mutable ESP32-S3 physical eFuse state: native 336-byte payload or compatible 1 KiB QEMU backing file |
 | `--chip s3\|c3\|c6` | which chip (default s3) |
 | `--rom F` | mask ROM ELF (default: the chip's in `~/.espressif/tools/esp-rom-elfs/*/`) |
 | `--mac xx:xx:xx:xx:xx:xx` | the station MAC the efuses report |
@@ -31,6 +35,26 @@ register presets).
 | `--net nat\|none` | what the virtual network does with traffic it is not itself answering: `nat` (default) forwards TCP and UDP to the host's own network through ordinary sockets, `none` refuses it |
 | `--trace-fn PREFIX` (repeatable) | log every call to functions whose name starts with PREFIX, with args and caller |
 | `--regstat FILE` | write per-register access statistics (count, pc, symbol) at exit — for reverse-engineering |
+
+### Persistent state
+
+`--flash-state` makes ESP-IDF NVS, OTA metadata and every other flash-backed
+partition survive a separate emulator process. `--efuse-state` persists
+one-way eFuse burns. Both flags currently support the ESP32-S3 only.
+
+```sh
+esp32sim --chip s3 --boot rom \
+  --bootloader bootloader.bin --ptable partition-table.bin --app app.bin \
+  --flash-mb 16 \
+  --flash-state .state/flash.bin --efuse-state .state/efuse.bin
+```
+
+If a state file is absent, its seeds are applied once before it is created. If
+it exists, state wins and the corresponding seeds are ignored. Delete/select a
+new state file to emulate a fresh device; seed files are never overwritten.
+Flash state is logical CPU-visible data, not physical encrypted ciphertext.
+See [storage.md](storage.md) for exact formats, write timing, reset behavior,
+browser profiles and security considerations.
 
 ## Running
 | Flag | Meaning |
@@ -65,7 +89,7 @@ register presets).
 | `--coverage`, `--coverage-file F` | block starts reached, per function; with a file, one `addr symbol` line each |
 | `--irq-latency` | cycles from an interrupt line appearing at a core to the core taking it, per line; retains block execution |
 | `--vcd F` | GPIO edges and interrupt lines as a VCD waveform (1 ps units); retains block execution |
-| `--debug AREAS` | what the model prints: device names or prefixes (`spi`, `usb`, `i2c`, `wifi`, `gdma`, `sha`, `rsa`, `lcd_cam`), `net`, `wifi-frames`, `aes`, `rom`, `mmio`, `rt`; also `ESP_EMU_DEBUG=a,b` |
+| `--debug AREAS` | what the model prints: device names or prefixes (`spi`, `usb`, `i2c`, `wifi`, `gdma`, `sha`, `rsa`, `lcd_cam`), `ulp` (controller start/timer/halt lifecycle), `net`, `wifi-frames`, `aes`, `rom`, `mmio`, `rt`; also `ESP_EMU_DEBUG=a,b` |
 | `--log-periph` | log the first access to every unknown peripheral register |
 | `--no-jit` | run blocks through the interpreter instead of native code (aarch64 hosts compile blocks to machine code by default); the two must produce identical results, so this is the oracle when something looks wrong |
 | `--stop-after-exceptions N` | stop after N exceptions |
@@ -74,6 +98,10 @@ register presets).
 Environment: `ESP_EMU_DEBUG=wifi,spi,net` is `--debug` for every run (the older
 `ESP_EMU_DEBUG_SPI`, `ESP_EMU_DEBUG_NET`, `ESP_EMU_LOG_ALL`, `ESP_EMU_RT_LOG`... still work as aliases).
 `XTENSA_DIS_FILES=a.dis:b.dis` feeds the decoder equivalence test.
+
+When either ESP32-S3 ULP architecture runs, the final report includes its instruction and cycle
+counts, traps and main-CPU wake requests. These counts are diagnostic only and are not included
+in the main-core `--max-insns` limit. See [ulp.md](ulp.md) for supported behavior and limits.
 
 ## Action scripts
 

@@ -1,8 +1,9 @@
 //! Real-machine regressions for scheduler exits; invoked only by the WASM test build.
 use esp_soc::{ScriptAction, SocBus, Stop};
-use xtensa_lx7::Core;
+use xtensa_lx7::{Bus, Core};
 const BASE: u32 = 0x4037_0000;
 const CONTROL: u32 = 0x600c_0000;
+const RTC_CNTL: u32 = 0x6000_8000;
 // addi.n a3,a3,1; s32i a5,a4,0; j back
 const LOOP: [u8; 8] = [0x1b, 0x33, 0x52, 0x64, 0x00, 0xc6, 0xfd, 0xff];
 fn machine(jit: bool) -> esp32s3::Machine {
@@ -49,6 +50,21 @@ fn same(a: &esp32s3::Machine, b: &esp32s3::Machine) {
         assert_eq!(a.windowbase, b.windowbase);
         assert_eq!(a.epc, b.epc);
     }
+    assert_eq!(a.bus.rtc_slow, b.bus.rtc_slow);
+    assert_eq!(a.bus.ulp_fsm.cpu, b.bus.ulp_fsm.cpu);
+    assert_eq!(a.bus.ulp_fsm.wake_requests, b.bus.ulp_fsm.wake_requests);
+    assert_eq!(a.bus.ulp_fsm.traps, b.bus.ulp_fsm.traps);
+    assert_eq!(a.bus.ulp_fsm.decode_hits, b.bus.ulp_fsm.decode_hits);
+    assert_eq!(a.bus.ulp_fsm.decode_misses, b.bus.ulp_fsm.decode_misses);
+    assert_eq!(a.bus.ulp_riscv.cpu.pc, b.bus.ulp_riscv.cpu.pc);
+    assert_eq!(a.bus.ulp_riscv.cpu.x, b.bus.ulp_riscv.cpu.x);
+    assert_eq!(a.bus.ulp_riscv.cpu.mcause, b.bus.ulp_riscv.cpu.mcause);
+    assert_eq!(a.bus.ulp_riscv.cpu.insn_count, b.bus.ulp_riscv.cpu.insn_count);
+    assert_eq!(a.bus.ulp_riscv.cpu.retired_count, b.bus.ulp_riscv.cpu.retired_count);
+    assert_eq!(a.bus.ulp_riscv.cpu.cycle_count, b.bus.ulp_riscv.cpu.cycle_count);
+    assert_eq!(a.bus.ulp_riscv.wake_requests, b.bus.ulp_riscv.wake_requests);
+    assert_eq!(a.bus.ulp_riscv.traps, b.bus.ulp_riscv.traps);
+    assert_eq!(a.bus.periph.rtc.interrupt_status(), b.bus.periph.rtc.interrupt_status());
 }
 pub fn run() -> u32 {
     let (mut a, mut b) = (machine(false), machine(true));
@@ -94,5 +110,43 @@ pub fn run() -> u32 {
         }
         same(&a, &b);
     }
-    3
+    let (mut a, mut b) = (machine(false), machine(true));
+    let words = [0x7481_2340_u32, 0x7480_00a1, 0x6800_0184, 0x9000_0001, 0xb000_0000];
+    let program: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    for m in [&mut a, &mut b] {
+        SocBus::load_bytes(&mut m.bus, esp32s3::bus::RTC_SLOW_LOW, &program).unwrap();
+        m.bus.periph.rtc.write(0x104, (1 << 27) | (1 << 23));
+        m.bus.periph.rtc.write(0x100, (1 << 30) | (1 << 28) | (512 << 11) | 512);
+        m.max_cycles = m.bus.cycles + 1_000;
+        assert!(matches!(m.run(u64::MAX), Stop::Halted));
+    }
+    same(&a, &b);
+    assert_eq!(a.bus.ulp_fsm.wake_requests, 1);
+    const ULP_RISCV: &[u8] = include_bytes!("../../esp32s3/tests/fixtures/ulp-riscv/esp-idf-v5.2.1-test-app.bin");
+    let (mut a, mut b) = (machine(false), machine(true));
+    for m in [&mut a, &mut b] {
+        SocBus::load_bytes(&mut m.bus, esp32s3::bus::RTC_SLOW_LOW, ULP_RISCV).unwrap();
+        m.bus.write32(esp32s3::bus::RTC_SLOW_LOW + 0x1d0, 4).unwrap();
+        m.bus.write32(RTC_CNTL + 0x104, (1 << 27) | (1 << 24) | (1 << 22) | 1).unwrap();
+        m.bus.write32(RTC_CNTL + 0x100, (1 << 30) | (512 << 11) | 512).unwrap();
+        m.max_cycles = m.bus.cycles + 20_000;
+        assert!(matches!(m.run(u64::MAX), Stop::Halted));
+    }
+    same(&a, &b);
+    assert_eq!(u32::from_le_bytes(a.bus.rtc_slow[0x1c8..0x1cc].try_into().unwrap()), 4);
+    assert_eq!(u32::from_le_bytes(a.bus.rtc_slow[0x1cc..0x1d0].try_into().unwrap()), 1);
+    assert_eq!(u32::from_le_bytes(a.bus.rtc_slow[0x1e0..0x1e4].try_into().unwrap()), 1);
+    assert_eq!(a.bus.ulp_riscv.traps, 0);
+    let (mut a, mut b) = (machine(false), machine(true));
+    for m in [&mut a, &mut b] {
+        SocBus::load_bytes(&mut m.bus, esp32s3::bus::RTC_SLOW_LOW, ULP_RISCV).unwrap();
+        m.bus.write32(esp32s3::bus::RTC_SLOW_LOW + 0x1d0, 6).unwrap();
+        m.bus.write32(RTC_CNTL + 0x104, (1 << 27) | (1 << 24) | (1 << 22) | 1).unwrap();
+        m.bus.write32(RTC_CNTL + 0x100, (1 << 30) | (512 << 11) | 512).unwrap();
+        m.bus.tick(40_000_000);
+    }
+    same(&a, &b);
+    assert_eq!(u32::from_le_bytes(a.bus.rtc_slow[0x1dc..0x1e0].try_into().unwrap()), 100_000);
+    assert_eq!(a.bus.ulp_riscv.traps, 0);
+    6
 }

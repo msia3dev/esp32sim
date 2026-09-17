@@ -863,7 +863,7 @@ impl<S: Soc> Machine<S> {
     /// host edits between runs and events inserted by web input are observed immediately.
     #[inline]
     fn apply_script_events(&mut self) -> bool {
-        if !self.script.events.get(self.script.pos).is_some_and(|(at, _)| *at <= self.bus.cycles()) {
+        if self.script.events.get(self.script.pos).is_none_or(|(at, _)| *at > self.bus.cycles()) {
             return false;
         }
         self.apply_due_script_events()
@@ -990,7 +990,8 @@ impl<S: Soc> Machine<S> {
             let mkb = |d: &[u8]| -> Vec<u8> { let mut f = vec![0x82u8]; let n = d.len(); if n < 126 { f.push(n as u8); } else if n < 65536 { f.push(126); f.extend_from_slice(&(n as u16).to_be_bytes()); } else { f.push(127); f.extend_from_slice(&(n as u64).to_be_bytes()); } f.extend_from_slice(d); f };
             hello.push(mk(&format!("{{\"t\":\"serial\",\"src\":\"uart0\",\"data\":\"{}\"}}", json_escape(&String::from_utf8_lossy(&self.console.uart0)))));
             hello.push(mk(&format!("{{\"t\":\"serial\",\"src\":\"usb\",\"data\":\"{}\"}}", json_escape(&String::from_utf8_lossy(&self.console.usb)))));
-            hello.push(mk(&format!("{{\"t\":\"board\",\"name\":\"{}\"}}", board.name())));
+            let controls = board.panel_controls().iter().map(|control| format!("{{\"name\":\"{}\",\"label\":\"{}\",\"x\":{},\"y\":{}}}", json_escape(control.name), json_escape(control.label), control.x, control.y)).collect::<Vec<_>>().join(",");
+            hello.push(mk(&format!("{{\"t\":\"board\",\"name\":\"{}\",\"rotate\":{},\"controls\":[{}]}}", board.name(), board.display_rotation(), controls)));
             if let Some((w_, h_, px, _)) = board.display() { let mut b = vec![1u8, w_ as u8, (w_ >> 8) as u8, h_ as u8, (h_ >> 8) as u8]; for p in &px { b.push(*p as u8); b.push((*p >> 8) as u8); } hello.push(mkb(&b)); }
             if let Some(rgb) = board.camera_preview(320, 240) { let mut b = vec![4u8, (320u16 & 255) as u8, (320u16 >> 8) as u8, (240u16 & 255) as u8, (240u16 >> 8) as u8]; b.extend_from_slice(&rgb); hello.push(mkb(&b)); }
             if let Some((leds, _)) = board.leds() { let leds: Vec<String> = leds.iter().map(|c| format!("[{},{},{}]", c[0], c[1], c[2])).collect();

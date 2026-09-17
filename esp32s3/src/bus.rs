@@ -1,8 +1,12 @@
 //! ESP32-S3 memory map: internal SRAM (512 KiB, IRAM/DRAM aliases), mask ROM, RTC
 //! memories, external flash + PSRAM through the 512-entry cache MMU, peripherals.
 use crate::periph::{Peripherals, PERIPH_BASE, PERIPH_END};
+use crate::ulp::{RtcSlowBus, UlpFsmEngine};
+use crate::ulp_riscv::{UlpRiscVBus, UlpRiscVEngine};
 use crate::board::Board;
+use esp_soc::StateFile;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use xtensa_lx7::bus::{Bus, Fault};
 
 pub const SRAM_SIZE: usize = 512 * 1024;
@@ -83,6 +87,8 @@ pub struct SocBus {
     /// GPIO edges for observers, while one wants them: (cycle, pin, level)
     pub gpio_events: Option<Vec<(u64, u8, bool)>>,
     pub debug: esp_soc::DebugFlags,
+    pub ulp_fsm: UlpFsmEngine,
+    pub ulp_riscv: UlpRiscVEngine,
     /// Software TLB: the last resolved mapping per 64 KiB page, so loads, stores and fetches skip
     /// the address-range walk and the flash MMU. Cleared whenever the MMU changes.
     tlb: Vec<TlbEntry>,
@@ -98,7 +104,13 @@ pub struct SocBus {
     /// batch when a timer is due, a peripheral register is accessed, or MAX_TICK_DEFER cycles
     /// have passed — so guest-visible time is exact while idle rounds cost nothing.
     tick_pending: u32, tick_budget: u32,
+    flash_state: Option<StateSlot>,
+    efuse_state: Option<StateSlot>,
+    storage_error: Option<String>,
+    storage_generation: u64,
 }
+
+struct StateSlot { path: PathBuf, file: Option<StateFile>, loaded: bool }
 
 /// Longest stretch of cycles device models may go without seeing time advance. Bounds the
 /// latency of everything that has no computed deadline (DMA, USB, LCD, WiFi).
@@ -121,12 +133,78 @@ impl SocBus {
         let bus_uninit = SocBus {
             sram: vec![0; SRAM_SIZE], irom: vec![0; (IROM_MASK_HIGH - IROM_MASK_LOW) as usize], drom: vec![0; (DROM_MASK_HIGH - DROM_MASK_LOW) as usize],
             rtc_fast: vec![0; 8192], rtc_slow: vec![0; 8192], flash: vec![0xff; flash_size], psram: vec![0; psram_size],
-            mmu: [MMU_INVALID; MMU_ENTRIES], periph: Peripherals::new(mac), board: Box::new(crate::board::Atech14::new()), cycles: 0, last_fault: None, spi2_dma_fault: None, irq_dirty: false, gpio_events: None, debug: Default::default(),
+            mmu: [MMU_INVALID; MMU_ENTRIES], periph: Peripherals::new(mac), board: Box::new(crate::board::Atech14::new()), cycles: 0, last_fault: None, spi2_dma_fault: None, irq_dirty: false, gpio_events: None, debug: Default::default(), ulp_fsm: UlpFsmEngine::new(), ulp_riscv: UlpRiscVEngine::new(),
             tlb: vec![TlbEntry::EMPTY; TLB_SIZE], page_ver: Vec::new(), ver_base: [0; 7], tick_pending: 0, tick_budget: 0,
+            flash_state: None, efuse_state: None, storage_error: None, storage_generation: 0,
         };
         let mut b = bus_uninit;
         b.rebuild_page_table();
         b
+    }
+
+    pub fn configure_flash_state(&mut self, path: impl Into<PathBuf>) -> Result<bool, String> {
+        let path = path.into();
+        match StateFile::open(&path, self.flash.len())? {
+            Some((file, bytes)) => { self.flash = bytes; self.rebuild_page_table(); self.flash_state = Some(StateSlot { path, file: Some(file), loaded: true }); Ok(true) }
+            None => { self.flash_state = Some(StateSlot { path, file: None, loaded: false }); Ok(false) }
+        }
+    }
+
+    pub fn configure_efuse_state(&mut self, path: impl Into<PathBuf>) -> Result<bool, String> {
+        let path = path.into();
+        match StateFile::open_sizes(&path, &[crate::periph::EFUSE_STATE_BYTES, 1024])? {
+            Some((file, bytes)) => { self.periph.efuse.load_state(&bytes[..crate::periph::EFUSE_STATE_BYTES])?; self.efuse_state = Some(StateSlot { path, file: Some(file), loaded: true }); Ok(true) }
+            None => { self.efuse_state = Some(StateSlot { path, file: None, loaded: false }); Ok(false) }
+        }
+    }
+
+    pub fn persistent_flash_loaded(&self) -> bool { self.flash_state.as_ref().is_some_and(|state| state.loaded) }
+    pub fn persistent_efuse_loaded(&self) -> bool { self.efuse_state.as_ref().is_some_and(|state| state.loaded) }
+
+    pub fn initialize_storage(&mut self) -> Result<(), String> {
+        if let Some(state) = &mut self.flash_state {
+            if state.file.is_none() { state.file = Some(StateFile::create(&state.path, &self.flash)?); }
+        }
+        if let Some(state) = &mut self.efuse_state {
+            if state.file.is_none() { state.file = Some(StateFile::create(&state.path, &self.periph.efuse.state_bytes())?); }
+        }
+        Ok(())
+    }
+
+    pub fn flush_storage(&mut self) -> Result<(), String> {
+        if let Some(file) = self.flash_state.as_mut().and_then(|state| state.file.as_mut()) { file.sync()?; }
+        if let Some(file) = self.efuse_state.as_mut().and_then(|state| state.file.as_mut()) { file.sync()?; }
+        if let Some(error) = self.storage_error.take() { return Err(error); }
+        Ok(())
+    }
+
+    pub fn storage_generation(&self) -> u64 { self.storage_generation }
+    pub fn export_storage(&self, kind: u32) -> Option<Vec<u8>> { match kind { 0 => Some(self.flash.clone()), 1 => Some(self.periph.efuse.state_bytes()), _ => None } }
+    pub fn import_storage(&mut self, kind: u32, data: &[u8]) -> Result<(), String> {
+        match kind {
+            0 => {
+                if data.len() != self.flash.len() { return Err(format!("flash state is {} bytes, expected {}", data.len(), self.flash.len())); }
+                self.flash.copy_from_slice(data); self.rebuild_page_table(); Ok(())
+            }
+            1 => self.periph.efuse.load_state(data),
+            _ => Err(format!("unknown persistent state kind {}", kind)),
+        }
+    }
+
+    fn persist_flash(&mut self, offset: usize, len: usize) {
+        let end = offset.saturating_add(len).min(self.flash.len());
+        if end <= offset { return; }
+        self.storage_generation = self.storage_generation.wrapping_add(1);
+        if let Some(file) = self.flash_state.as_mut().and_then(|state| state.file.as_mut()) {
+            if let Err(error) = file.write_range(offset, &self.flash[offset..end]) { self.storage_error.get_or_insert(error); }
+        }
+    }
+
+    fn persist_efuse(&mut self) {
+        self.storage_generation = self.storage_generation.wrapping_add(1);
+        if let Some(file) = self.efuse_state.as_mut().and_then(|state| state.file.as_mut()) {
+            if let Err(error) = file.write_range(0, &self.periph.efuse.state_bytes()).and_then(|_| file.sync()) { self.storage_error.get_or_insert(error); }
+        }
     }
 
     /// Attach fresh peripheral-side devices and restore the levels driven by the persistent board.
@@ -238,6 +316,16 @@ impl SocBus {
     #[inline]
     fn is_periph(addr: u32) -> bool { (PERIPH_BASE..PERIPH_END).contains(&addr) }
 
+    #[inline]
+    fn is_efuse(addr: u32) -> bool {
+        (PERIPH_BASE + 0x7000..PERIPH_BASE + 0x8000).contains(&addr)
+    }
+
+    fn efuse_read8(&mut self, addr: u32) -> u8 {
+        let word = self.periph_read(addr & !3);
+        (word >> ((addr & 3) * 8)) as u8
+    }
+
     fn periph_read(&mut self, addr: u32) -> u32 {
         if (MMU_TABLE..MMU_TABLE + (MMU_ENTRIES as u32) * 4).contains(&addr) {
             return self.mmu[((addr - MMU_TABLE) >> 2) as usize];
@@ -247,6 +335,7 @@ impl SocBus {
     }
     fn periph_write(&mut self, addr: u32, v: u32) {
         self.periph_write_inner(addr, v);
+        self.reconcile_ulp();
         self.refresh_tick_budget();   // the write may have armed something
     }
     fn periph_write_inner(&mut self, addr: u32, v: u32) {
@@ -262,6 +351,7 @@ impl SocBus {
         }
         let old_gpio_out = self.periph.gpio.out;
         self.periph.write32(a, v);
+        if self.periph.efuse.take_dirty() { self.persist_efuse(); }
         self.complete_spi2_dma();
         self.deliver_spi2_transfer();
         // GPIO output writes usually only drive the board, but an enabled level
@@ -282,8 +372,14 @@ impl SocBus {
         }
         if self.periph.spi_exec {
             self.periph.spi_exec = false;
+            if let Some(program) = self.periph.flash_encrypt.take_ready() {
+                self.periph.spi1.encrypted_program = Some(program);
+            }
             self.periph.spi1.execute(&mut self.flash, &mut self.psram);
-            for (m, off, len) in std::mem::take(&mut self.periph.spi1.dirty) { self.note_written(match m { crate::periph::DirtyMem::Flash => SRC_FLASH, crate::periph::DirtyMem::Psram => SRC_PSRAM }, off, len); }
+            for (m, off, len) in std::mem::take(&mut self.periph.spi1.dirty) {
+                self.note_written(match m { crate::periph::DirtyMem::Flash => SRC_FLASH, crate::periph::DirtyMem::Psram => SRC_PSRAM }, off, len);
+                if m == crate::periph::DirtyMem::Flash { self.persist_flash(off, len); }
+            }
         }
     }
 
@@ -337,7 +433,7 @@ impl SocBus {
                     events.push((self.cycles, pin, level));
                 }
             }
-            self.board.gpio_changes(&changes);
+            self.board.gpio_changes_at(self.cycles, &changes);
         }
         let rx = self.board.spi_transfer(2, &transfer.tx, transfer.rx_len);
         self.periph.spi2.finish_transfer(transfer, &rx);
@@ -909,12 +1005,21 @@ impl SocBus {
 
 impl Bus for SocBus {
     fn read8(&mut self, addr: u32) -> Result<u8, Fault> {
+        // ESP32-S3's ROM byte-reads eFuse shadow registers while provisioning
+        // Secure Boot. Narrow reads remain rejected for other peripherals,
+        // where widening a FIFO or clear-on-read access could add side effects.
+        if Self::is_efuse(addr) { return Ok(self.efuse_read8(addr)); }
         if Self::is_periph(addr) { self.last_fault = Some((addr, false)); return Err(Fault::Prohibited); }
+        if (RTC_SLOW_LOW..RTC_SLOW_HIGH).contains(&addr) { self.flush_ticks(); }
         let Some(e) = self.lookup(addr) else { self.last_fault = Some((addr, false)); return Err(Fault::Unmapped) };
         Ok(self.buf(e.src as u8)[e.off as usize + (addr - e.lo) as usize])
     }
     fn read16(&mut self, addr: u32) -> Result<u16, Fault> {
+        if Self::is_efuse(addr) {
+            return Ok(u16::from_le_bytes([self.efuse_read8(addr), self.efuse_read8(addr + 1)]));
+        }
         if Self::is_periph(addr) { self.last_fault = Some((addr, false)); return Err(Fault::Prohibited); }
+        if (RTC_SLOW_LOW..RTC_SLOW_HIGH).contains(&addr) { self.flush_ticks(); }
         match self.lookup(addr) {
             Some(e) if addr.wrapping_add(2) <= e.hi => { let o = e.off as usize + (addr - e.lo) as usize; Ok(u16::from_le_bytes(self.buf(e.src as u8)[o..o + 2].try_into().unwrap())) }
             Some(_) => Ok(u16::from_le_bytes([self.read8(addr)?, self.read8(addr + 1)?])),       // straddles a page
@@ -926,6 +1031,7 @@ impl Bus for SocBus {
             if addr & 3 != 0 { self.last_fault = Some((addr, false)); return Err(Fault::Misaligned); }
             return Ok(self.periph_read(addr));
         }
+        if (RTC_SLOW_LOW..RTC_SLOW_HIGH).contains(&addr) { self.flush_ticks(); }
         match self.lookup(addr) {
             Some(e) if addr.wrapping_add(4) <= e.hi => { let o = e.off as usize + (addr - e.lo) as usize; Ok(u32::from_le_bytes(self.buf(e.src as u8)[o..o + 4].try_into().unwrap())) }
             Some(_) => Ok(u32::from_le_bytes([self.read8(addr)?, self.read8(addr + 1)?, self.read8(addr + 2)?, self.read8(addr + 3)?])),
@@ -937,6 +1043,7 @@ impl Bus for SocBus {
         // Reject unsupported widths before reading a device or advancing its time.
         // This is an explicit emulator policy, not a model of optional PMS IRQs.
         if Self::is_periph(addr) { self.last_fault = Some((addr, true)); return Err(Fault::Prohibited); }
+        if (RTC_SLOW_LOW..RTC_SLOW_HIGH).contains(&addr) { self.flush_ticks(); }
         match self.lookup(addr) {
             Some(e) if e.writable != 0 => { let rel = (addr - e.lo) as usize; self.buf_mut(e.src as u8)[e.off as usize + rel] = v; self.bump(e.vbase, rel, 1); Ok(()) }
             _ => { self.last_fault = Some((addr, true)); Err(Fault::Prohibited) }
@@ -944,6 +1051,7 @@ impl Bus for SocBus {
     }
     fn write16(&mut self, addr: u32, v: u16) -> Result<(), Fault> {
         if Self::is_periph(addr) { self.last_fault = Some((addr, true)); return Err(Fault::Prohibited); }
+        if (RTC_SLOW_LOW..RTC_SLOW_HIGH).contains(&addr) { self.flush_ticks(); }
         match self.lookup(addr) {
             Some(e) if e.writable != 0 && addr.wrapping_add(2) <= e.hi => { let rel = (addr - e.lo) as usize; let o = e.off as usize + rel; self.buf_mut(e.src as u8)[o..o + 2].copy_from_slice(&v.to_le_bytes()); self.bump(e.vbase, rel, 2); Ok(()) }
             Some(e) if e.writable != 0 => { let b = v.to_le_bytes(); self.write8(addr, b[0])?; self.write8(addr + 1, b[1]) }
@@ -955,6 +1063,7 @@ impl Bus for SocBus {
             if addr & 3 != 0 { self.last_fault = Some((addr, true)); return Err(Fault::Misaligned); }
             self.periph_write(addr, v); return Ok(());
         }
+        if (RTC_SLOW_LOW..RTC_SLOW_HIGH).contains(&addr) { self.flush_ticks(); }
         match self.lookup(addr) {
             Some(e) if e.writable != 0 && addr.wrapping_add(4) <= e.hi => { let rel = (addr - e.lo) as usize; let o = e.off as usize + rel; self.buf_mut(e.src as u8)[o..o + 4].copy_from_slice(&v.to_le_bytes()); self.bump(e.vbase, rel, 4); Ok(()) }
             Some(e) if e.writable != 0 => { let b = v.to_le_bytes(); for i in 0..4 { self.write8(addr + i, b[i as usize])?; } Ok(()) }
@@ -962,6 +1071,7 @@ impl Bus for SocBus {
         }
     }
     fn fetch(&mut self, pc: u32) -> Result<[u8; 4], Fault> {
+        if (RTC_SLOW_LOW..RTC_SLOW_HIGH).contains(&pc) { self.flush_ticks(); }
         let Some(e) = self.lookup(pc) else { self.last_fault = Some((pc, false)); return Err(Fault::Unmapped) };
         let o = e.off as usize + (pc - e.lo) as usize;
         let b = self.buf(e.src as u8);
@@ -1004,6 +1114,9 @@ impl Bus for SocBus {
 impl SocBus {
     pub(crate) fn refresh_tick_budget(&mut self) {
         let mut budget = self.periph.cycles_until_timer().clamp(1, MAX_TICK_DEFER);
+        let fast_hz = UlpFsmEngine::rtc_fast_hz(&self.periph.rtc);
+        if let Some(deadline) = self.ulp_fsm.cpu_cycles_until_deadline(fast_hz) { budget = budget.min(deadline); }
+        if let Some(deadline) = self.ulp_riscv.cpu_cycles_until_deadline(fast_hz) { budget = budget.min(deadline); }
         if let Some(deadline) = self.board.next_deadline() {
             let until_deadline = u64::from(self.tick_pending)
                 .saturating_add(deadline.saturating_sub(self.cycles))
@@ -1025,6 +1138,7 @@ impl SocBus {
         // Reads may flush before the periodic backstop. Refresh for either edge
         // of a clocked source, without breaking every block that polls MMIO.
         self.irq_dirty |= self.periph.tick(cycles as u64);
+        self.advance_ulp(cycles);
         self.board.advance_to(self.cycles);
         for edge in self.board.take_edges() {
             if let Some(events) = &mut self.gpio_events { events.push((edge.cycle, edge.pin, edge.level)); }
@@ -1062,7 +1176,7 @@ impl SocBus {
         if !self.periph.gpio.changes.is_empty() {
             let ch = std::mem::take(&mut self.periph.gpio.changes);
             if let Some(ev) = &mut self.gpio_events { for &(pin, level) in &ch { ev.push((self.cycles, pin, level)); } }
-            self.board.gpio_changes(&ch);
+            self.board.gpio_changes_at(self.cycles, &ch);
         }
         self.deliver_spi2_transfer();
         if !self.periph.rmt.done.is_empty() {
@@ -1074,6 +1188,37 @@ impl SocBus {
         }
         0
     }
+
+    fn reconcile_ulp(&mut self) {
+        let version_base = self.ver_base[SRC_RTC_SLOW as usize];
+        let mut bus = RtcSlowBus::new(&mut self.periph.rtc, &mut self.rtc_slow, &mut self.page_ver, version_base);
+        self.ulp_fsm.reconcile(&mut bus);
+        drop(bus);
+        let mut bus = UlpRiscVBus::new(&mut self.periph.rtc, &mut self.rtc_slow, &mut self.page_ver, version_base);
+        self.ulp_riscv.reconcile(&mut bus);
+    }
+
+    fn advance_ulp(&mut self, cycles: u32) {
+        let interrupt_before = self.periph.rtc.interrupt_status();
+        let fast_hz = UlpFsmEngine::rtc_fast_hz(&self.periph.rtc);
+        let version_base = self.ver_base[SRC_RTC_SLOW as usize];
+        let mut bus = RtcSlowBus::new(&mut self.periph.rtc, &mut self.rtc_slow, &mut self.page_ver, version_base);
+        self.ulp_fsm.advance(cycles, fast_hz, &mut bus);
+        let changes = bus.take_gpio_changes();
+        drop(bus);
+        let mut riscv_bus = UlpRiscVBus::new(&mut self.periph.rtc, &mut self.rtc_slow, &mut self.page_ver, version_base);
+        self.ulp_riscv.advance(cycles, fast_hz, &mut riscv_bus);
+        let mut changes = changes;
+        changes.extend(riscv_bus.take_gpio_changes());
+        drop(riscv_bus);
+        if !changes.is_empty() {
+            if let Some(events) = &mut self.gpio_events {
+                for &(pin, level) in &changes { events.push((self.cycles, pin, level)); }
+            }
+            self.board.gpio_changes_at(self.cycles, &changes);
+        }
+        self.irq_dirty |= interrupt_before != self.periph.rtc.interrupt_status();
+    }
 }
 #[cfg(test)]
 mod gp_spi_board_tests {
@@ -1083,6 +1228,52 @@ mod gp_spi_board_tests {
     const SPI2: u32 = 0x6002_4000;
     const GDMA: u32 = 0x6003_f000;
     const FIRST_DESC: u32 = 0x3fc9_0100;
+
+    fn state_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("esp32sim-s3-state-{}-{}", std::process::id(), name))
+    }
+
+    #[test]
+    fn flash_program_and_erase_survive_a_new_bus() {
+        const SPI1: u32 = 0x6000_2000;
+        let path = state_path("flash.bin"); let _ = std::fs::remove_file(&path);
+        {
+            let mut bus = SocBus::new(0x2000, 0, [0; 6]);
+            assert!(!bus.configure_flash_state(&path).unwrap()); bus.initialize_storage().unwrap();
+            bus.periph.spi1.regs.write(0x4, 0x120); bus.periph.spi1.regs.write(0x24, 31); bus.periph.spi1.w[0] = 0x4433_2211;
+            bus.write32(SPI1, 1 << 25).unwrap(); bus.flush_storage().unwrap();
+        }
+        {
+            let mut bus = SocBus::new(0x2000, 0, [0; 6]); assert!(bus.configure_flash_state(&path).unwrap());
+            assert_eq!(&bus.flash[0x120..0x124], &[0x11, 0x22, 0x33, 0x44]);
+            bus.periph.spi1.regs.write(0x4, 0x120); bus.write32(SPI1, 1 << 24).unwrap(); bus.flush_storage().unwrap();
+        }
+        let mut bus = SocBus::new(0x2000, 0, [0; 6]); assert!(bus.configure_flash_state(&path).unwrap());
+        assert_eq!(&bus.flash[0x120..0x124], &[0xff; 4]); std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn efuse_burn_survives_a_new_bus() {
+        const EFUSE: u32 = 0x6000_7000;
+        let path = state_path("efuse.bin"); let _ = std::fs::remove_file(&path);
+        {
+            let mut bus = SocBus::new(1024, 0, [0; 6]); assert!(!bus.configure_efuse_state(&path).unwrap()); bus.initialize_storage().unwrap();
+            bus.write32(EFUSE, 0x55).unwrap(); bus.write32(EFUSE + 0x1d4, (4 << 2) | 2).unwrap(); bus.flush_storage().unwrap();
+        }
+        let mut bus = SocBus::new(1024, 0, [0; 6]); assert!(bus.configure_efuse_state(&path).unwrap());
+        assert_eq!(bus.periph.efuse.read(0x9c), 0x55); std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn qemu_sized_efuse_backing_preserves_padding() {
+        const EFUSE: u32 = 0x6000_7000;
+        let path = state_path("qemu-efuse.bin"); let _ = std::fs::remove_file(&path);
+        let mut backing = vec![0u8; 1024]; backing[esp_periph::EFUSE_STATE_BYTES..].fill(0xa5); std::fs::write(&path, &backing).unwrap();
+        let mut bus = SocBus::new(1024, 0, [0; 6]); assert!(bus.configure_efuse_state(&path).unwrap());
+        bus.write32(EFUSE, 0x55).unwrap(); bus.write32(EFUSE + 0x1d4, (4 << 2) | 2).unwrap(); bus.flush_storage().unwrap(); drop(bus);
+        let saved = std::fs::read(&path).unwrap(); assert_eq!(saved.len(), 1024); assert!(saved[esp_periph::EFUSE_STATE_BYTES..].iter().all(|byte| *byte == 0xa5));
+        std::fs::remove_file(path).unwrap();
+    }
 
     struct ProbeBoard {
         events: Arc<Mutex<Vec<String>>>,
@@ -1643,6 +1834,22 @@ mod gp_spi_board_tests {
         assert_eq!(bus.read32(USB), Ok(0x11));
         assert_eq!(bus.periph.usb.rx.iter().copied().collect::<Vec<_>>(), [0x22]);
         assert_eq!(bus.tick_pending, 0);
+    }
+
+    #[test]
+    fn efuse_shadow_registers_allow_narrow_reads() {
+        const EFUSE: u32 = 0x6000_7000;
+        let mut bus = SocBus::new(1024, 1024, [0; 6]);
+        bus.periph.efuse.ram.write(0x9c, 0x4433_2211);
+        bus.periph.efuse.ram.write(0xa0, 0x8877_6655);
+
+        assert_eq!(bus.read8(EFUSE + 0x9c), Ok(0x11));
+        assert_eq!(bus.read8(EFUSE + 0x9f), Ok(0x44));
+        assert_eq!(bus.read16(EFUSE + 0x9d), Ok(0x3322));
+        assert_eq!(bus.read16(EFUSE + 0x9f), Ok(0x5544));
+
+        assert_eq!(bus.read8(0x6003_8000), Err(Fault::Prohibited));
+        assert_eq!(bus.read16(0x6003_8000), Err(Fault::Prohibited));
     }
 
     #[test]

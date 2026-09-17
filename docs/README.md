@@ -10,6 +10,7 @@ cover the RISC-V side.
 | [peripherals.md](peripherals.md) | Every modelled block, what part of it is modelled, what is missing |
 | [boards.md](boards.md) | The `BoardModel` trait, the three boards, pin maps, how to add one |
 | [cli.md](cli.md) | Command-line flags, environment variables, action scripts, output files |
+| [storage.md](storage.md) | Persistent flash/NVS and eFuse state: lifecycle, formats, precedence, browser profiles |
 | [web-ui.md](web-ui.md) | The browser UI and its WebSocket protocol |
 | [decisions.md](decisions.md) | Design decisions and hard-won gotchas (the "why" behind the code) |
 | [roadmap.md](roadmap.md) | What is planned, in priority order |

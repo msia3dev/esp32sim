@@ -2,7 +2,101 @@
 //! mechanics from outside the crate: dispatch by block and range, `delta`, `alias`, the generic
 //! fallback, interrupt source mapping, tick delivery per clock domain, the timer-deadline query.
 use emu_core::{ClockDomain, ClockTree};
-use esp_periph::{device_set, mmio, Device, DeviceSet, Dispatch, Gpio, I2s, Misc, RegRam, Systimer, TimerGroup, UsbSerialJtag, WriteEffect, NO_SOURCE};
+use esp_periph::{device_set, mmio, Device, DeviceSet, Dispatch, Gpio, I2s, Misc, RegRam, RtcCntl, Systimer, TimerGroup, UlpState, UsbSerialJtag, WriteEffect, NO_SOURCE};
+
+// ------------------------------------------------------------------ RTC ULP controller
+#[test]
+fn rtc_ulp_registers_arm_the_timer_and_publish_state() {
+    let mut rtc = RtcCntl::new();
+    assert_eq!(Device::write(&mut rtc, 0x104, (1 << 27) | (1 << 23)), WriteEffect::ULP); // FSM, clock gate
+    assert_eq!(Device::write(&mut rtc, 0x100, (1 << 28) | (512 << 11) | 512), WriteEffect::ULP); // FSM clock, memory range
+    assert_eq!(Device::write(&mut rtc, 0x134, 12 << 8), WriteEffect::ULP); // wake period
+    assert_eq!(Device::write(&mut rtc, 0xfc, (1 << 31) | 9), WriteEffect::ULP); // timer, entry PC
+    assert_eq!(Device::clock(&rtc), Some(ClockDomain::RtcSlow));
+    Device::debug(&mut rtc, true);
+    assert!(rtc.ulp.debug_enabled());
+    assert!(Device::has_deadline(&rtc));
+    assert_eq!(Device::next_deadline(&rtc), Some(12));
+
+    Device::tick(&mut rtc, 11);
+    assert_eq!(rtc.ulp.state, UlpState::WakeDelay);
+    assert_eq!(Device::next_deadline(&rtc), Some(1));
+    Device::tick(&mut rtc, 1);
+    assert_eq!(rtc.ulp.state, UlpState::Running);
+    assert_eq!(rtc.ulp.entry_pc, 9);
+    assert_eq!(Device::read(&mut rtc, 0xd0) & (0xf << 13), 1 << 13, "LOW_POWER_ST reports COCPU start");
+    assert!(rtc.ulp.report().is_some_and(|line| line.contains("Fsm Running") && line.contains("1 starts")));
+}
+
+#[test]
+fn rtc_ulp_reset_blocks_start_and_unrelated_writes_have_no_effect() {
+    let mut rtc = RtcCntl::new();
+    Device::write(&mut rtc, 0x104, (1 << 27) | (1 << 23));
+    assert_eq!(Device::write(&mut rtc, 0x100, (1 << 30) | (1 << 29) | (1 << 28)), WriteEffect::ULP);
+    assert_eq!(rtc.ulp.state, UlpState::Reset);
+    assert_eq!(rtc.ulp.starts, 0);
+
+    Device::write(&mut rtc, 0x100, 1 << 28);
+    Device::write(&mut rtc, 0x100, (1 << 30) | (1 << 28));
+    assert_eq!(rtc.ulp.state, UlpState::Running);
+    assert_eq!(rtc.ulp.starts, 1);
+    assert_eq!(Device::write(&mut rtc, 0x74, 0x1234), WriteEffect::NONE);
+}
+
+#[test]
+fn rtc_interrupt_raw_enable_status_clear_and_aliases_match_hardware_registers() {
+    let mut rtc = RtcCntl::new();
+    let ulp = esp_periph::INT_ULP_CP;
+
+    rtc.raise_ulp_interrupt();
+    assert_eq!(Device::read(&mut rtc, 0x44) & ulp, ulp, "raw records a disabled event");
+    assert_eq!(Device::read(&mut rtc, 0x48) & ulp, 0, "status masks raw with enable");
+    assert_eq!(Device::irq_sources(&rtc), 0);
+
+    Device::write(&mut rtc, 0x138, ulp);
+    assert_eq!(Device::read(&mut rtc, 0x40) & ulp, ulp);
+    assert_eq!(Device::read(&mut rtc, 0x48) & ulp, ulp);
+    assert_eq!(Device::irq_sources(&rtc), 1);
+
+    Device::write(&mut rtc, 0x13c, ulp);
+    assert_eq!(Device::read(&mut rtc, 0x48) & ulp, 0);
+    assert_eq!(Device::read(&mut rtc, 0x44) & ulp, ulp, "disable does not clear raw");
+    Device::write(&mut rtc, 0x40, ulp);
+    Device::write(&mut rtc, 0x4c, ulp);
+    assert_eq!(Device::read(&mut rtc, 0x44) & ulp, 0);
+    assert_eq!(Device::read(&mut rtc, 0x48) & ulp, 0);
+    assert_eq!(Device::read(&mut rtc, 0x4c), 0, "write-only clear reads zero");
+
+    rtc.raise_ulp_interrupt();
+    Device::write(&mut rtc, 0x44, 0);
+    assert_eq!(Device::read(&mut rtc, 0x44) & ulp, 0, "ESP-IDF clears raw through REG_CLR_BIT");
+}
+
+#[test]
+fn rtc_cocpu_wake_trap_and_done_use_the_shared_interrupt_and_lifecycle_registers() {
+    let mut rtc = RtcCntl::new();
+    Device::write(&mut rtc, 0x18, 1);
+    assert_eq!(Device::read(&mut rtc, 0x44) & esp_periph::INT_COCPU, esp_periph::INT_COCPU);
+    rtc.raise_cocpu_trap_interrupt();
+    assert_eq!(Device::read(&mut rtc, 0x44) & esp_periph::INT_COCPU_TRAP, esp_periph::INT_COCPU_TRAP);
+
+    Device::write(&mut rtc, 0x104, (1 << 27) | 1); // RISC-V clock
+    Device::write(&mut rtc, 0x100, 1 << 30);       // force start
+    assert_eq!(rtc.ulp.state, UlpState::Running);
+    Device::write(&mut rtc, 0x104, (1 << 27) | (1 << 25) | 1);
+    assert_eq!(rtc.ulp.state, UlpState::Halted);
+}
+
+#[test]
+fn rtc_io_w1_registers_update_output_and_enable_latches() {
+    let mut rtc = RtcCntl::new();
+    Device::write(&mut rtc, 0x404, (1 << 10) | (1 << 12));
+    Device::write(&mut rtc, 0x408, 1 << 10);
+    assert_eq!(Device::read(&mut rtc, 0x400), 1 << 12);
+    Device::write(&mut rtc, 0x410, (1 << 11) | (1 << 12));
+    Device::write(&mut rtc, 0x414, 1 << 11);
+    assert_eq!(Device::read(&mut rtc, 0x40c), 1 << 12);
+}
 
 // ------------------------------------------------------------------ systimer
 #[test]
@@ -62,6 +156,20 @@ fn timer_group_alarm_autoreload_and_deadline() {
     assert_eq!(Device::read(&mut g, 0x0) & (1 << 10), 1 << 10, "autoreload keeps the alarm");
 }
 
+#[test]
+fn timer_group_rtc_calibration_uses_the_selected_clock() {
+    let mut timer = TimerGroup::new();
+    let cycles = 100u32;
+    let value = |timer: &mut TimerGroup| Device::read(timer, 0x6c) >> 7;
+
+    Device::write(&mut timer, 0x68, cycles << 16);
+    assert_eq!(value(&mut timer), cycles * 40_000_000 / 150_000);
+    Device::write(&mut timer, 0x68, (cycles << 16) | (1 << 13));
+    assert_eq!(value(&mut timer), (u64::from(cycles) * 40_000_000 / (17_500_000 / 256)) as u32);
+    Device::write(&mut timer, 0x68, (cycles << 16) | (2 << 13));
+    assert_eq!(value(&mut timer), cycles * 40_000_000 / 32_768);
+}
+
 // ------------------------------------------------------------------ GPIO
 #[test]
 fn gpio_edges_and_interrupt_types() {
@@ -72,7 +180,7 @@ fn gpio_edges_and_interrupt_types() {
     assert_eq!(g.changes, vec![(5, true), (5, false)], "output edges in order, only for enabled pins");
     // pin 7: rising-edge interrupt, enabled for core 0
     Device::write(&mut g, 0x74 + 4 * 7, (1 << 7) | (1 << 13));
-    assert!(!g.set_input(7, false)); assert!(!Device::irq_sources(&g) != 0 || true);
+    assert!(!g.set_input(7, false)); assert_eq!(Device::irq_sources(&g), 0);
     assert!(g.set_input(7, true), "a rising edge latches STATUS");
     assert_eq!(Device::irq_sources(&g), 1);
     Device::write(&mut g, 0x4c, 1 << 7);                     // STATUS_W1TC

@@ -1,0 +1,56 @@
+# Generated with ESP-IDF 5.2.1's esp32ulp-elf-as 2.38_20240113 using --mcpu=esp32s2.
+# raw word | canonical disassembly
+40000011|wait 17
+b0000000|halt
+90000001|wake
+74812340|move r0, 0x1234
+70800001|move r1, r0
+70000012|add r2, r0, r1
+7420007b|sub r3, r2, 7
+74400ff0|and r0, r0, 255
+70600025|or r1, r1, r2
+74a0003a|lsh r2, r2, 3
+70c0000f|rsh r3, r3, r0
+78400000|stage_rst
+78000050|stage_inc 5
+78200020|stage_dec 2
+d0000804|ld r0, r1, 8
+d0000c09|ld r1, r2, 12
+d800100e|ldh r2, r3, 16
+68000d8e|st r2, r3, 12
+68001184|st r0, r1, 16
+680015c9|sth r1, r2, 20
+6800182e|st32 r2, r3, 24, 2
+68001c93|stl r3, r0, 28, 1
+680020f4|sth r0, r1, 32, 3
+66002400|sto 36
+62000189|sti r1, r2
+620000ae|sti r2, r3, 2
+62000013|sti32 r3, r0, 1
+8400000c|jump 12
+84200002|jump r2
+84400010|jump 16, eq
+84800014|jump 20, ov
+84600001|jump r1, eq
+84a00003|jump r3, ov
+80080055|jumpr 8, 85, lt
+80090055|jumpr 8, 85, gt
+800a0055|jumpr 8, 85, eq
+8a0b8003|jumps -8, 3, ge
+88088003|jumps 8, 3, lt
+880a8003|jumps 8, 3, le
+880a0003|jumps 8, 3, eq
+88098003|jumps 8, 3, gt
+11841404|reg_wr 4, 3, 1, 5
+23080007|reg_rd 7, 6, 2
+50000011|adc r1, 0, 3
+a0000086|tsens r2, 33
+38a93412|i2c_wr 0x12, 0x34, 5, 1, 2
+30f80056|i2c_rd 0x56, 7, 0, 3
+74000094|add r0, r1, 9
+70200039|sub r1, r2, r3
+7040000e|and r2, r3, r0
+74600aa3|or r3, r0, 170
+7080003c|move r0, r3
+70a00039|lsh r1, r2, r3
+74c00046|rsh r2, r1, 4

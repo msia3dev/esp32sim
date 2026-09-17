@@ -82,6 +82,12 @@ pub trait SocBus: Bus {
     fn misc(&mut self) -> &mut Misc;
     fn load_bytes(&mut self, addr: u32, data: &[u8]) -> Result<(), String>;
     fn write_flash(&mut self, offset: usize, data: &[u8]) -> Result<(), String>;
+    fn persistent_flash_loaded(&self) -> bool { false }
+    fn initialize_storage(&mut self) -> Result<(), String> { Ok(()) }
+    fn flush_storage(&mut self) -> Result<(), String> { Ok(()) }
+    fn storage_generation(&self) -> u64 { 0 }
+    fn export_storage(&self, _kind: u32) -> Option<Vec<u8>> { None }
+    fn import_storage(&mut self, _kind: u32, _data: &[u8]) -> Result<(), String> { Err("persistent state is unsupported for this chip".into()) }
     /// Map and copy the app image at flash `app_off` as the bootloader would; returns the entry point.
     fn boot_app(&mut self, app_off: usize) -> Result<u32, String>;
     /// Chip reset: re-create the digital peripherals, keep what survives on silicon. Returns the cause.

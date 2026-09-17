@@ -159,4 +159,14 @@ mod tests {
         assert_eq!(cpu.read_csr(csr::MINSTRET), 0xffff_ffe0);
         assert_eq!(cpu.read_csr(csr::MINSTRETH), 0x9000_0000);
     }
+
+    #[test]
+    fn standard_user_counter_aliases_are_read_only() {
+        let mut cpu = crate::Cpu::new();
+        cpu.advance_cycles(9);
+        assert_eq!(cpu.read_csr(csr::CYCLE), 9);
+        cpu.write_csr(csr::CYCLE, 1);
+        assert_eq!(cpu.read_csr(csr::CYCLE), 9);
+        assert_eq!(cpu.read_csr(csr::INSTRET), 0);
+    }
 }

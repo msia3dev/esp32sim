@@ -14,7 +14,7 @@ ESP32-S3 peripheral MMIO reads and writes must be aligned 32-bit accesses. Byte 
 | SPI0/SPI1 (flash controller) | 0x60002000/3000 | full | user commands, JEDEC (size follows `--flash-mb`), read/program/erase, status/QE |
 | Octal PSRAM (on SPI1 CS1) | — | full | mode registers MR0–MR8, sync read/write, `--psram-mb` |
 | efuse | 0x60007000 | partial | MAC, chip revision, defaults; `--efuse-regs` loads a dump |
-| RTC_CNTL | 0x60008000 | partial | reset cause, slow-clock time, SW resets, RTC watchdog (stages, feed, wprotect) |
+| RTC_CNTL / ULP | 0x60008000 | partial | reset cause, slow-clock time, SW resets, RTC watchdog; ULP-FSM and ULP RISC-V timer/force-start/reset/halt lifecycle, RTC core interrupt raw/enable/status/clear, running-CPU wake and periodic reruns |
 | systimer | 0x60023000 | full | 2 units, 3 targets, one-shot/periodic |
 | Timer groups 0/1 | 0x6001F000/20000 | partial | timer 0 with alarm/auto-reload; WDT registers as stubs |
 | GPIO / IO_MUX | 0x60004000/9000 | full | out/enable/input, pin matrix in/out selects, edge/level interrupts, strap |
@@ -38,3 +38,10 @@ ESP32-S3 peripheral MMIO reads and writes must be aligned 32-bit accesses. Byte 
 
 CPU-side: full base ISA, FPU (single precision), MAC16, booleans, PIE (all esp-dl/esp-dsp
 ops; FFT/GPIO/s32 corners decode but are not executed).
+
+ULP-side: the ESP32-S3 ULP-FSM instruction families execute from shared RTC slow memory with
+RTC GPIO, ADC, temperature sensor and RTC-I2C register access. ULP RISC-V reuses the RV32IMC
+core (including the LR/SC and AMO operations used by ESP-IDF's shared lock), standard cycle
+counters, a restricted RTC-memory/peripheral map, timer reruns, wake and trap signaling. Deep
+sleep and its reset/wakeup-cause registers are not modelled; a ULP can wake a running or `waiti`
+main core, but the simulator does not claim a deep-sleep wake cause. See [ulp.md](ulp.md).
