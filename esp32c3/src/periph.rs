@@ -41,6 +41,7 @@ pub mod src {
 /// cleared by writing CPU_INT_CLEAR.
 pub struct Intc {
     pub map: [u32; src::COUNT],
+    pub source_status: [u32; 2],
     pub lines: esp_periph::intmtx::Lines,
     ram: RegRam,
 }
@@ -49,12 +50,13 @@ impl Default for Intc { fn default() -> Self { Self::new() } }
 
 impl Intc {
     pub fn new() -> Self {
-        Intc { map: [0; src::COUNT], lines: Default::default(), ram: RegRam::new() }
+        Intc { map: [0; src::COUNT], source_status: [0; 2], lines: Default::default(), ram: RegRam::new() }
     }
 
     pub fn read(&self, off: u32) -> u32 {
         match off {
-            0x000..=0x0f8 => self.map.get((off / 4) as usize).copied().unwrap_or(0),
+            0x000..=0x0f4 => self.map[(off / 4) as usize],
+            0x0f8 => self.source_status[0], 0x0fc => self.source_status[1],
             0x104 => self.lines.enable,
             0x108 => self.lines.int_type,
             0x110 => self.lines.level | self.lines.edge_pending,     // EIP_STATUS: raw source state
@@ -66,7 +68,7 @@ impl Intc {
 
     pub fn write(&mut self, off: u32, v: u32) {
         match off {
-            0x000..=0x0f8 => { if let Some(m) = self.map.get_mut((off / 4) as usize) { *m = v & 0x1f; } }
+            0x000..=0x0f4 => self.map[(off / 4) as usize] = v & 0x1f,
             0x104 => self.lines.enable = v,
             0x108 => self.lines.int_type = v,
             0x10c => self.lines.edge_pending &= !v,            // CPU_INT_CLEAR
@@ -243,6 +245,7 @@ impl Peripherals {
         let st = self.source_status();
         let changed = st != self.last_status;
         self.last_status = st;
+        self.intc.source_status.copy_from_slice(&st[..2]);
         self.intc.lines.update(&self.intc.map, &st);
         changed
     }

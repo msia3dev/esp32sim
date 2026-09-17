@@ -464,7 +464,9 @@ impl SocBus {
         }
         self.vq_backstop(addr);
         self.flush_ticks();                                         // registers must show exact time
-        self.periph.read32(addr)
+        let value = self.periph.read32(addr);
+        if addr & 0xfff == 0 && matches!((addr - PERIPH_BASE) >> 12, 0x00 | 0x10 | 0x2e) { self.irq_dirty = true; }
+        value
     }
     /// EX133: every device-register access must have been deferred out of a multi-quantum run.
     /// One that was not (a PIE or MAC16 word access; nothing real does this) saw early time.

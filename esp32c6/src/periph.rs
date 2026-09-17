@@ -41,12 +41,12 @@ pub mod src {
 
 /// The interrupt matrix (`INTMTX`, 0x60010000): 77 peripheral sources, each mapped to one of the
 /// 31 CPU interrupt lines.
-pub struct IntMatrix { pub map: [u32; src::COUNT], ram: RegRam }
+pub struct IntMatrix { pub map: [u32; src::COUNT], pub source_status: [u32; 3], ram: RegRam }
 impl Default for IntMatrix { fn default() -> Self { Self::new() } }
 impl IntMatrix {
-    pub fn new() -> Self { IntMatrix { map: [0; src::COUNT], ram: RegRam::new() } }
+    pub fn new() -> Self { IntMatrix { map: [0; src::COUNT], source_status: [0; 3], ram: RegRam::new() } }
     pub fn read(&self, off: u32) -> u32 {
-        match off { off if off < src::COUNT as u32 * 4 => self.map[(off / 4) as usize], _ => self.ram.read(off) }
+        match off { off if off < src::COUNT as u32 * 4 => self.map[(off / 4) as usize], 0x134..=0x13c => self.source_status[((off - 0x134) / 4) as usize], _ => self.ram.read(off) }
     }
     pub fn write(&mut self, off: u32, v: u32) {
         match off { off if off < src::COUNT as u32 * 4 => self.map[(off / 4) as usize] = v & 0x1f, _ => self.ram.write(off, v) }
@@ -505,6 +505,7 @@ impl Peripherals {
         let st = self.source_status();
         let changed = st != self.last_status;
         self.last_status = st;
+        self.intmtx.source_status.copy_from_slice(&st[..3]);
         self.intc.lines.update(&self.intmtx.map, &st);
         changed
     }
