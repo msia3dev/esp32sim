@@ -94,6 +94,9 @@ TCP has no RTS/DTR reset control, so use esptool's no-reset options. ROM mode wo
 S3 v1.3.0 stub has an upstream hard-coded classic-ESP32 address and is intentionally unsupported.
 After flashing, restart esp32sim in normal ROM boot using the same `--flash-state` file.
 
+C3 and C6 use the same socket workflow with `--chip c3` or `--chip c6`; their ROM loader and
+modern v2 stub support flash identification, compressed writes, and digest verification.
+
 ## Outputs
 | Flag | Meaning |
 | --- | --- |
