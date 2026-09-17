@@ -91,6 +91,8 @@ pub struct Machine<S: Soc> {
     pub uart_tcp: Option<crate::uart_tcp::UartTcp>,
     #[cfg(not(target_arch = "wasm32"))]
     uart_tcp_pending: VecDeque<u8>,
+    #[cfg(not(target_arch = "wasm32"))]
+    uart_tcp_next_rx: u64,
     /// The page's Restart (`reset` on the WebSocket) is honoured: the front-end sets this when it
     /// can bring the machine back up after the reset. Otherwise the message is ignored, so a run
     /// that stops at a chip reset is not ended from the page.
@@ -158,6 +160,8 @@ impl<S: Soc> Machine<S> {
             uart_tcp: None,
             #[cfg(not(target_arch = "wasm32"))]
             uart_tcp_pending: VecDeque::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            uart_tcp_next_rx: 0,
             rt: Realtime { enabled: false, wall_start: None, last_check: 0, behind: 0.0, resyncs: 0, speed: None, speed_mark: None, log: false, log_last: None, log_insns: (0, 0) },
             debug_rom: false, cost: None, model_accesses: Vec::new(), approximate_jit_timing: None, approximate_jit_frontiers: false, model_ready_at: vec![0; S::CORES], model_stop: None, model_attach_error: None,
         }
@@ -301,6 +305,8 @@ impl<S: Soc> Machine<S> {
         let cause = self.bus.reboot(self.mac);
         for (i, c) in self.cores.iter_mut().enumerate() { S::reset_core(c, i); if i > 0 { self.core_held[i] = true; } }
         self.reboots += 1;
+        #[cfg(not(target_arch = "wasm32"))]
+        { self.uart_tcp_next_rx = 0; }
         self.model_ready_at.fill(self.bus.cycles());
         if let Some(model) = &mut self.cost {
             let facts = LifecycleFacts { kind: LifecycleKind::ChipReset, chip: S::NAME, cores: S::CORES, cpu_hz: S::CPU_HZ };
@@ -1057,7 +1063,17 @@ impl<S: Soc> Machine<S> {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn uart_tcp_poll_input(&mut self) { let Some(tcp) = self.uart_tcp.clone() else { return }; let room = self.bus.uart_rx_capacity(0); if room > 0 { let data = tcp.take_input(room); if !data.is_empty() { self.bus.uart_input(0, &data); } } }
+    fn uart_tcp_poll_input(&mut self) {
+        let Some(tcp) = self.uart_tcp.clone() else { return };
+        let now = self.bus.cycles();
+        if tcp.pending_input() == 0 { self.uart_tcp_next_rx = now; return; }
+        let cycles_per_byte = (S::CPU_HZ * 10 / 115_200).max(1);
+        if now < self.uart_tcp_next_rx { return; }
+        let due = 1 + (now - self.uart_tcp_next_rx) / cycles_per_byte;
+        let room = self.bus.uart_rx_capacity(0); if room == 0 { return; }
+        let data = tcp.take_input(room.min(due as usize));
+        if !data.is_empty() { self.bus.uart_input(0, &data); self.uart_tcp_next_rx = self.uart_tcp_next_rx.saturating_add(data.len() as u64 * cycles_per_byte); }
+    }
     #[cfg(not(target_arch = "wasm32"))]
     fn uart_tcp_output(&mut self, data: &[u8]) { const LIMIT: usize = 1 << 20; let Some(tcp) = self.uart_tcp.clone() else { return }; if !tcp.connected() { self.uart_tcp_pending.clear(); return; } self.uart_tcp_pending.extend(data); if self.uart_tcp_pending.len() > LIMIT { tcp.disconnect(); self.uart_tcp_pending.clear(); return; } while !self.uart_tcp_pending.is_empty() { let accepted = tcp.queue_output(self.uart_tcp_pending.make_contiguous()); if accepted == 0 { break; } self.uart_tcp_pending.drain(..accepted); } }
 
