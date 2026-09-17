@@ -97,6 +97,8 @@ After flashing, restart esp32sim in normal ROM boot using the same `--flash-stat
 C3 and C6 use the same socket workflow with `--chip c3` or `--chip c6`; their ROM loader and
 modern v2 stub support flash identification, compressed writes, and digest verification.
 Their writes persist across processes when the same `--flash-state` file is reused.
+The ROM loaders support write, verify and read-back but not `erase_region`; the v2 stubs add
+bounded erase and chip erase. Normal ROM boot from esptool-flashed ESP-IDF images is supported.
 
 ## Outputs
 | Flag | Meaning |
