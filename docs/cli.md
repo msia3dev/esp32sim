@@ -19,7 +19,7 @@ PSRAM and register presets.
 | `--ptable-offset 0xNNNN` | where `--ptable` (and thus the partition table itself) is written, default 0x8000 — match your project's `CONFIG_PARTITION_TABLE_OFFSET` if it isn't the default (a bootloader built with Secure Boot V2 + Flash Encryption is often larger than the default 0x8000 gap and needs this pushed out, or it'll silently overlap and corrupt the tail of the bootloader image) |
 | `--app-offset 0xNNNN` | where `--app` is written (and, in `--boot app`, where its image is read from), default 0x10000 — match the offset of the partition you're booting (e.g. the `factory` app partition's actual offset from your partition table), which can differ once earlier partitions have been resized or reordered |
 | `--flash-image F` | whole flash dump written at 0 |
-| `--flash-state F` | persistent mutable ESP32-S3 logical flash; create from seed images when missing, otherwise load it and ignore the seeds |
+| `--flash-state F` | persistent mutable logical flash on S3/C3/C6; create from seed images when missing, otherwise load it and ignore the seeds |
 | `--efuse-state F` | persistent mutable ESP32-S3 physical eFuse state: native 336-byte payload or compatible 1 KiB QEMU backing file |
 | `--chip s3\|c3\|c6` | which chip (default s3) |
 | `--rom F` | mask ROM ELF (default: the chip's in `~/.espressif/tools/esp-rom-elfs/*/`) |
@@ -96,6 +96,7 @@ After flashing, restart esp32sim in normal ROM boot using the same `--flash-stat
 
 C3 and C6 use the same socket workflow with `--chip c3` or `--chip c6`; their ROM loader and
 modern v2 stub support flash identification, compressed writes, and digest verification.
+Their writes persist across processes when the same `--flash-state` file is reused.
 
 ## Outputs
 | Flag | Meaning |
