@@ -156,6 +156,20 @@ fn timer_group_alarm_autoreload_and_deadline() {
     assert_eq!(Device::read(&mut g, 0x0) & (1 << 10), 1 << 10, "autoreload keeps the alarm");
 }
 
+#[test]
+fn timer_group_rtc_calibration_uses_the_selected_clock() {
+    let mut timer = TimerGroup::new();
+    let cycles = 100u32;
+    let value = |timer: &mut TimerGroup| Device::read(timer, 0x6c) >> 7;
+
+    Device::write(&mut timer, 0x68, cycles << 16);
+    assert_eq!(value(&mut timer), cycles * 40_000_000 / 150_000);
+    Device::write(&mut timer, 0x68, (cycles << 16) | (1 << 13));
+    assert_eq!(value(&mut timer), (u64::from(cycles) * 40_000_000 / (17_500_000 / 256)) as u32);
+    Device::write(&mut timer, 0x68, (cycles << 16) | (2 << 13));
+    assert_eq!(value(&mut timer), cycles * 40_000_000 / 32_768);
+}
+
 // ------------------------------------------------------------------ GPIO
 #[test]
 fn gpio_edges_and_interrupt_types() {

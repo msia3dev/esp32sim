@@ -4,6 +4,9 @@ use crate::regram::RegRam;
 use crate::{RTC_SLOW_HZ, XTAL_HZ};
 use emu_core::ClockDomain;
 
+const RC_FAST_HZ: u64 = 17_500_000;
+const XTAL32K_HZ: u64 = 32_768;
+
 // ------------------------------------------------------------------ Timer group (T0/T1 + WDT + RTC calibration)
 pub struct TimerGroup {
     ram: RegRam,
@@ -46,7 +49,16 @@ impl TimerGroup {
         }
         match off {
             0x68 => (self.ram.read(off) & !(1 << 15)) | (1 << 15),                       // RTCCALICFG: always RDY
-            0x6c => { let n = (self.ram.read(0x68) >> 16) & 0x7fff; ((n as u64 * XTAL_HZ / RTC_SLOW_HZ) as u32) << 7 }   // RTCCALICFG1 value
+            0x6c => {
+                let config = self.ram.read(0x68);
+                let n = (config >> 16) & 0x7fff;
+                let frequency = match (config >> 13) & 3 {
+                    1 => RC_FAST_HZ / 256,
+                    2 => XTAL32K_HZ,
+                    _ => RTC_SLOW_HZ,
+                };
+                ((u64::from(n) * XTAL_HZ / frequency) as u32) << 7
+            }   // RTCCALICFG1 value
             0x70 => self.int_ena, 0x74 => self.int_raw, 0x78 => self.int_raw & self.int_ena,
             0xf8 => 0x2006191,
             _ => self.ram.read(off),
