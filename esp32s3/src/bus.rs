@@ -355,7 +355,7 @@ impl SocBus {
                     events.push((self.cycles, pin, level));
                 }
             }
-            self.board.gpio_changes(&changes);
+            self.board.gpio_changes_at(self.cycles, &changes);
         }
         let rx = self.board.spi_transfer(2, &transfer.tx, transfer.rx_len);
         self.periph.spi2.finish_transfer(transfer, &rx);
@@ -1098,7 +1098,7 @@ impl SocBus {
         if !self.periph.gpio.changes.is_empty() {
             let ch = std::mem::take(&mut self.periph.gpio.changes);
             if let Some(ev) = &mut self.gpio_events { for &(pin, level) in &ch { ev.push((self.cycles, pin, level)); } }
-            self.board.gpio_changes(&ch);
+            self.board.gpio_changes_at(self.cycles, &ch);
         }
         self.deliver_spi2_transfer();
         if !self.periph.rmt.done.is_empty() {
@@ -1137,7 +1137,7 @@ impl SocBus {
             if let Some(events) = &mut self.gpio_events {
                 for &(pin, level) in &changes { events.push((self.cycles, pin, level)); }
             }
-            self.board.gpio_changes(&changes);
+            self.board.gpio_changes_at(self.cycles, &changes);
         }
         self.irq_dirty |= interrupt_before != self.periph.rtc.interrupt_status();
     }
