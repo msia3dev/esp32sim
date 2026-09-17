@@ -72,7 +72,7 @@ pub struct Opts {
     pub board: String, pub wifi: Option<String>, pub net: String, pub cam_image: Option<String>, pub cam_fps: f64,
     pub spi2_timing: bool, pub measured_te: bool,
     pub max_insns: u64, pub max_seconds: Option<f64>, pub script: Option<String>, pub serial: Option<String>,
-    pub console: Option<String>, pub console_prefix: bool, pub realtime: bool, pub web_port: Option<u16>, pub web_dir: Option<String>, pub no_reboot: bool,
+    pub console: Option<String>, pub console_prefix: bool, pub realtime: bool, pub uart_tcp: Option<String>, pub web_port: Option<u16>, pub web_dir: Option<String>, pub no_reboot: bool,
     pub wav: Option<String>, pub tft_png: Option<String>, pub gram_png: Option<String>, pub dump: bool,
     pub trace: bool, pub trace_from: u64, pub breaks: Vec<u32>, pub watch: Option<u32>, pub peeks: Vec<(u32, usize)>, pub disasms: Vec<(u32, usize)>,
     pub profile: bool, pub profile_blocks: bool, pub coverage: Option<Option<String>>, pub irq_latency: bool, pub vcd: Option<String>,
@@ -127,6 +127,7 @@ pub fn parse(args: &[String], default_chip: &str) -> Opts {
             "--console" => o.console = Some(next()),
             "--console-prefix" => o.console_prefix = true,
             "--realtime" => o.realtime = true,
+            "--uart-tcp" => o.uart_tcp = Some(next()),
             "--web" => o.web_port = Some(next().parse().expect("port")),
             "--web-dir" => o.web_dir = Some(next()),
             "--no-reboot" => o.no_reboot = true,
@@ -197,6 +198,7 @@ pub fn run_cli(default_chip: &str) {
 fn run_cooja(o: &mut Opts) {
     if !matches!(o.chip.as_str(), "c6" | "esp32c6") { eprintln!("--cooja: only the ESP32-C6 speaks the Cooja-NG lock-step protocol"); std::process::exit(2); }
     if o.max_insns != u64::MAX { eprintln!("--cooja: --max-insns is unsupported; use --max-seconds"); std::process::exit(2); }
+    if o.uart_tcp.is_some() { eprintln!("--uart-tcp cannot be combined with --cooja"); std::process::exit(2); }
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let hello = match cooja::read_hello(&mut input) { Ok(h) => h, Err(e) => { eprintln!("[cooja] {}", e); std::process::exit(2) } };
@@ -428,6 +430,11 @@ fn prepare<S: Soc>(m: &mut Machine<S>, o: &Opts) -> String {
     m.dbg.stop_after_exceptions = o.stop_exc;
     m.console.mask = console_mask(&console);
     m.console.prefix = o.console_prefix;
+    if let Some(addr) = &o.uart_tcp {
+        let uart_tcp = esp_soc::UartTcp::start(addr).unwrap_or_else(|e| { eprintln!("--uart-tcp {}: {}", addr, e); std::process::exit(2) });
+        eprintln!("[emu] UART0 TCP: {}", uart_tcp.local_addr()); m.uart_tcp = Some(uart_tcp);
+        m.console.mask &= !2; m.rt.enabled = true;
+    }
     if let Some(p) = &o.regtrace { m.add_observer(Box::new(RegTrace::new(std::fs::File::create(p).expect("regtrace file"), o.regtrace_max, o.regtrace_from_pc))); }
     if let Some(port) = o.web_port {
         let dir = o.web_dir.clone().unwrap_or_else(|| { let exe = std::env::current_exe().unwrap(); let mut d = exe.parent().unwrap().to_path_buf(); for _ in 0..3 { if d.join("web").exists() { break; } d = d.parent().unwrap().to_path_buf(); } d.join("web").to_string_lossy().to_string() });
