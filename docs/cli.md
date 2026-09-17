@@ -80,6 +80,20 @@ the current round past the requested number. With an approximate cost model, it 
 scheduled events. Use `--max-seconds` for a predictable duration. The final execution report
 separately lists the actual instruction count for each core.
 
+### esptool over UART TCP
+
+Start the S3 in UART download mode with persistent flash and a raw UART0 socket:
+
+```sh
+esp32sim --chip s3 --board none --boot download --flash-mb 8 \
+  --flash-state .state/device-flash.bin --uart-tcp 127.0.0.1:5555 --console none
+```
+
+TCP has no RTS/DTR reset control, so use esptool's no-reset options. ROM mode works with
+`--no-stub`; for uploaded flashers use the modern v2 stub (`ESPTOOL_STUB_VERSION=2`). The legacy
+S3 v1.3.0 stub has an upstream hard-coded classic-ESP32 address and is intentionally unsupported.
+After flashing, restart esp32sim in normal ROM boot using the same `--flash-state` file.
+
 ## Outputs
 | Flag | Meaning |
 | --- | --- |
