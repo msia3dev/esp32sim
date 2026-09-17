@@ -863,7 +863,7 @@ impl<S: Soc> Machine<S> {
     /// host edits between runs and events inserted by web input are observed immediately.
     #[inline]
     fn apply_script_events(&mut self) -> bool {
-        if !self.script.events.get(self.script.pos).is_some_and(|(at, _)| *at <= self.bus.cycles()) {
+        if self.script.events.get(self.script.pos).is_none_or(|(at, _)| *at > self.bus.cycles()) {
             return false;
         }
         self.apply_due_script_events()

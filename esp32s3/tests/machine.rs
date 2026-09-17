@@ -22,6 +22,15 @@ fn peripheral_block_names_cover_aes_neighbors() {
     assert_eq!(Peripherals::block_name_pub(0x3b), "SHA");
 }
 
+#[test]
+fn ulp_debug_area_enables_controller_lifecycle_logging() {
+    let mut m = machine();
+    let mut flags = esp_soc::DebugFlags::default();
+    flags.add("ulp");
+    esp_soc::SocBus::set_debug(&mut m.bus, &flags);
+    assert!(m.bus.periph.rtc.ulp.debug_enabled());
+}
+
 /// A core in `waiti` with nothing pending costs no instructions: a millisecond of emulated time
 /// passes in a few hundred scheduling steps.
 #[test]

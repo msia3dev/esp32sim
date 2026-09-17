@@ -167,6 +167,7 @@ impl esp_soc::SocBus for SocBus {
     fn set_debug(&mut self, f: &esp_soc::DebugFlags) {
         self.debug = f.clone();
         for area in f.iter() { esp_periph::Dispatch::debug(&mut self.periph, area, true); }
+        if f.has("ulp") { self.periph.rtc.ulp.debug(true); }
         self.periph.misc.log_all = f.has("mmio");
     }
     fn observe_gpio(&mut self, on: bool) { self.gpio_events = if on { Some(Vec::new()) } else { None }; }

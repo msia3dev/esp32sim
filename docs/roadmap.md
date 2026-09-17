@@ -36,7 +36,11 @@ Ordered by value; each item links to its plan where one exists.
 9. **Browser build (WebAssembly)** — done ([wasm.md](wasm.md)): the emulator in the page,
    hello_world / the panel with SID / Atech at real time in Chrome. Left: a WebSocket relay so
    the guest reaches the real network from a tab, and a wasm backend for the JIT.
-10. **Packaging** — `cargo install esp32sim`, a `--net`/`--board` aware `examples/` runner,
+10. **ESP32-S3 ULP coprocessors** — ULP-FSM and ULP RISC-V execute from shared RTC slow
+   memory with timer/force-start lifecycle, RTC peripherals, wake/trap interrupts, native/no-JIT/
+   WebAssembly parity and checked-in ESP-IDF fixtures ([ulp.md](ulp.md)). Remaining: a real
+   deep-sleep power/reset model before reporting ULP as a deep-sleep wake cause.
+11. **Packaging** — `cargo install esp32sim`, a `--net`/`--board` aware `examples/` runner,
    release binaries for macOS/Linux.
 
 Not planned: blob-level WiFi/BLE emulation, cache-timing accuracy, Wokwi/cloud integration.

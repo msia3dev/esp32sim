@@ -67,7 +67,7 @@ register presets).
 | `--coverage`, `--coverage-file F` | block starts reached, per function; with a file, one `addr symbol` line each |
 | `--irq-latency` | cycles from an interrupt line appearing at a core to the core taking it, per line; retains block execution |
 | `--vcd F` | GPIO edges and interrupt lines as a VCD waveform (1 ps units); retains block execution |
-| `--debug AREAS` | what the model prints: device names or prefixes (`spi`, `usb`, `i2c`, `wifi`, `gdma`, `sha`, `rsa`, `lcd_cam`), `net`, `wifi-frames`, `aes`, `rom`, `mmio`, `rt`; also `ESP_EMU_DEBUG=a,b` |
+| `--debug AREAS` | what the model prints: device names or prefixes (`spi`, `usb`, `i2c`, `wifi`, `gdma`, `sha`, `rsa`, `lcd_cam`), `ulp` (controller start/timer/halt lifecycle), `net`, `wifi-frames`, `aes`, `rom`, `mmio`, `rt`; also `ESP_EMU_DEBUG=a,b` |
 | `--log-periph` | log the first access to every unknown peripheral register |
 | `--no-jit` | run blocks through the interpreter instead of native code (aarch64 hosts compile blocks to machine code by default); the two must produce identical results, so this is the oracle when something looks wrong |
 | `--stop-after-exceptions N` | stop after N exceptions |
@@ -76,6 +76,10 @@ register presets).
 Environment: `ESP_EMU_DEBUG=wifi,spi,net` is `--debug` for every run (the older
 `ESP_EMU_DEBUG_SPI`, `ESP_EMU_DEBUG_NET`, `ESP_EMU_LOG_ALL`, `ESP_EMU_RT_LOG`... still work as aliases).
 `XTENSA_DIS_FILES=a.dis:b.dis` feeds the decoder equivalence test.
+
+When either ESP32-S3 ULP architecture runs, the final report includes its instruction and cycle
+counts, traps and main-CPU wake requests. These counts are diagnostic only and are not included
+in the main-core `--max-insns` limit. See [ulp.md](ulp.md) for supported behavior and limits.
 
 ## Action scripts
 

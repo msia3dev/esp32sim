@@ -45,8 +45,10 @@ esp32sim/
                   PIE SIMD), basic-block interpreter, AArch64 JIT, objdump-compatible disassembler
   esp32s3/        SoC + boards: memory map, cache MMU, SPI flash/PSRAM, SHA/AES/RSA, RNG,
                   systimer, timer groups, interrupt matrix (per core), GPIO, USB-CDC,
-                  UARTs, I2C, GDMA + I2S/LCD_CAM, RMT TX, regi2c, RTC WDT, WiFi MAC + virtual
+                  UARTs, I2C, GDMA + I2S/LCD_CAM, RMT TX, regi2c, RTC WDT, ULP-FSM + ULP RISC-V,
+                  WiFi MAC + virtual
                   AP + NAT; board/: atech14 / waveshare-cam / waveshare-lcd4b / waveshare-amoled18-v2 / none
+  ulp-fsm/        ESP32-S2/S3 ULP-FSM decoder, disassembler and interpreter
   cli/            the `esp32sim` command line, every chip (`--chip`); `esp32sim-c3` / `esp32sim-c6` are alias binaries
   ── ESP32-C3 and ESP32-C6 (RISC-V, single core) ──
   riscv-rv32/     RV32IMAC decoder (verified 100% against objdump), interpreter, disassembler
@@ -227,6 +229,7 @@ Env: `ESP_EMU_DEBUG`, `ESP_EMU_DEBUG_SPI`, `ESP_EMU_DEBUG_USB`, `ESP_EMU_DEBUG_W
 `docs/` — [architecture](docs/architecture.md), [peripheral coverage](docs/peripherals.md),
 [boards](docs/boards.md), [CLI reference](docs/cli.md), [web UI protocol](docs/web-ui.md),
 [design decisions & gotchas](docs/decisions.md), [roadmap](docs/roadmap.md),
+[ESP32-S3 ULP support](docs/ulp.md),
 [networking how-to](docs/networking-howto.md), the [WiFi](docs/wifi-plan.md) and
 [networking](docs/networking-plan.md) design notes, and the [testing](docs/testing-plan.md) plan.
 

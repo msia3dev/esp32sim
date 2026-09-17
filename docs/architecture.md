@@ -35,6 +35,8 @@ esp32s3/      the SoC and boards
   net.rs      the emulated subnet 10.0.2.0/24: ARP, DHCP, ICMP, DNS, SNTP
   nat.rs      user-mode NAT: guest TCP/UDP relayed over ordinary host sockets
   crypto.rs   SHA-1/2, HMAC, PBKDF2, the 802.11 PRF, AES, AES key wrap, bignum arithmetic
+  ulp.rs      ULP-FSM RTC-memory/peripheral adapter, exact instruction scheduler, decode cache
+  ulp_riscv.rs restricted ULP RISC-V bus and wrapper over the shared RV32IMC interpreter
   board/      one file per board: Atech14, WaveshareCam, WaveshareLcd4b, WaveshareAmoled18V2 (BoardModel from esp-soc)
   web.rs      dependency-free HTTP + WebSocket server
   elf.rs / image.rs / picture.rs   loaders (ELF symbols/segments, ESP app images, BMP/PPM)
@@ -53,6 +55,8 @@ xtensa-lx7/   the core
   jit/        native code generation for blocks: mod.rs compiler + helpers (encoder in emu-core)
   state.rs    Cpu: registers, special registers, user registers (ACCX/QACC/…), interrupt levels
   disasm.rs   objdump-compatible formatter (used by the differential decoder test)
+ulp-fsm/      ESP32-S2/S3 ULP-FSM decoder, disassembler and reference interpreter
+riscv-rv32/   shared RV32IMC/RV32IMAC core, also used by the S3 ULP RISC-V wrapper
 web/          index.html: the landing page; run.html: board drawing, console, WebAudio, camera panel (no build step)
               emu.js + wasm/worker.js: the same page driving the WebAssembly build (docs/wasm.md)
 wasm/         esp32sim-wasm: C ABI over Machine plus the guarded browser-JIT handoff
@@ -128,6 +132,12 @@ wasm-jit/     receipt-priced wasm emitter; first SRAM opcode slice, shared-memor
 - **Reset**: `Machine::reboot()` re-creates the digital peripherals, keeps SRAM, RTC memories,
   efuses and the captured audio, sets `RESET_CAUSE`, and restarts both cores at the ROM reset
   vector — the path used by `esp_restart()` (RTC watchdog) and `SW_PROCPU_RST`.
+- **ULP coprocessors**: the RTC controller owns timer, force-start, reset, halt and architecture
+  selection. `ulp-fsm` executes the legacy word-addressed ISA; the ULP RISC-V wrapper reuses
+  `riscv-rv32` through a restricted 0-based RTC-memory map and the converted RTC register windows.
+  Both advance on the RTC fast clock, publish instruction-completion effects into the shared
+  timeline, invalidate code through RTC page versions, and route wake/trap signals through the
+  RTC core interrupt source. See [ulp.md](ulp.md).
 
 ## Observers
 
@@ -157,6 +167,8 @@ its pending device-time flush. Device models see time lazily: cycles accumulate 
 batch when a timer alarm is due, when a peripheral register is accessed (so registers always
 read exact time), or after 256 cycles at most. Peripheral clocks (APB 80 MHz, systimer 16 MHz,
 RTC slow 150 kHz) are derived from the 240 MHz cycle counter with delivered-tick accounting.
+ULP wake timers shorten the idle horizon, and an active ULP instruction adds its own exact
+completion deadline; ULP instruction counts remain separate from the main-core run limit.
 With `--web` the machine is paced to wall time (sleeping when ahead, resynchronising rather
 than bursting if it falls > 0.5 s behind). Work that costs host syscalls — reading the NAT's
 sockets — runs on its own emulated-time cadence rather than every round, because at 240 MHz a
