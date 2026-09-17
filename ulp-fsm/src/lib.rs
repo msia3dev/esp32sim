@@ -4,5 +4,9 @@
 //! lifecycle and RTC peripheral ownership remain outside this crate.
 pub mod decode;
 pub mod disasm;
+pub mod exec;
+pub mod state;
 
 pub use decode::{decode, AluOp, BranchCond, Effects, Insn, Kind, StoreKind, StoreMode, Target};
+pub use exec::{step, Bus, Event, Trap};
+pub use state::Cpu;

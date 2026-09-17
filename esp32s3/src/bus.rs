@@ -1,6 +1,7 @@
 //! ESP32-S3 memory map: internal SRAM (512 KiB, IRAM/DRAM aliases), mask ROM, RTC
 //! memories, external flash + PSRAM through the 512-entry cache MMU, peripherals.
 use crate::periph::{Peripherals, PERIPH_BASE, PERIPH_END};
+use crate::ulp::{RtcSlowBus, UlpFsmEngine};
 use crate::board::Board;
 use std::collections::HashSet;
 use xtensa_lx7::bus::{Bus, Fault};
@@ -83,6 +84,7 @@ pub struct SocBus {
     /// GPIO edges for observers, while one wants them: (cycle, pin, level)
     pub gpio_events: Option<Vec<(u64, u8, bool)>>,
     pub debug: esp_soc::DebugFlags,
+    pub ulp_fsm: UlpFsmEngine,
     /// Software TLB: the last resolved mapping per 64 KiB page, so loads, stores and fetches skip
     /// the address-range walk and the flash MMU. Cleared whenever the MMU changes.
     tlb: Vec<TlbEntry>,
@@ -121,7 +123,7 @@ impl SocBus {
         let bus_uninit = SocBus {
             sram: vec![0; SRAM_SIZE], irom: vec![0; (IROM_MASK_HIGH - IROM_MASK_LOW) as usize], drom: vec![0; (DROM_MASK_HIGH - DROM_MASK_LOW) as usize],
             rtc_fast: vec![0; 8192], rtc_slow: vec![0; 8192], flash: vec![0xff; flash_size], psram: vec![0; psram_size],
-            mmu: [MMU_INVALID; MMU_ENTRIES], periph: Peripherals::new(mac), board: Box::new(crate::board::Atech14::new()), cycles: 0, last_fault: None, spi2_dma_fault: None, irq_dirty: false, gpio_events: None, debug: Default::default(),
+            mmu: [MMU_INVALID; MMU_ENTRIES], periph: Peripherals::new(mac), board: Box::new(crate::board::Atech14::new()), cycles: 0, last_fault: None, spi2_dma_fault: None, irq_dirty: false, gpio_events: None, debug: Default::default(), ulp_fsm: UlpFsmEngine::new(),
             tlb: vec![TlbEntry::EMPTY; TLB_SIZE], page_ver: Vec::new(), ver_base: [0; 7], tick_pending: 0, tick_budget: 0,
         };
         let mut b = bus_uninit;
@@ -257,6 +259,7 @@ impl SocBus {
     }
     fn periph_write(&mut self, addr: u32, v: u32) {
         self.periph_write_inner(addr, v);
+        self.reconcile_ulp();
         self.refresh_tick_budget();   // the write may have armed something
     }
     fn periph_write_inner(&mut self, addr: u32, v: u32) {
@@ -927,6 +930,7 @@ impl Bus for SocBus {
         // where widening a FIFO or clear-on-read access could add side effects.
         if Self::is_efuse(addr) { return Ok(self.efuse_read8(addr)); }
         if Self::is_periph(addr) { self.last_fault = Some((addr, false)); return Err(Fault::Prohibited); }
+        if (RTC_SLOW_LOW..RTC_SLOW_HIGH).contains(&addr) { self.flush_ticks(); }
         let Some(e) = self.lookup(addr) else { self.last_fault = Some((addr, false)); return Err(Fault::Unmapped) };
         Ok(self.buf(e.src as u8)[e.off as usize + (addr - e.lo) as usize])
     }
@@ -935,6 +939,7 @@ impl Bus for SocBus {
             return Ok(u16::from_le_bytes([self.efuse_read8(addr), self.efuse_read8(addr + 1)]));
         }
         if Self::is_periph(addr) { self.last_fault = Some((addr, false)); return Err(Fault::Prohibited); }
+        if (RTC_SLOW_LOW..RTC_SLOW_HIGH).contains(&addr) { self.flush_ticks(); }
         match self.lookup(addr) {
             Some(e) if addr.wrapping_add(2) <= e.hi => { let o = e.off as usize + (addr - e.lo) as usize; Ok(u16::from_le_bytes(self.buf(e.src as u8)[o..o + 2].try_into().unwrap())) }
             Some(_) => Ok(u16::from_le_bytes([self.read8(addr)?, self.read8(addr + 1)?])),       // straddles a page
@@ -946,6 +951,7 @@ impl Bus for SocBus {
             if addr & 3 != 0 { self.last_fault = Some((addr, false)); return Err(Fault::Misaligned); }
             return Ok(self.periph_read(addr));
         }
+        if (RTC_SLOW_LOW..RTC_SLOW_HIGH).contains(&addr) { self.flush_ticks(); }
         match self.lookup(addr) {
             Some(e) if addr.wrapping_add(4) <= e.hi => { let o = e.off as usize + (addr - e.lo) as usize; Ok(u32::from_le_bytes(self.buf(e.src as u8)[o..o + 4].try_into().unwrap())) }
             Some(_) => Ok(u32::from_le_bytes([self.read8(addr)?, self.read8(addr + 1)?, self.read8(addr + 2)?, self.read8(addr + 3)?])),
@@ -957,6 +963,7 @@ impl Bus for SocBus {
         // Reject unsupported widths before reading a device or advancing its time.
         // This is an explicit emulator policy, not a model of optional PMS IRQs.
         if Self::is_periph(addr) { self.last_fault = Some((addr, true)); return Err(Fault::Prohibited); }
+        if (RTC_SLOW_LOW..RTC_SLOW_HIGH).contains(&addr) { self.flush_ticks(); }
         match self.lookup(addr) {
             Some(e) if e.writable != 0 => { let rel = (addr - e.lo) as usize; self.buf_mut(e.src as u8)[e.off as usize + rel] = v; self.bump(e.vbase, rel, 1); Ok(()) }
             _ => { self.last_fault = Some((addr, true)); Err(Fault::Prohibited) }
@@ -964,6 +971,7 @@ impl Bus for SocBus {
     }
     fn write16(&mut self, addr: u32, v: u16) -> Result<(), Fault> {
         if Self::is_periph(addr) { self.last_fault = Some((addr, true)); return Err(Fault::Prohibited); }
+        if (RTC_SLOW_LOW..RTC_SLOW_HIGH).contains(&addr) { self.flush_ticks(); }
         match self.lookup(addr) {
             Some(e) if e.writable != 0 && addr.wrapping_add(2) <= e.hi => { let rel = (addr - e.lo) as usize; let o = e.off as usize + rel; self.buf_mut(e.src as u8)[o..o + 2].copy_from_slice(&v.to_le_bytes()); self.bump(e.vbase, rel, 2); Ok(()) }
             Some(e) if e.writable != 0 => { let b = v.to_le_bytes(); self.write8(addr, b[0])?; self.write8(addr + 1, b[1]) }
@@ -975,6 +983,7 @@ impl Bus for SocBus {
             if addr & 3 != 0 { self.last_fault = Some((addr, true)); return Err(Fault::Misaligned); }
             self.periph_write(addr, v); return Ok(());
         }
+        if (RTC_SLOW_LOW..RTC_SLOW_HIGH).contains(&addr) { self.flush_ticks(); }
         match self.lookup(addr) {
             Some(e) if e.writable != 0 && addr.wrapping_add(4) <= e.hi => { let rel = (addr - e.lo) as usize; let o = e.off as usize + rel; self.buf_mut(e.src as u8)[o..o + 4].copy_from_slice(&v.to_le_bytes()); self.bump(e.vbase, rel, 4); Ok(()) }
             Some(e) if e.writable != 0 => { let b = v.to_le_bytes(); for i in 0..4 { self.write8(addr + i, b[i as usize])?; } Ok(()) }
@@ -982,6 +991,7 @@ impl Bus for SocBus {
         }
     }
     fn fetch(&mut self, pc: u32) -> Result<[u8; 4], Fault> {
+        if (RTC_SLOW_LOW..RTC_SLOW_HIGH).contains(&pc) { self.flush_ticks(); }
         let Some(e) = self.lookup(pc) else { self.last_fault = Some((pc, false)); return Err(Fault::Unmapped) };
         let o = e.off as usize + (pc - e.lo) as usize;
         let b = self.buf(e.src as u8);
@@ -1024,6 +1034,8 @@ impl Bus for SocBus {
 impl SocBus {
     pub(crate) fn refresh_tick_budget(&mut self) {
         let mut budget = self.periph.cycles_until_timer().clamp(1, MAX_TICK_DEFER);
+        let fast_hz = UlpFsmEngine::rtc_fast_hz(&self.periph.rtc);
+        if let Some(deadline) = self.ulp_fsm.cpu_cycles_until_deadline(fast_hz) { budget = budget.min(deadline); }
         if let Some(deadline) = self.board.next_deadline() {
             let until_deadline = u64::from(self.tick_pending)
                 .saturating_add(deadline.saturating_sub(self.cycles))
@@ -1045,6 +1057,7 @@ impl SocBus {
         // Reads may flush before the periodic backstop. Refresh for either edge
         // of a clocked source, without breaking every block that polls MMIO.
         self.irq_dirty |= self.periph.tick(cycles as u64);
+        self.advance_ulp(cycles);
         self.board.advance_to(self.cycles);
         for edge in self.board.take_edges() {
             if let Some(events) = &mut self.gpio_events { events.push((edge.cycle, edge.pin, edge.level)); }
@@ -1093,6 +1106,19 @@ impl SocBus {
             self.irq_dirty = true;
         }
         0
+    }
+
+    fn reconcile_ulp(&mut self) {
+        let version_base = self.ver_base[SRC_RTC_SLOW as usize];
+        let mut bus = RtcSlowBus::new(&mut self.rtc_slow, &mut self.page_ver, version_base);
+        self.ulp_fsm.reconcile(&mut self.periph.rtc.ulp, &mut bus);
+    }
+
+    fn advance_ulp(&mut self, cycles: u32) {
+        let fast_hz = UlpFsmEngine::rtc_fast_hz(&self.periph.rtc);
+        let version_base = self.ver_base[SRC_RTC_SLOW as usize];
+        let mut bus = RtcSlowBus::new(&mut self.rtc_slow, &mut self.page_ver, version_base);
+        self.ulp_fsm.advance(cycles, fast_hz, &mut self.periph.rtc.ulp, &mut bus);
     }
 }
 #[cfg(test)]

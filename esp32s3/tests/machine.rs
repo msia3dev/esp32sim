@@ -100,6 +100,7 @@ fn idle_cut_includes_each_enabled_cores_timer() {
 #[test]
 fn idle_machine_advances_to_the_ulp_timer_deadline() {
     let mut m = machine();
+    m.bus.write32(esp32s3::bus::RTC_SLOW_LOW + 7 * 4, 0xb000_0000).unwrap();
     m.bus.write32(RTC_CNTL + 0x104, (1 << 27) | (1 << 23)).unwrap(); // FSM, clock gate
     m.bus.write32(RTC_CNTL + 0x100, (1 << 28) | (512 << 11) | 512).unwrap();
     m.bus.write32(RTC_CNTL + 0x134, 3 << 8).unwrap();
@@ -111,11 +112,36 @@ fn idle_machine_advances_to_the_ulp_timer_deadline() {
     m.cores[0].ps = 0;
     m.max_cycles = 5_000;
     assert!(matches!(m.run(u64::MAX), Stop::Halted));
-    assert_eq!(m.bus.periph.rtc.ulp.state, esp_periph::UlpState::Running);
-    assert_eq!(m.bus.periph.rtc.ulp.starts, 1);
+    assert_eq!(m.bus.periph.rtc.ulp.state, esp_periph::UlpState::WakeDelay);
+    assert!(m.bus.periph.rtc.ulp.starts >= 1);
+    assert_eq!(m.bus.periph.rtc.ulp.starts, m.bus.periph.rtc.ulp.halts);
     assert_eq!(m.bus.periph.rtc.ulp.entry_pc, 7);
     let report = esp_soc::SocBus::report(&m.bus);
-    assert!(report.contains("[emu] ulp: Fsm Running, entry 7, 1 starts, 0 halts"), "{report}");
+    assert!(report.contains("[emu] ulp: Fsm WakeDelay, entry 7"), "{report}");
+}
+
+#[test]
+fn ulp_fsm_executes_shared_rtc_memory_at_instruction_boundaries() {
+    let mut m = machine();
+    let words = [0x7481_2340u32, 0x7480_00a1, 0x6800_0184, 0xd000_0006, 0xb000_0000];
+    let program: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    esp_soc::SocBus::load_bytes(&mut m.bus, esp32s3::bus::RTC_SLOW_LOW, &program).unwrap();
+
+    m.bus.write32(RTC_CNTL + 0x104, (1 << 27) | (1 << 23)).unwrap(); // FSM, clock gate
+    m.bus.write32(RTC_CNTL + 0x100, (1 << 30) | (1 << 28) | (512 << 11) | 512).unwrap();
+    assert!(m.bus.next_deadline() <= 72, "six ULP cycles at the reset 20 MHz RTC_FAST clock");
+
+    m.bus.tick(239);
+    assert_eq!(m.bus.read32(esp32s3::bus::RTC_SLOW_LOW + 40), Ok(0), "store is not visible one CPU cycle early");
+    m.bus.tick(1);
+    assert_eq!(m.bus.read32(esp32s3::bus::RTC_SLOW_LOW + 40), Ok(0x1234), "store becomes visible at completion");
+
+    m.bus.tick(120);
+    assert!(m.bus.ulp_fsm.cpu.halted);
+    assert_eq!(m.bus.periph.rtc.ulp.state, esp_periph::UlpState::Halted);
+    assert_eq!(m.bus.ulp_fsm.cpu.regs[2], 0x1234);
+    assert_eq!((m.bus.ulp_fsm.cpu.insn_count, m.bus.ulp_fsm.cpu.cycle_count), (5, 30));
+    assert!(esp_soc::SocBus::report(&m.bus).contains("[emu] ulp-fsm: 5 instructions, 30 cycles, 0 traps"));
 }
 
 #[test]

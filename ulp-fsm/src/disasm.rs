@@ -81,18 +81,18 @@ pub fn format(insn: &Insn) -> String {
             addr,
             offset,
             upper: false,
-        } => format!("ld {}, {}, {}", r(dest), r(addr), offset * 4),
+        } => format!("ld {}, {}, {}", r(dest), r(addr), i32::from(offset) * 4),
         Kind::Load {
             dest,
             addr,
             offset,
             upper: true,
-        } => format!("ldh {}, {}, {}", r(dest), r(addr), offset * 4),
+        } => format!("ldh {}, {}, {}", r(dest), r(addr), i32::from(offset) * 4),
         Kind::Store {
             kind: StoreKind::Offset,
             offset,
             ..
-        } => format!("sto {}", offset * 4),
+        } => format!("sto {}", i32::from(offset) * 4),
         Kind::Store {
             kind,
             mode,
@@ -123,10 +123,15 @@ pub fn format(insn: &Insn) -> String {
                         "{mnemonic} {}, {}, {}, {label}",
                         r(src),
                         r(addr),
-                        offset * 4
+                        i32::from(offset) * 4
                     )
                 }
-                StoreKind::Manual => format!("{mnemonic} {}, {}, {}", r(src), r(addr), offset * 4),
+                StoreKind::Manual => format!(
+                    "{mnemonic} {}, {}, {}",
+                    r(src),
+                    r(addr),
+                    i32::from(offset) * 4
+                ),
                 StoreKind::Offset => unreachable!(),
             }
         }

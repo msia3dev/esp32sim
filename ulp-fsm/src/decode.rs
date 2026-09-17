@@ -92,14 +92,14 @@ pub enum Kind {
         mode: StoreMode,
         src: u8,
         addr: u8,
-        offset: u16,
+        offset: i16,
         label: u8,
         upper: bool,
     },
     Load {
         dest: u8,
         addr: u8,
-        offset: u16,
+        offset: i16,
         upper: bool,
     },
     AluReg {
@@ -178,6 +178,26 @@ impl Insn {
             Kind::Store { .. } | Kind::Load { .. } => Effects::MEMORY,
         }
     }
+
+    /// Total ULP clock cycles, including the documented fetch cost.
+    /// Peripheral-dependent instructions return `None` until their U4 timing inputs are modeled.
+    pub fn cycles(self) -> Option<u32> {
+        Some(match self.kind {
+            Kind::Illegal | Kind::I2c { .. } | Kind::Adc { .. } | Kind::Tsens { .. } => {
+                return None
+            }
+            Kind::Halt => 2,
+            Kind::BranchAbs { .. } | Kind::BranchRel { .. } => 4,
+            Kind::Store { .. } | Kind::Load { .. } | Kind::ReadReg { .. } => 8,
+            Kind::WriteReg { .. } => 12,
+            Kind::Wait { cycles } => 6 + u32::from(cycles),
+            Kind::End { .. }
+            | Kind::Sleep { .. }
+            | Kind::AluReg { .. }
+            | Kind::AluImm { .. }
+            | Kind::Stage { .. } => 6,
+        })
+    }
 }
 
 fn alu(sel: u32) -> Option<AluOp> {
@@ -200,6 +220,10 @@ fn illegal(raw: u32) -> Insn {
 }
 fn reg(raw: u32, shift: u32) -> u8 {
     ((raw >> shift) & 3) as u8
+}
+fn signed11(raw: u32, shift: u32) -> i16 {
+    let value = ((raw >> shift) & 0x7ff) as i16;
+    (value << 5) >> 5
 }
 
 pub fn decode(raw: u32) -> Insn {
@@ -276,7 +300,7 @@ pub fn decode(raw: u32) -> Insn {
                 addr: reg(raw, 2),
                 label: ((raw >> 4) & 3) as u8,
                 upper: raw & (1 << 6) != 0,
-                offset: ((raw >> 10) & 0x7ff) as u16,
+                offset: signed11(raw, 10),
             }
         }
         7 => match (raw >> 26) & 3 {
@@ -379,7 +403,7 @@ pub fn decode(raw: u32) -> Insn {
         13 if raw & 0x07e0_03f0 == 0 => Kind::Load {
             dest: reg(raw, 0),
             addr: reg(raw, 2),
-            offset: ((raw >> 10) & 0x7ff) as u16,
+            offset: signed11(raw, 10),
             upper: raw & (1 << 27) != 0,
         },
         _ => return illegal(raw),
