@@ -197,6 +197,37 @@ fn ulp_timer_reruns_a_wake_program_after_each_halt() {
 }
 
 #[test]
+fn main_cpu_force_stop_flag_halts_a_looping_ulp_program() {
+    let mut m = machine();
+    let words = [
+        0x7480_0081_u32, // move r1, 8: shared force-stop flag word
+        0xd000_0004,     // ld r0, r1, 0
+        0x800a_0001,     // jumpr +8, 1, eq: flag == 1 -> HALT
+        0x8400_0004,     // jump 4: loop back to word 1
+        0xb000_0000,     // halt
+        0,
+        0,
+        0,
+        0,               // force-stop flag
+    ];
+    let program: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    esp_soc::SocBus::load_bytes(&mut m.bus, esp32s3::bus::RTC_SLOW_LOW, &program).unwrap();
+    m.bus.write32(RTC_CNTL + 0x104, (1 << 27) | (1 << 23)).unwrap();
+    m.bus.write32(RTC_CNTL + 0x100, (1 << 30) | (1 << 28) | (512 << 11) | 512).unwrap();
+
+    m.bus.tick(1_000);
+    assert!(!m.bus.ulp_fsm.cpu.halted, "zero flag must keep the ULP loop running");
+    let before = m.bus.ulp_fsm.cpu.insn_count;
+
+    m.bus.write32(esp32s3::bus::RTC_SLOW_LOW + 8 * 4, 1).unwrap();
+    m.bus.tick(1_000);
+
+    assert!(m.bus.ulp_fsm.cpu.halted, "shared force-stop flag must reach HALT");
+    assert!(m.bus.ulp_fsm.cpu.insn_count > before);
+    assert_eq!(m.bus.periph.rtc.ulp.state, esp_periph::UlpState::Halted);
+}
+
+#[test]
 fn main_cpu_rtc_access_orders_after_ulp_completion_at_the_same_cycle() {
     let mut m = machine();
     let program = 0x9000_0001_u32.to_le_bytes(); // WAKE
