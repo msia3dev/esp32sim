@@ -102,7 +102,7 @@ impl esp_soc::SocBus for SocBus {
         p.gpio.strap = old.gpio.strap;
         p.misc.log_unknown = old.misc.log_unknown; p.spi1.log = old.spi1.log;
         p.spi0.jedec = old.spi0.jedec; p.spi1.jedec = old.spi1.jedec;   // the flash chip is not reset: its ID keeps the --flash-mb capacity
-        p.rtc.ram = old.rtc.ram; p.rtc.slow_ticks = old.rtc.slow_ticks;
+        p.rtc.ram = old.rtc.ram; p.rtc.slow_ticks = old.rtc.slow_ticks; p.rtc.ulp = old.rtc.ulp;
         p.rtc.ram.write(0x38, cause | (cause << 6));
         p.rtc.ram.write(0x98, 0);                       // watchdog disarmed by the reset; the ROM re-arms it
         p.i2s0.pcm = old.i2s0.pcm; p.i2s0.frames_out = old.i2s0.frames_out; p.i2s1.pcm = old.i2s1.pcm; p.i2s1.frames_out = old.i2s1.frames_out;   // keep the captured audio continuous
@@ -154,6 +154,7 @@ impl esp_soc::SocBus for SocBus {
             if let Some(t) = &n.nat { s += &format!("[emu] nat: {} TCP connections ({} failed), {} UDP flows, {} bytes out, {} bytes in\n", t.tcp_opened, t.tcp_refused, t.udp_flows, t.bytes_to_host, t.bytes_to_guest); } } }
         { let (a, sh, r) = (&p.aes, &p.sha, &p.rsa);
           if a.blocks + sh.blocks + r.ops > 0 { s += &format!("[emu] crypto: {} AES blocks, {} SHA blocks, {} RSA/MPI operations\n", a.blocks, sh.blocks, r.ops); } }
+        if let Some(r) = p.rtc.ulp.report() { s += &r; s += "\n"; }
         if p.lcd_cam.lcd_frames > 0 { s += &format!("[emu] lcd: {} RGB frames\n", p.lcd_cam.lcd_frames); }
         if p.lcd_cam.frames + p.lcd_cam.dropped > 0 { s += &format!("[emu] camera: {} frames delivered, {} dropped (no DMA/no picture)\n", p.lcd_cam.frames, p.lcd_cam.dropped); }
         if p.rmt.tx_count > 0 { s += &format!("[emu] rmt tx {}\n", p.rmt.tx_count); }

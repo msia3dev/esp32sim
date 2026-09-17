@@ -10,6 +10,8 @@ impl WriteEffect {
     pub const SPI_EXEC: WriteEffect = WriteEffect(1);
     /// the interrupt source → line mapping changed
     pub const INTMAP: WriteEffect = WriteEffect(2);
+    /// ULP controller state or its next deadline changed
+    pub const ULP: WriteEffect = WriteEffect(4);
     pub fn contains(self, o: WriteEffect) -> bool { self.0 & o.0 != 0 }
 }
 impl std::ops::BitOr for WriteEffect { type Output = WriteEffect; fn bitor(self, o: WriteEffect) -> WriteEffect { WriteEffect(self.0 | o.0) } }

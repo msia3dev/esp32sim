@@ -7,6 +7,7 @@ use esp_soc::{ScriptAction, Stop};
 
 const IRAM: u32 = 0x4037_0000;
 const RESET: u32 = 0x4000_0400;
+const RTC_CNTL: u32 = 0x6000_8000;
 const WAITI_LOOP: [u8; 6] = [0x00, 0x70, 0x00, 0x06, 0xff, 0xff];   // waiti 0 ; j .
 const SPIN: [u8; 3] = [0x06, 0xff, 0xff];                             // j .   (objdump: ffff06)
 
@@ -94,6 +95,27 @@ fn idle_cut_includes_each_enabled_cores_timer() {
         let cuts = rounds.lock().unwrap();
         assert!(cuts.contains(&(now + 3)), "core {core}, until={until}, cuts={cuts:?}");
     }
+}
+
+#[test]
+fn idle_machine_advances_to_the_ulp_timer_deadline() {
+    let mut m = machine();
+    m.bus.write32(RTC_CNTL + 0x104, (1 << 27) | (1 << 23)).unwrap(); // FSM, clock gate
+    m.bus.write32(RTC_CNTL + 0x100, (1 << 28) | (512 << 11) | 512).unwrap();
+    m.bus.write32(RTC_CNTL + 0x134, 3 << 8).unwrap();
+    m.bus.write32(RTC_CNTL + 0xfc, (1 << 31) | 7).unwrap();
+    assert_eq!(m.bus.periph.rtc.ulp.state, esp_periph::UlpState::WakeDelay);
+    assert!(m.bus.next_deadline() <= 2 * 1600, "ULP deadline must shorten the deferred device horizon");
+
+    m.cores[0].waiting = true;
+    m.cores[0].ps = 0;
+    m.max_cycles = 5_000;
+    assert!(matches!(m.run(u64::MAX), Stop::Halted));
+    assert_eq!(m.bus.periph.rtc.ulp.state, esp_periph::UlpState::Running);
+    assert_eq!(m.bus.periph.rtc.ulp.starts, 1);
+    assert_eq!(m.bus.periph.rtc.ulp.entry_pc, 7);
+    let report = esp_soc::SocBus::report(&m.bus);
+    assert!(report.contains("[emu] ulp: Fsm Running, entry 7, 1 starts, 0 halts"), "{report}");
 }
 
 #[test]
@@ -284,6 +306,8 @@ fn reboot_keeps_what_silicon_keeps() {
     m.bus.periph.gpio.strap = 0x7;
     m.bus.periph.rtc.ram.write(0x120, 0x1234);
     m.bus.periph.rtc.slow_ticks = 999;
+    m.bus.periph.rtc.ulp.state = esp_periph::UlpState::Halted;
+    m.bus.periph.rtc.ulp.starts = 7;
     m.bus.periph.i2s0.pcm = vec![1, 2, 3]; m.bus.periph.i2s0.frames_out = 3;
     m.bus.periph.uart[0].tx_out = b"gone".to_vec();
     m.bus.periph.systimer.conf = 0xffff;
@@ -295,6 +319,7 @@ fn reboot_keeps_what_silicon_keeps() {
     let p = &m.bus.periph;
     assert_eq!(p.efuse.ram.read(0x44), 0xdead_beef); assert_eq!(p.gpio.strap, 0x7);
     assert_eq!(p.rtc.ram.read(0x120), 0x1234); assert_eq!(p.rtc.slow_ticks, 999);
+    assert_eq!(p.rtc.ulp.state, esp_periph::UlpState::Halted); assert_eq!(p.rtc.ulp.starts, 7);
     assert_eq!(p.rtc.ram.read(0x38), cause | (cause << 6));
     assert_eq!(p.i2s0.pcm, vec![1, 2, 3]);
     assert_eq!((p.spi0.jedec[2], p.spi1.jedec[2]), (0x18, 0x18), "the flash chip keeps its capacity, or IDF finds it smaller than the image header");

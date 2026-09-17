@@ -2,7 +2,46 @@
 //! mechanics from outside the crate: dispatch by block and range, `delta`, `alias`, the generic
 //! fallback, interrupt source mapping, tick delivery per clock domain, the timer-deadline query.
 use emu_core::{ClockDomain, ClockTree};
-use esp_periph::{device_set, mmio, Device, DeviceSet, Dispatch, Gpio, I2s, Misc, RegRam, Systimer, TimerGroup, UsbSerialJtag, WriteEffect, NO_SOURCE};
+use esp_periph::{device_set, mmio, Device, DeviceSet, Dispatch, Gpio, I2s, Misc, RegRam, RtcCntl, Systimer, TimerGroup, UlpState, UsbSerialJtag, WriteEffect, NO_SOURCE};
+
+// ------------------------------------------------------------------ RTC ULP controller
+#[test]
+fn rtc_ulp_registers_arm_the_timer_and_publish_state() {
+    let mut rtc = RtcCntl::new();
+    assert_eq!(Device::write(&mut rtc, 0x104, (1 << 27) | (1 << 23)), WriteEffect::ULP); // FSM, clock gate
+    assert_eq!(Device::write(&mut rtc, 0x100, (1 << 28) | (512 << 11) | 512), WriteEffect::ULP); // FSM clock, memory range
+    assert_eq!(Device::write(&mut rtc, 0x134, 12 << 8), WriteEffect::ULP); // wake period
+    assert_eq!(Device::write(&mut rtc, 0xfc, (1 << 31) | 9), WriteEffect::ULP); // timer, entry PC
+    assert_eq!(Device::clock(&rtc), Some(ClockDomain::RtcSlow));
+    Device::debug(&mut rtc, true);
+    assert!(rtc.ulp.debug_enabled());
+    assert!(Device::has_deadline(&rtc));
+    assert_eq!(Device::next_deadline(&rtc), Some(12));
+
+    Device::tick(&mut rtc, 11);
+    assert_eq!(rtc.ulp.state, UlpState::WakeDelay);
+    assert_eq!(Device::next_deadline(&rtc), Some(1));
+    Device::tick(&mut rtc, 1);
+    assert_eq!(rtc.ulp.state, UlpState::Running);
+    assert_eq!(rtc.ulp.entry_pc, 9);
+    assert_eq!(Device::read(&mut rtc, 0xd0) & (0xf << 13), 1 << 13, "LOW_POWER_ST reports COCPU start");
+    assert!(rtc.ulp.report().is_some_and(|line| line.contains("Fsm Running") && line.contains("1 starts")));
+}
+
+#[test]
+fn rtc_ulp_reset_blocks_start_and_unrelated_writes_have_no_effect() {
+    let mut rtc = RtcCntl::new();
+    Device::write(&mut rtc, 0x104, (1 << 27) | (1 << 23));
+    assert_eq!(Device::write(&mut rtc, 0x100, (1 << 30) | (1 << 29) | (1 << 28)), WriteEffect::ULP);
+    assert_eq!(rtc.ulp.state, UlpState::Reset);
+    assert_eq!(rtc.ulp.starts, 0);
+
+    Device::write(&mut rtc, 0x100, 1 << 28);
+    Device::write(&mut rtc, 0x100, (1 << 30) | (1 << 28));
+    assert_eq!(rtc.ulp.state, UlpState::Running);
+    assert_eq!(rtc.ulp.starts, 1);
+    assert_eq!(Device::write(&mut rtc, 0x74, 0x1234), WriteEffect::NONE);
+}
 
 // ------------------------------------------------------------------ systimer
 #[test]
