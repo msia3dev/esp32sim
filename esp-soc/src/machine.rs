@@ -131,6 +131,8 @@ pub struct Machine<S: Soc> {
 /// Default scheduling quantum; `Machine::quantum` can change it (not bit-exact with the default). q256: 256 on wasm32,
 /// 64 native (M3 CLI at 256: Pocket Tank 5.4% slower, cheap native quantum switches lose to +15% spin-waiting).
 const QUANTUM: u64 = if cfg!(target_arch = "wasm32") { 256 } else { 64 };
+#[cfg(not(target_arch = "wasm32"))]
+fn uart_tcp_pacing_baud(chip: &str) -> u64 { if chip == "esp32c6" { 230_400 } else { 115_200 } }
 /// EX133 default for `Machine::vq_max`; a build can pin another with `ESP32SIM_VQ_BUILD=<n>`.
 const VQ_DEFAULT: u64 = match option_env!("ESP32SIM_VQ_BUILD") {
     Some(s) => { let b = s.as_bytes(); let (mut i, mut v) = (0, 0u64); while i < b.len() { v = v * 10 + (b[i] - b'0') as u64; i += 1; } v }
@@ -1067,7 +1069,7 @@ impl<S: Soc> Machine<S> {
         let Some(tcp) = self.uart_tcp.clone() else { return };
         let now = self.bus.cycles();
         if tcp.pending_input() == 0 { self.uart_tcp_next_rx = now; return; }
-        let cycles_per_byte = (S::CPU_HZ * 10 / 115_200).max(1);
+        let cycles_per_byte = (S::CPU_HZ * 10 / uart_tcp_pacing_baud(S::NAME)).max(1);
         if now < self.uart_tcp_next_rx { return; }
         let due = 1 + (now - self.uart_tcp_next_rx) / cycles_per_byte;
         let room = self.bus.uart_rx_capacity(0); if room == 0 { return; }
