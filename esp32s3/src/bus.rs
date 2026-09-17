@@ -1115,6 +1115,7 @@ impl SocBus {
     }
 
     fn advance_ulp(&mut self, cycles: u32) {
+        let interrupt_before = self.periph.rtc.interrupt_status();
         let fast_hz = UlpFsmEngine::rtc_fast_hz(&self.periph.rtc);
         let version_base = self.ver_base[SRC_RTC_SLOW as usize];
         let mut bus = RtcSlowBus::new(&mut self.periph.rtc, &mut self.rtc_slow, &mut self.page_ver, version_base);
@@ -1127,6 +1128,7 @@ impl SocBus {
             }
             self.board.gpio_changes(&changes);
         }
+        self.irq_dirty |= interrupt_before != self.periph.rtc.interrupt_status();
     }
 }
 #[cfg(test)]

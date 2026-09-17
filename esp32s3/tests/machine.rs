@@ -145,6 +145,72 @@ fn ulp_fsm_executes_shared_rtc_memory_at_instruction_boundaries() {
 }
 
 #[test]
+fn ulp_wake_asserts_rtc_core_interrupt_and_releases_waiti() {
+    let mut m = machine();
+    let words = [0x9000_0001_u32, 0xb000_0000]; // WAKE; HALT
+    let program: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    esp_soc::SocBus::load_bytes(&mut m.bus, esp32s3::bus::RTC_SLOW_LOW, &program).unwrap();
+    m.bus.periph.intmatrix.map[0][esp32s3::periph::SRC_RTC_CORE] = 4;
+    m.cores[0].intenable = 1 << 4;
+    m.cores[0].waiting = true;
+    m.cores[0].ps = 0;
+    m.bus.write32(RTC_CNTL + 0x40, esp_periph::INT_ULP_CP).unwrap();
+    m.bus.write32(RTC_CNTL + 0x104, (1 << 27) | (1 << 23)).unwrap();
+    m.bus.write32(RTC_CNTL + 0x100, (1 << 30) | (1 << 28) | (512 << 11) | 512).unwrap();
+    m.max_cycles = 200;
+    assert!(matches!(m.run(u64::MAX), Stop::Halted));
+
+    assert_eq!(m.bus.read32(RTC_CNTL + 0x44).unwrap() & esp_periph::INT_ULP_CP, esp_periph::INT_ULP_CP);
+    assert_eq!(m.bus.read32(RTC_CNTL + 0x48).unwrap() & esp_periph::INT_ULP_CP, esp_periph::INT_ULP_CP);
+    assert!(!m.cores[0].waiting(), "the routed RTC level interrupt releases waiti");
+    assert_eq!(m.bus.ulp_fsm.wake_requests, 1);
+}
+
+#[test]
+fn ulp_timer_reruns_a_wake_program_after_each_halt() {
+    let mut m = machine();
+    let words = [0x9000_0001_u32, 0xb000_0000]; // WAKE; HALT
+    let program: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    esp_soc::SocBus::load_bytes(&mut m.bus, esp32s3::bus::RTC_SLOW_LOW, &program).unwrap();
+    m.bus.write32(RTC_CNTL + 0x104, (1 << 27) | (1 << 23)).unwrap();
+    m.bus.write32(RTC_CNTL + 0x100, (1 << 28) | (512 << 11) | 512).unwrap();
+    m.bus.write32(RTC_CNTL + 0x134, 3 << 8).unwrap();
+    m.bus.write32(RTC_CNTL + 0xfc, 1 << 31).unwrap();
+    m.cores[0].waiting = true;
+    m.cores[0].ps = 0;
+    m.max_cycles = 20_000;
+    assert!(matches!(m.run(u64::MAX), Stop::Halted));
+
+    assert!(m.bus.periph.rtc.ulp.starts >= 3, "periodic timer did not rerun the ULP");
+    assert_eq!(m.bus.periph.rtc.ulp.starts, m.bus.periph.rtc.ulp.halts);
+    assert_eq!(m.bus.ulp_fsm.wake_requests, m.bus.periph.rtc.ulp.starts);
+    assert_eq!(m.bus.periph.rtc.ulp.state, esp_periph::UlpState::WakeDelay);
+}
+
+#[test]
+fn main_cpu_rtc_access_orders_after_ulp_completion_at_the_same_cycle() {
+    let mut m = machine();
+    let program = 0x9000_0001_u32.to_le_bytes(); // WAKE
+    esp_soc::SocBus::load_bytes(&mut m.bus, esp32s3::bus::RTC_SLOW_LOW, &program).unwrap();
+    m.bus.write32(RTC_CNTL + 0x104, (1 << 27) | (1 << 23)).unwrap();
+    m.bus.write32(RTC_CNTL + 0x100, (1 << 30) | (1 << 28) | (512 << 11) | 512).unwrap();
+
+    m.bus.tick(71);
+    assert_eq!(m.bus.read32(RTC_CNTL + 0x44).unwrap() & esp_periph::INT_ULP_CP, 0);
+    m.bus.tick(1);
+    assert_eq!(m.bus.read32(RTC_CNTL + 0x44).unwrap() & esp_periph::INT_ULP_CP, esp_periph::INT_ULP_CP);
+
+    let mut m = machine();
+    esp_soc::SocBus::load_bytes(&mut m.bus, esp32s3::bus::RTC_SLOW_LOW, &program).unwrap();
+    m.bus.write32(RTC_CNTL + 0x104, (1 << 27) | (1 << 23)).unwrap();
+    m.bus.write32(RTC_CNTL + 0x100, (1 << 30) | (1 << 28) | (512 << 11) | 512).unwrap();
+    m.bus.tick(72);
+    m.bus.write32(RTC_CNTL + 0x4c, esp_periph::INT_ULP_CP).unwrap();
+    assert_eq!(m.bus.read32(RTC_CNTL + 0x44).unwrap() & esp_periph::INT_ULP_CP, 0, "ULP completion is applied before the main-CPU W1C access");
+    assert_eq!(m.bus.ulp_fsm.wake_requests, 1);
+}
+
+#[test]
 fn ulp_register_write_can_stop_its_timer_before_halt() {
     let mut m = machine();
     let words = [0x1ffc_003f_u32, 0xb000_0000]; // I_END(); HALT

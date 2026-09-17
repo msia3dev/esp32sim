@@ -35,7 +35,7 @@ pub use usb_serial_jtag::UsbSerialJtag;
 pub use systimer::Systimer;
 pub use timg::{Timer, TimerGroup};
 pub use gpio::Gpio;
-pub use rtc_cntl::{reset_cause_name, RtcCntl, RST_POWERON, RST_RTCWDT_CPU, RST_RTCWDT_RTC, RST_RTCWDT_SYS, RST_SW_CPU, RST_SW_SYS};
+pub use rtc_cntl::{reset_cause_name, RtcCntl, INT_ULP_CP, RST_POWERON, RST_RTCWDT_CPU, RST_RTCWDT_RTC, RST_RTCWDT_SYS, RST_SW_CPU, RST_SW_SYS};
 pub use ulp::{UlpArchitecture, UlpController, UlpState};
 pub use efuse::Efuse;
 pub use system::SystemRegs;

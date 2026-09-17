@@ -13,6 +13,7 @@ pub const PERIPH_END: u32 = 0x600D_0000;
 
 // interrupt sources (soc/interrupts.h, with the enum's explicit gaps)
 pub const SRC_GPIO: usize = 16;
+pub const SRC_RTC_CORE: usize = 39;
 pub const SRC_UART0: usize = 27;
 pub const SRC_UART1: usize = 28;
 pub const SRC_SPI2: usize = 21;
@@ -463,7 +464,7 @@ device_set! { Peripherals; clock: (clock) CPU_HZ, [(ClockDomain::Systimer, 15), 
     0x20 "TIMG1" (timg[1]) => [SRC_TG1_T0];
     0xc2 "INTERRUPT" (intmatrix) => [];
     0x04 "GPIO" (gpio) => [SRC_GPIO];
-    0x08 "RTC" (rtc) => [];
+    0x08 "RTC" (rtc) => [SRC_RTC_CORE];
     0x07 "EFUSE" (efuse) => [];
     0xc0 "SYSTEM" (system) => [SRC_FROM_CPU0, SRC_FROM_CPU0 + 1, SRC_FROM_CPU0 + 2, SRC_FROM_CPU0 + 3];
     0xc4 "EXTMEM" (extmem) => [];

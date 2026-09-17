@@ -93,6 +93,17 @@ fn assembled_program_moves_stores_loads_and_halts() {
 }
 
 #[test]
+fn wake_retires_at_its_documented_cost_and_continues_execution() {
+    let mut ram = Ram::new(&[0x9000_0001, 0xb000_0000]);
+    let mut cpu = Cpu::new(0);
+
+    assert_eq!(step(&mut cpu, &mut ram), Ok(Event::Wake));
+    assert_eq!((cpu.pc, cpu.insn_count, cpu.cycle_count), (1, 1, 6));
+    assert!(!cpu.halted);
+    assert_eq!(step(&mut cpu, &mut ram), Ok(Event::Halt));
+}
+
+#[test]
 fn arithmetic_flags_drive_absolute_branches() {
     let mut ram = Ram::new(&[
         0x7420_0013,

@@ -227,6 +227,7 @@ impl UlpFsmEngine {
                 Ok(Event::Continue) => self.prime(bus),
                 Ok(Event::Wake) => {
                     self.wake_requests += 1;
+                    bus.rtc.raise_ulp_interrupt();
                     self.prime(bus);
                 }
                 Ok(Event::Halt) => {

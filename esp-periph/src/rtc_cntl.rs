@@ -3,6 +3,15 @@ use crate::regram::RegRam;
 use crate::ulp::UlpController;
 use emu_core::ClockDomain;
 
+const INT_ENA: u32 = 0x40;
+const INT_RAW: u32 = 0x44;
+const INT_ST: u32 = 0x48;
+const INT_CLR: u32 = 0x4c;
+const INT_ENA_W1TS: u32 = 0x138;
+const INT_ENA_W1TC: u32 = 0x13c;
+const INT_WDT: u32 = 1 << 3;
+pub const INT_ULP_CP: u32 = 1 << 5;
+
 // ------------------------------------------------------------------ RTC controller
 /// Reset causes (RTC_CNTL_RESET_CAUSE_PROCPU), as the ROM prints them.
 pub const RST_POWERON: u32 = 1; pub const RST_SW_SYS: u32 = 3; pub const RST_RTCWDT_SYS: u32 = 9; pub const RST_SW_CPU: u32 = 12;
@@ -32,7 +41,7 @@ impl RtcCntl {
             if self.wdt_count < timeout { break; }
             self.wdt_count = 0; self.wdt_stage += 1;
             match action {
-                1 => { self.ram.write(0x100, self.ram.read(0x100) | (1 << 10)); }   // INT_RAW.WDT
+                1 => self.raise_interrupt(INT_WDT),
                 2 => self.request_reset(RST_RTCWDT_CPU),
                 3 => self.request_reset(RST_RTCWDT_SYS),
                 4 => self.request_reset(RST_RTCWDT_RTC),
@@ -62,6 +71,8 @@ impl RtcCntl {
         match off {
             0x10 => self.time_latch as u32, 0x14 => (self.time_latch >> 32) as u32,
             0xc => self.ram.read(off) | (1 << 30),  // TIME_UPDATE: valid
+            INT_ST => self.interrupt_status(),
+            INT_CLR | INT_ENA_W1TS | INT_ENA_W1TC => 0,
             0xd0 => (self.ram.read(off) & !(0xf << 13)) | self.ulp.status_bits(),
             0x1fc => 0x2007270,
             0x850 => (self.ram.read(off) & !0x1ff) | (1 << 8) | u32::from(self.ulp_tsens & 0xff),
@@ -73,6 +84,11 @@ impl RtcCntl {
         match off {
             0x0 => { if v & (1 << 31) != 0 { self.request_reset(RST_SW_SYS); } else if v & (1 << 5) != 0 { self.request_reset(RST_SW_CPU); } self.ram.write(off, v & !((1 << 31) | (1 << 5))); }   // OPTIONS0.SW_SYS_RST / SW_PROCPU_RST
             0xc => { if v & (1 << 31) != 0 { self.time_latch = self.slow_ticks; } self.ram.write(off, v); }
+            INT_ENA | INT_RAW => self.ram.write(off, v),
+            INT_ST => {}
+            INT_CLR => self.ram.write(INT_RAW, self.ram.read(INT_RAW) & !v),
+            INT_ENA_W1TS => self.ram.write(INT_ENA, self.ram.read(INT_ENA) | v),
+            INT_ENA_W1TC => self.ram.write(INT_ENA, self.ram.read(INT_ENA) & !v),
             0xb0 => { self.wdt_unlocked = v == 0x50D8_3AA1; self.ram.write(off, v); }
             0x98..=0xa8 => { if self.wdt_unlocked { if off == 0x98 && (v ^ self.ram.read(0x98)) & (1 << 31) != 0 { self.wdt_count = 0; self.wdt_stage = 0; } self.ram.write(off, v); } }
             0xac => { if self.wdt_unlocked && v & (1 << 31) != 0 { self.wdt_count = 0; self.wdt_stage = 0; } }   // WDTFEED
@@ -88,6 +104,10 @@ impl RtcCntl {
         }
         effect
     }
+
+    pub fn raise_ulp_interrupt(&mut self) { self.raise_interrupt(INT_ULP_CP); }
+    pub fn interrupt_status(&self) -> u32 { self.ram.read(INT_RAW) & self.ram.read(INT_ENA) }
+    fn raise_interrupt(&mut self, mask: u32) { self.ram.write(INT_RAW, self.ram.read(INT_RAW) | mask); }
 }
 
 impl Default for RtcCntl { fn default() -> Self { Self::new() } }
@@ -95,6 +115,7 @@ impl Default for RtcCntl { fn default() -> Self { Self::new() } }
 impl Device for RtcCntl {
     fn read(&mut self, off: u32) -> u32 { RtcCntl::read(self, off) }
     fn write(&mut self, off: u32, v: u32) -> WriteEffect { RtcCntl::write(self, off, v) }
+    fn irq_sources(&self) -> u64 { u64::from(self.interrupt_status() != 0) }
     fn clock(&self) -> Option<ClockDomain> { Some(ClockDomain::RtcSlow) }
     fn tick(&mut self, ticks: u64) { self.slow_ticks += ticks; self.wdt_tick(ticks); self.ulp.tick(ticks); }
     fn has_deadline(&self) -> bool { true }

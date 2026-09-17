@@ -44,6 +44,35 @@ fn rtc_ulp_reset_blocks_start_and_unrelated_writes_have_no_effect() {
 }
 
 #[test]
+fn rtc_interrupt_raw_enable_status_clear_and_aliases_match_hardware_registers() {
+    let mut rtc = RtcCntl::new();
+    let ulp = esp_periph::INT_ULP_CP;
+
+    rtc.raise_ulp_interrupt();
+    assert_eq!(Device::read(&mut rtc, 0x44) & ulp, ulp, "raw records a disabled event");
+    assert_eq!(Device::read(&mut rtc, 0x48) & ulp, 0, "status masks raw with enable");
+    assert_eq!(Device::irq_sources(&rtc), 0);
+
+    Device::write(&mut rtc, 0x138, ulp);
+    assert_eq!(Device::read(&mut rtc, 0x40) & ulp, ulp);
+    assert_eq!(Device::read(&mut rtc, 0x48) & ulp, ulp);
+    assert_eq!(Device::irq_sources(&rtc), 1);
+
+    Device::write(&mut rtc, 0x13c, ulp);
+    assert_eq!(Device::read(&mut rtc, 0x48) & ulp, 0);
+    assert_eq!(Device::read(&mut rtc, 0x44) & ulp, ulp, "disable does not clear raw");
+    Device::write(&mut rtc, 0x40, ulp);
+    Device::write(&mut rtc, 0x4c, ulp);
+    assert_eq!(Device::read(&mut rtc, 0x44) & ulp, 0);
+    assert_eq!(Device::read(&mut rtc, 0x48) & ulp, 0);
+    assert_eq!(Device::read(&mut rtc, 0x4c), 0, "write-only clear reads zero");
+
+    rtc.raise_ulp_interrupt();
+    Device::write(&mut rtc, 0x44, 0);
+    assert_eq!(Device::read(&mut rtc, 0x44) & ulp, 0, "ESP-IDF clears raw through REG_CLR_BIT");
+}
+
+#[test]
 fn rtc_io_w1_registers_update_output_and_enable_latches() {
     let mut rtc = RtcCntl::new();
     Device::write(&mut rtc, 0x404, (1 << 10) | (1 << 12));
