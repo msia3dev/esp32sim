@@ -15,6 +15,7 @@ pub mod observers;
 pub mod picture;
 pub mod png;
 pub mod soc;
+pub mod storage;
 pub mod web;
 
 pub use board::{Board, BoardModel, NoBoard, PanelControl};
@@ -22,3 +23,4 @@ pub use debug::DebugFlags;
 pub use machine::{Console, Debug, Machine, Realtime, Script, ScriptAction};
 pub use observe::{Ctx, Observer, Wants};
 pub use soc::{CoreState, RunUntil, Soc, SocBus, Stop};
+pub use storage::StateFile;

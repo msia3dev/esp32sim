@@ -64,6 +64,12 @@ impl esp_soc::SocBus for SocBus {
         self.note_written(SRC_FLASH, offset, data.len());
         Ok(())
     }
+    fn persistent_flash_loaded(&self) -> bool { SocBus::persistent_flash_loaded(self) }
+    fn initialize_storage(&mut self) -> Result<(), String> { SocBus::initialize_storage(self) }
+    fn flush_storage(&mut self) -> Result<(), String> { SocBus::flush_storage(self) }
+    fn storage_generation(&self) -> u64 { SocBus::storage_generation(self) }
+    fn export_storage(&self, kind: u32) -> Option<Vec<u8>> { SocBus::export_storage(self, kind) }
+    fn import_storage(&mut self, kind: u32, data: &[u8]) -> Result<(), String> { SocBus::import_storage(self, kind, data) }
     /// Copy IRAM/DRAM segments, map IROM/DROM through the MMU, as the 2nd-stage bootloader would.
     fn boot_app(&mut self, app_off: usize) -> Result<u32, String> {
         self.periph.system.preset_after_bootloader();
@@ -99,6 +105,7 @@ impl esp_soc::SocBus for SocBus {
         let old = std::mem::replace(&mut self.periph, periph::Peripherals::new(mac));
         let p = &mut self.periph;
         p.efuse = old.efuse;
+        p.efuse.reset_controller();
         p.gpio.strap = old.gpio.strap;
         p.misc.log_unknown = old.misc.log_unknown; p.spi1.log = old.spi1.log;
         p.spi0.jedec = old.spi0.jedec; p.spi1.jedec = old.spi1.jedec;   // the flash chip is not reset: its ID keeps the --flash-mb capacity

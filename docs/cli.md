@@ -18,6 +18,8 @@ register presets).
 | `--ptable-offset 0xNNNN` | where `--ptable` (and thus the partition table itself) is written, default 0x8000 — match your project's `CONFIG_PARTITION_TABLE_OFFSET` if it isn't the default (a bootloader built with Secure Boot V2 + Flash Encryption is often larger than the default 0x8000 gap and needs this pushed out, or it'll silently overlap and corrupt the tail of the bootloader image) |
 | `--app-offset 0xNNNN` | where `--app` is written (and, in `--boot app`, where its image is read from), default 0x10000 — match the offset of the partition you're booting (e.g. the `factory` app partition's actual offset from your partition table), which can differ once earlier partitions have been resized or reordered |
 | `--flash-image F` | whole flash dump written at 0 |
+| `--flash-state F` | persistent mutable ESP32-S3 logical flash; create from seed images when missing, otherwise load it and ignore the seeds |
+| `--efuse-state F` | persistent mutable 336-byte ESP32-S3 physical eFuse state; existing state takes precedence over `--efuse-regs` |
 | `--chip s3\|c3\|c6` | which chip (default s3) |
 | `--rom F` | mask ROM ELF (default: the chip's in `~/.espressif/tools/esp-rom-elfs/*/`) |
 | `--mac xx:xx:xx:xx:xx:xx` | the station MAC the efuses report |
@@ -33,6 +35,26 @@ register presets).
 | `--net nat\|none` | what the virtual network does with traffic it is not itself answering: `nat` (default) forwards TCP and UDP to the host's own network through ordinary sockets, `none` refuses it |
 | `--trace-fn PREFIX` (repeatable) | log every call to functions whose name starts with PREFIX, with args and caller |
 | `--regstat FILE` | write per-register access statistics (count, pc, symbol) at exit — for reverse-engineering |
+
+### Persistent state
+
+`--flash-state` makes ESP-IDF NVS, OTA metadata and every other flash-backed
+partition survive a separate emulator process. `--efuse-state` persists
+one-way eFuse burns. Both flags currently support the ESP32-S3 only.
+
+```sh
+esp32sim --chip s3 --boot rom \
+  --bootloader bootloader.bin --ptable partition-table.bin --app app.bin \
+  --flash-mb 16 \
+  --flash-state .state/flash.bin --efuse-state .state/efuse.bin
+```
+
+If a state file is absent, its seeds are applied once before it is created. If
+it exists, state wins and the corresponding seeds are ignored. Delete/select a
+new state file to emulate a fresh device; seed files are never overwritten.
+Flash state is logical CPU-visible data, not physical encrypted ciphertext.
+See [storage.md](storage.md) for exact formats, write timing, reset behavior,
+browser profiles and security considerations.
 
 ## Running
 | Flag | Meaning |

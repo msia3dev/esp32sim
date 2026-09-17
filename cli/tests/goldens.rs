@@ -26,6 +26,27 @@ fn atech(extra: &[&str]) -> (Run, Vec<u8>) {
     (r, data)
 }
 
+#[test]
+fn persistent_state_is_created_reloaded_and_does_not_modify_the_seed() {
+    let flash = tmp("persistent-flash.bin"); let efuse = tmp("persistent-efuse.bin");
+    let _ = std::fs::remove_file(&flash); let _ = std::fs::remove_file(&efuse);
+    let app = root().join(format!("{FW}/hello_world.bin")); let before = std::fs::read(&app).unwrap();
+    let args = ["--chip", "s3", "--board", "none", "--boot", "app", "--no-dump", "--max-insns", "1",
+        "--app", app.to_str().unwrap(), "--flash-state", flash.to_str().unwrap(), "--efuse-state", efuse.to_str().unwrap()];
+    let first = run(BIN, &args); assert!(first.stderr.contains("flash state:") && first.stderr.contains("(new)"));
+    assert_eq!(std::fs::metadata(&flash).unwrap().len(), 8 << 20); assert_eq!(std::fs::metadata(&efuse).unwrap().len(), 336);
+    let second = run(BIN, &args); assert!(second.stderr.contains("existing flash state takes precedence over seed images"));
+    assert_eq!(std::fs::read(app).unwrap(), before); std::fs::remove_file(flash).unwrap(); std::fs::remove_file(efuse).unwrap();
+}
+
+#[test]
+fn persistent_state_rejects_the_wrong_size() {
+    let flash = tmp("bad-persistent-flash.bin"); std::fs::write(&flash, [0u8; 3]).unwrap();
+    let out = std::process::Command::new(BIN).args(["--chip", "s3", "--flash-state", flash.to_str().unwrap(), "--max-insns", "1"]).current_dir(root()).output().unwrap();
+    assert!(!out.status.success()); assert!(String::from_utf8_lossy(&out.stderr).contains("state size is 3 bytes, expected 8388608"));
+    std::fs::remove_file(flash).unwrap();
+}
+
 /// The Pocket Synth scenario: buttons, encoder, a serial command, the SID voice on I2S.
 #[test] #[ignore = "needs the ESP32-S3 mask ROM ELF"]
 fn atech_script1() {

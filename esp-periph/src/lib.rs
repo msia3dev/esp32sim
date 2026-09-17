@@ -37,7 +37,7 @@ pub use timg::{Timer, TimerGroup};
 pub use gpio::Gpio;
 pub use rtc_cntl::{reset_cause_name, RtcCntl, INT_COCPU, INT_COCPU_TRAP, INT_ULP_CP, RST_POWERON, RST_RTCWDT_CPU, RST_RTCWDT_RTC, RST_RTCWDT_SYS, RST_SW_CPU, RST_SW_SYS};
 pub use ulp::{UlpArchitecture, UlpController, UlpState};
-pub use efuse::Efuse;
+pub use efuse::{Efuse, EFUSE_STATE_BYTES, EFUSE_STATE_WORDS};
 pub use system::SystemRegs;
 pub use spi_mem::{DirtyMem, SpiMem};
 pub use sha::Sha;

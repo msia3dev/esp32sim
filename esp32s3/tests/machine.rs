@@ -728,7 +728,7 @@ fn browser_external_finish_honors_halt_and_drains_console() {
 #[test]
 fn reboot_keeps_what_silicon_keeps() {
     let mut m = machine();
-    m.bus.periph.efuse.ram.write(0x44, 0xdead_beef);
+    assert!(m.bus.periph.efuse.import_shadow(0x44, 0xdead_beef));
     m.bus.periph.gpio.strap = 0x7;
     m.bus.periph.rtc.ram.write(0x120, 0x1234);
     m.bus.periph.rtc.slow_ticks = 999;
