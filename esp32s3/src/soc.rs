@@ -103,6 +103,8 @@ impl esp_soc::SocBus for SocBus {
         p.misc.log_unknown = old.misc.log_unknown; p.spi1.log = old.spi1.log;
         p.spi0.jedec = old.spi0.jedec; p.spi1.jedec = old.spi1.jedec;   // the flash chip is not reset: its ID keeps the --flash-mb capacity
         p.rtc.ram = old.rtc.ram; p.rtc.slow_ticks = old.rtc.slow_ticks; p.rtc.ulp = old.rtc.ulp;
+        p.rtc.ulp_adc = old.rtc.ulp_adc; p.rtc.ulp_tsens = old.rtc.ulp_tsens; p.rtc.ulp_i2c = old.rtc.ulp_i2c;
+        p.rtc.ulp_adc_sample_cycle = old.rtc.ulp_adc_sample_cycle; p.rtc.ulp_adc_sample_bits = old.rtc.ulp_adc_sample_bits;
         p.rtc.ram.write(0x38, cause | (cause << 6));
         p.rtc.ram.write(0x98, 0);                       // watchdog disarmed by the reset; the ROM re-arms it
         p.i2s0.pcm = old.i2s0.pcm; p.i2s0.frames_out = old.i2s0.frames_out; p.i2s1.pcm = old.i2s1.pcm; p.i2s1.frames_out = old.i2s1.frames_out;   // keep the captured audio continuous

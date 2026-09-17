@@ -145,6 +145,79 @@ fn ulp_fsm_executes_shared_rtc_memory_at_instruction_boundaries() {
 }
 
 #[test]
+fn ulp_register_write_can_stop_its_timer_before_halt() {
+    let mut m = machine();
+    let words = [0x1ffc_003f_u32, 0xb000_0000]; // I_END(); HALT
+    let program: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    esp_soc::SocBus::load_bytes(&mut m.bus, esp32s3::bus::RTC_SLOW_LOW, &program).unwrap();
+
+    m.bus.write32(RTC_CNTL + 0x104, (1 << 27) | (1 << 23)).unwrap();
+    m.bus.write32(RTC_CNTL + 0xfc, 1 << 31).unwrap();
+    m.bus.write32(RTC_CNTL + 0x100, (1 << 30) | (1 << 28) | (512 << 11) | 512).unwrap();
+    m.cores[0].waiting = true;
+    m.cores[0].ps = 0;
+    m.max_cycles = 300;
+    assert!(matches!(m.run(u64::MAX), Stop::Halted));
+
+    assert_eq!(m.bus.periph.rtc.ram.read(0xfc) & (1 << 31), 0);
+    assert_eq!(m.bus.periph.rtc.ulp.state, esp_periph::UlpState::Halted);
+    assert_eq!((m.bus.periph.rtc.ulp.starts, m.bus.periph.rtc.ulp.halts), (1, 1));
+    assert_eq!((m.bus.ulp_fsm.cpu.insn_count, m.bus.ulp_fsm.cpu.cycle_count), (2, 14));
+}
+
+#[test]
+fn ulp_rtc_gpio_edges_keep_instruction_completion_timestamps() {
+    let mut m = machine();
+    let words = [0x1528_0500_u32, 0x4000_0011, 0x1528_0100, 0xb000_0000];
+    let program: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    esp_soc::SocBus::load_bytes(&mut m.bus, esp32s3::bus::RTC_SLOW_LOW, &program).unwrap();
+    m.bus.write32(RTC_CNTL + 0x484, 1 << 19).unwrap(); // GPIO0 selects RTC function
+    m.bus.write32(RTC_CNTL + 0x40c, 1 << 10).unwrap(); // RTC channel 0 output enable
+    esp_soc::SocBus::observe_gpio(&mut m.bus, true);
+    m.bus.write32(RTC_CNTL + 0x104, (1 << 27) | (1 << 23)).unwrap();
+    m.bus.write32(RTC_CNTL + 0x100, (1 << 30) | (1 << 28) | (512 << 11) | 512).unwrap();
+    m.cores[0].waiting = true;
+    m.cores[0].ps = 0;
+    m.max_cycles = 700;
+    assert!(matches!(m.run(u64::MAX), Stop::Halted));
+
+    assert_eq!(
+        esp_soc::SocBus::take_gpio_events(&mut m.bus),
+        [(144, 0, true), (564, 0, false)]
+    );
+    assert_eq!((m.bus.ulp_fsm.cpu.insn_count, m.bus.ulp_fsm.cpu.cycle_count), (4, 49));
+}
+
+#[test]
+fn ulp_adc_tsens_and_rtc_i2c_run_with_register_derived_timing() {
+    let mut m = machine();
+    let words = [0x5000_0011_u32, 0xa000_0086, 0x38a9_3412, 0x30b8_0012, 0xb000_0000];
+    let program: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    esp_soc::SocBus::load_bytes(&mut m.bus, esp32s3::bus::RTC_SLOW_LOW, &program).unwrap();
+    m.bus.periph.rtc.ulp_adc[0][3] = 0x0abc;
+    m.bus.periph.rtc.ulp_tsens = 0x0087;
+    m.bus.periph.rtc.ulp_i2c[2][0x12] = 0xff;
+    m.bus.periph.rtc.ram.write(0xc00, 2); // RTC-I2C SCL low
+    m.bus.periph.rtc.ram.write(0xc14, 2); // RTC-I2C SCL high
+    m.bus.periph.rtc.ram.write(0xc1c, 1); // start
+    m.bus.periph.rtc.ram.write(0xc20, 1); // stop
+    m.bus.write32(RTC_CNTL + 0x104, (1 << 27) | (1 << 23)).unwrap();
+    m.bus.write32(RTC_CNTL + 0x100, (1 << 30) | (1 << 28) | (512 << 11) | 512).unwrap();
+    assert!(m.bus.next_deadline() <= 71 * 12, "ADC completion is the first ULP deadline");
+    m.cores[0].waiting = true;
+    m.cores[0].ps = 0;
+    m.max_cycles = 5_000;
+    assert!(matches!(m.run(u64::MAX), Stop::Halted));
+
+    assert_eq!(m.bus.ulp_fsm.cpu.regs[1], 0x0abc);
+    assert_eq!(m.bus.ulp_fsm.cpu.regs[2], 0x0087);
+    assert_eq!(m.bus.ulp_fsm.cpu.regs[0], 0xf5);
+    assert_eq!(m.bus.periph.rtc.ulp_i2c[2][0x12], 0xf5);
+    assert_eq!((m.bus.ulp_fsm.cpu.insn_count, m.bus.ulp_fsm.cpu.cycle_count), (5, 358));
+    assert_eq!(m.bus.ulp_fsm.traps, 0);
+}
+
+#[test]
 fn precise_trap_observer_reports_fault_after_resumed_hardware_loop() {
     use esp_soc::observe::{Ctx, Observer, Wants};
     use std::sync::{Arc, Mutex};

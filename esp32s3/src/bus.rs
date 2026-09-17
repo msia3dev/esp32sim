@@ -1110,15 +1110,23 @@ impl SocBus {
 
     fn reconcile_ulp(&mut self) {
         let version_base = self.ver_base[SRC_RTC_SLOW as usize];
-        let mut bus = RtcSlowBus::new(&mut self.rtc_slow, &mut self.page_ver, version_base);
-        self.ulp_fsm.reconcile(&mut self.periph.rtc.ulp, &mut bus);
+        let mut bus = RtcSlowBus::new(&mut self.periph.rtc, &mut self.rtc_slow, &mut self.page_ver, version_base);
+        self.ulp_fsm.reconcile(&mut bus);
     }
 
     fn advance_ulp(&mut self, cycles: u32) {
         let fast_hz = UlpFsmEngine::rtc_fast_hz(&self.periph.rtc);
         let version_base = self.ver_base[SRC_RTC_SLOW as usize];
-        let mut bus = RtcSlowBus::new(&mut self.rtc_slow, &mut self.page_ver, version_base);
-        self.ulp_fsm.advance(cycles, fast_hz, &mut self.periph.rtc.ulp, &mut bus);
+        let mut bus = RtcSlowBus::new(&mut self.periph.rtc, &mut self.rtc_slow, &mut self.page_ver, version_base);
+        self.ulp_fsm.advance(cycles, fast_hz, &mut bus);
+        let changes = bus.take_gpio_changes();
+        drop(bus);
+        if !changes.is_empty() {
+            if let Some(events) = &mut self.gpio_events {
+                for &(pin, level) in &changes { events.push((self.cycles, pin, level)); }
+            }
+            self.board.gpio_changes(&changes);
+        }
     }
 }
 #[cfg(test)]

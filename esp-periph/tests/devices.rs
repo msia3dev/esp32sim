@@ -43,6 +43,17 @@ fn rtc_ulp_reset_blocks_start_and_unrelated_writes_have_no_effect() {
     assert_eq!(Device::write(&mut rtc, 0x74, 0x1234), WriteEffect::NONE);
 }
 
+#[test]
+fn rtc_io_w1_registers_update_output_and_enable_latches() {
+    let mut rtc = RtcCntl::new();
+    Device::write(&mut rtc, 0x404, (1 << 10) | (1 << 12));
+    Device::write(&mut rtc, 0x408, 1 << 10);
+    assert_eq!(Device::read(&mut rtc, 0x400), 1 << 12);
+    Device::write(&mut rtc, 0x410, (1 << 11) | (1 << 12));
+    Device::write(&mut rtc, 0x414, 1 << 11);
+    assert_eq!(Device::read(&mut rtc, 0x40c), 1 << 12);
+}
+
 // ------------------------------------------------------------------ systimer
 #[test]
 fn systimer_one_shot_fires_on_its_tick_and_says_when() {

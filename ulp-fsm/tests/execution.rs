@@ -4,12 +4,20 @@ use ulp_fsm::{decode, step, Bus, Cpu, Event, Trap};
 struct Ram {
     words: Vec<u32>,
     writes: Vec<(u16, u32)>,
+    regs: [[u32; 256]; 4],
+    adc: [[u16; 16]; 2],
+    tsens: u16,
+    i2c: [[u8; 256]; 16],
 }
 impl Ram {
     fn new(words: &[u32]) -> Self {
         Self {
             words: words.to_vec(),
             writes: Vec::new(),
+            regs: [[0; 256]; 4],
+            adc: [[0; 16]; 2],
+            tsens: 0,
+            i2c: [[0; 256]; 16],
         }
     }
 }
@@ -23,6 +31,42 @@ impl Bus for Ram {
         *word = value;
         self.writes.push((address, value));
         Ok(())
+    }
+    fn read_reg(&mut self, peripheral: u8, address: u8) -> Option<u32> {
+        Some(self.regs[peripheral as usize][address as usize])
+    }
+    fn write_reg(&mut self, peripheral: u8, address: u8, value: u32) -> bool {
+        self.regs[peripheral as usize][address as usize] = value;
+        true
+    }
+    fn instruction_cycles(&mut self, insn: ulp_fsm::Insn) -> Option<u32> {
+        match insn.kind {
+            ulp_fsm::Kind::Adc { .. } => Some(60),
+            ulp_fsm::Kind::Tsens { .. } => Some(80),
+            ulp_fsm::Kind::I2c { .. } => Some(100),
+            _ => insn.cycles(),
+        }
+    }
+    fn adc(&mut self, sar: u8, mux: u8) -> Option<u16> {
+        self.adc
+            .get(sar as usize)?
+            .get(mux.checked_sub(1)? as usize)
+            .copied()
+    }
+    fn tsens(&mut self) -> Option<u16> {
+        Some(self.tsens)
+    }
+    fn i2c_read(&mut self, bus: u8, address: u8) -> Option<u8> {
+        self.i2c
+            .get(bus as usize)
+            .map(|registers| registers[address as usize])
+    }
+    fn i2c_write(&mut self, bus: u8, address: u8, value: u8) -> bool {
+        let Some(registers) = self.i2c.get_mut(bus as usize) else {
+            return false;
+        };
+        registers[address as usize] = value;
+        true
     }
 }
 
@@ -162,4 +206,46 @@ fn signed_load_offset_addresses_the_previous_word() {
     cpu.regs[1] = 5;
     assert_eq!(step(&mut cpu, &mut ram), Ok(Event::Continue));
     assert_eq!(cpu.regs[0], 0x5678);
+}
+
+#[test]
+fn register_access_updates_selected_fields_and_reads_into_r0() {
+    let mut ram = Ram::new(&[0x1184_1404, 0x2308_0007, 0xb000_0000]);
+    ram.regs[0][4] = 0xffff_0000;
+    ram.regs[0][7] = 0x0000_00b4;
+    let mut cpu = Cpu::new(0);
+
+    assert_eq!(step(&mut cpu, &mut ram), Ok(Event::Continue));
+    assert_eq!(
+        ram.regs[0][4], 0xffff_000a,
+        "REG_WR writes bits 3:1 with value 5"
+    );
+    assert_eq!(step(&mut cpu, &mut ram), Ok(Event::Continue));
+    assert_eq!(cpu.regs[0], 0x0d, "REG_RD reads bits 6:2 into R0");
+    assert_eq!((cpu.insn_count, cpu.cycle_count), (2, 20));
+}
+
+#[test]
+fn adc_tsens_and_i2c_use_configured_peripheral_values() {
+    let mut ram = Ram::new(&[
+        0x5000_0011,
+        0xa000_0086,
+        0x38a9_3412,
+        0x30b8_0012,
+        0xb000_0000,
+    ]);
+    ram.adc[0][3] = 0x0abc;
+    ram.tsens = 0x0087;
+    ram.i2c[2][0x12] = 0xff;
+    let mut cpu = Cpu::new(0);
+
+    assert_eq!(step(&mut cpu, &mut ram), Ok(Event::Continue));
+    assert_eq!(cpu.regs[1], 0x0abc);
+    assert_eq!(step(&mut cpu, &mut ram), Ok(Event::Continue));
+    assert_eq!(cpu.regs[2], 0x0087);
+    assert_eq!(step(&mut cpu, &mut ram), Ok(Event::Continue));
+    assert_eq!(ram.i2c[2][0x12], 0xf5);
+    assert_eq!(step(&mut cpu, &mut ram), Ok(Event::Continue));
+    assert_eq!(cpu.regs[0], 0xf5);
+    assert_eq!((cpu.insn_count, cpu.cycle_count), (4, 340));
 }

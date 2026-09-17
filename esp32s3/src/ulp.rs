@@ -1,7 +1,7 @@
 //! ESP32-S3 ULP-FSM RTC-memory adapter and instruction scheduler.
 
-use esp_periph::{RtcCntl, UlpArchitecture, UlpController, UlpState};
-use ulp_fsm::{decode, step, Bus, Cpu, Event};
+use esp_periph::{RtcCntl, UlpArchitecture, UlpState};
+use ulp_fsm::{decode, step, Bus, Cpu, Event, Insn, Kind};
 
 const RC_FAST_HZ: u64 = 17_500_000;
 const XTAL_D2_HZ: u64 = 20_000_000;
@@ -14,18 +14,31 @@ pub enum MemoryError {
 }
 
 pub(crate) struct RtcSlowBus<'a> {
+    rtc: &'a mut RtcCntl,
     memory: &'a mut [u8],
     versions: &'a mut [u32],
     version_base: usize,
+    gpio_changes: Vec<(u8, bool)>,
 }
 
 impl<'a> RtcSlowBus<'a> {
-    pub(crate) fn new(memory: &'a mut [u8], versions: &'a mut [u32], version_base: u32) -> Self {
+    pub(crate) fn new(
+        rtc: &'a mut RtcCntl,
+        memory: &'a mut [u8],
+        versions: &'a mut [u32],
+        version_base: u32,
+    ) -> Self {
         Self {
+            rtc,
             memory,
             versions,
             version_base: version_base as usize,
+            gpio_changes: Vec::new(),
         }
+    }
+
+    pub(crate) fn take_gpio_changes(&mut self) -> Vec<(u8, bool)> {
+        std::mem::take(&mut self.gpio_changes)
     }
 }
 
@@ -58,6 +71,88 @@ impl Bus for RtcSlowBus<'_> {
             }
         }
         Ok(())
+    }
+
+    fn read_reg(&mut self, peripheral: u8, address: u8) -> Option<u32> {
+        let offset = u32::from(peripheral) * 0x400 + u32::from(address) * 4;
+        (offset < 0x1000).then(|| self.rtc.read(offset))
+    }
+
+    fn write_reg(&mut self, peripheral: u8, address: u8, value: u32) -> bool {
+        let offset = u32::from(peripheral) * 0x400 + u32::from(address) * 4;
+        if offset >= 0x1000 {
+            return false;
+        }
+        let old_out = self.rtc.ram.read(0x400);
+        let old_enable = self.rtc.ram.read(0x40c);
+        self.rtc.write(offset, value);
+        if peripheral == 1 && address <= 5 {
+            let new_out = self.rtc.ram.read(0x400);
+            let new_enable = self.rtc.ram.read(0x40c);
+            let changed = ((old_out ^ new_out) & new_enable) | (!old_enable & new_enable);
+            for channel in 0..22u8 {
+                let bit = 1u32 << (10 + channel);
+                let pad = 0x484 + u32::from(channel) * 4;
+                if changed & bit != 0 && self.rtc.ram.read(pad) & (1 << 19) != 0 {
+                    self.gpio_changes.push((channel, new_out & bit != 0));
+                }
+            }
+        }
+        true
+    }
+
+    fn instruction_cycles(&mut self, insn: Insn) -> Option<u32> {
+        match insn.kind {
+            Kind::Adc { .. } => {
+                let amp1 = self.rtc.ram.read(0x818);
+                let amp2 = self.rtc.ram.read(0x81c);
+                let waits = (amp1 & 0xffff).max(1) + (amp1 >> 16).max(1) + (amp2 >> 16).max(1);
+                Some(
+                    27 + waits
+                        + u32::from(self.rtc.ulp_adc_sample_cycle)
+                        + u32::from(self.rtc.ulp_adc_sample_bits),
+                )
+            }
+            Kind::Tsens { delay, .. } => {
+                let divider = ((self.rtc.ram.read(0x850) >> 14) & 0xff).max(1);
+                Some(6 + u32::from(delay) + 3 * divider)
+            }
+            Kind::I2c { .. } => {
+                let low = (self.rtc.ram.read(0xc00) & 0x000f_ffff).max(1);
+                let high = (self.rtc.ram.read(0xc14) & 0x000f_ffff).max(1);
+                let start = self.rtc.ram.read(0xc1c) & 0x000f_ffff;
+                let stop = self.rtc.ram.read(0xc20) & 0x000f_ffff;
+                Some(4 + start + stop + 27 * (low + high))
+            }
+            _ => insn.cycles(),
+        }
+    }
+
+    fn adc(&mut self, sar: u8, mux: u8) -> Option<u16> {
+        self.rtc
+            .ulp_adc
+            .get(sar as usize)?
+            .get(mux.checked_sub(1)? as usize)
+            .copied()
+    }
+
+    fn tsens(&mut self) -> Option<u16> {
+        Some(self.rtc.ulp_tsens)
+    }
+
+    fn i2c_read(&mut self, bus: u8, address: u8) -> Option<u8> {
+        self.rtc
+            .ulp_i2c
+            .get(bus as usize)
+            .map(|registers| registers[address as usize])
+    }
+
+    fn i2c_write(&mut self, bus: u8, address: u8, value: u8) -> bool {
+        let Some(registers) = self.rtc.ulp_i2c.get_mut(bus as usize) else {
+            return false;
+        };
+        registers[address as usize] = value;
+        true
     }
 }
 
@@ -94,15 +189,12 @@ impl UlpFsmEngine {
         }
     }
 
-    pub fn reconcile(
-        &mut self,
-        controller: &mut UlpController,
-        bus: &mut impl Bus<Error = MemoryError>,
-    ) {
-        if controller.state == UlpState::Reset {
-            self.cpu.reset_architecture(controller.entry_pc);
+    pub(crate) fn reconcile(&mut self, bus: &mut RtcSlowBus<'_>) {
+        if bus.rtc.ulp.state == UlpState::Reset {
+            self.cpu.reset_architecture(bus.rtc.ulp.entry_pc);
         }
-        if controller.architecture != UlpArchitecture::Fsm || controller.state != UlpState::Running
+        if bus.rtc.ulp.architecture != UlpArchitecture::Fsm
+            || bus.rtc.ulp.state != UlpState::Running
         {
             self.active = false;
             self.remaining_ulp_cycles = 0;
@@ -112,21 +204,15 @@ impl UlpFsmEngine {
         if self.active {
             return;
         }
-        self.cpu.restart(controller.entry_pc);
+        self.cpu.restart(bus.rtc.ulp.entry_pc);
         self.phase = 0;
         self.active = true;
-        self.prime(controller, bus);
+        self.prime(bus);
     }
 
-    pub fn advance(
-        &mut self,
-        cpu_cycles: u32,
-        fast_hz: u64,
-        controller: &mut UlpController,
-        bus: &mut impl Bus<Error = MemoryError>,
-    ) {
+    pub(crate) fn advance(&mut self, cpu_cycles: u32, fast_hz: u64, bus: &mut RtcSlowBus<'_>) {
         let was_active = self.active;
-        self.reconcile(controller, bus);
+        self.reconcile(bus);
         if !self.active || !was_active {
             return;
         }
@@ -138,20 +224,20 @@ impl UlpFsmEngine {
             available -= self.remaining_ulp_cycles;
             self.remaining_ulp_cycles = 0;
             match step(&mut self.cpu, bus) {
-                Ok(Event::Continue) => self.prime(controller, bus),
+                Ok(Event::Continue) => self.prime(bus),
                 Ok(Event::Wake) => {
                     self.wake_requests += 1;
-                    self.prime(controller, bus);
+                    self.prime(bus);
                 }
                 Ok(Event::Halt) => {
-                    controller.halt();
+                    bus.rtc.ulp.halt();
                     self.active = false;
                 }
                 Err(trap) => {
                     self.traps += 1;
                     self.last_trap = Some(format!("{trap:?}"));
                     self.cpu.halted = true;
-                    controller.halt();
+                    bus.rtc.ulp.halt();
                     self.active = false;
                 }
             }
@@ -169,24 +255,24 @@ impl UlpFsmEngine {
         Some(numerator.div_ceil(fast_hz).clamp(1, u64::from(u32::MAX)) as u32)
     }
 
-    fn prime(&mut self, controller: &mut UlpController, bus: &mut impl Bus<Error = MemoryError>) {
+    fn prime(&mut self, bus: &mut RtcSlowBus<'_>) {
         match bus.read_word(self.cpu.pc) {
-            Ok(raw) => match decode(raw).cycles() {
+            Ok(raw) => match bus.instruction_cycles(decode(raw)) {
                 Some(cycles) => self.remaining_ulp_cycles = cycles,
                 None => self.trap_before_execute(
-                    controller,
+                    bus,
                     format!("unsupported instruction {raw:#010x} at pc {}", self.cpu.pc),
                 ),
             },
-            Err(error) => self.trap_before_execute(controller, format!("{error:?}")),
+            Err(error) => self.trap_before_execute(bus, format!("{error:?}")),
         }
     }
 
-    fn trap_before_execute(&mut self, controller: &mut UlpController, message: String) {
+    fn trap_before_execute(&mut self, bus: &mut RtcSlowBus<'_>, message: String) {
         self.traps += 1;
         self.last_trap = Some(message);
         self.cpu.halted = true;
-        controller.halt();
+        bus.rtc.ulp.halt();
         self.active = false;
         self.remaining_ulp_cycles = 0;
     }
@@ -204,9 +290,10 @@ mod tests {
 
     #[test]
     fn rtc_slow_store_bumps_the_written_code_page_version() {
+        let mut rtc = RtcCntl::new();
         let mut memory = vec![0u8; 8192];
         let mut versions = vec![0u32; 64];
-        let mut bus = RtcSlowBus::new(&mut memory, &mut versions, 4);
+        let mut bus = RtcSlowBus::new(&mut rtc, &mut memory, &mut versions, 4);
         bus.write_word(64, 0x1234_5678).unwrap();
         assert_eq!(bus.read_word(64), Ok(0x1234_5678));
         assert_eq!(versions[5], 1);
@@ -224,14 +311,14 @@ mod tests {
         engine.cpu.overflow = true;
         engine.cpu.insn_count = 12;
         engine.cpu.cycle_count = 34;
-        let mut controller = UlpController::new();
-        controller.state = UlpState::Reset;
-        controller.entry_pc = 7;
+        let mut rtc = RtcCntl::new();
+        rtc.ulp.state = UlpState::Reset;
+        rtc.ulp.entry_pc = 7;
         let mut memory = vec![0u8; 8192];
         let mut versions = vec![0u32; 64];
-        let mut bus = RtcSlowBus::new(&mut memory, &mut versions, 4);
+        let mut bus = RtcSlowBus::new(&mut rtc, &mut memory, &mut versions, 4);
 
-        engine.reconcile(&mut controller, &mut bus);
+        engine.reconcile(&mut bus);
 
         assert_eq!(engine.cpu.regs, [0; 4]);
         assert_eq!((engine.cpu.pc, engine.cpu.stage), (7, 0));

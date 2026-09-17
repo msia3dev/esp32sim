@@ -1,12 +1,33 @@
 //! One-instruction reference interpreter for the ESP32-S2/S3 ULP-FSM core.
 
-use crate::decode::{decode, AluOp, BranchCond, Kind, StoreKind, StoreMode, Target};
+use crate::decode::{decode, AluOp, BranchCond, Insn, Kind, StoreKind, StoreMode, Target};
 use crate::state::Cpu;
 
 pub trait Bus {
     type Error;
     fn read_word(&mut self, address: u16) -> Result<u32, Self::Error>;
     fn write_word(&mut self, address: u16, value: u32) -> Result<(), Self::Error>;
+    fn read_reg(&mut self, _peripheral: u8, _address: u8) -> Option<u32> {
+        None
+    }
+    fn write_reg(&mut self, _peripheral: u8, _address: u8, _value: u32) -> bool {
+        false
+    }
+    fn instruction_cycles(&mut self, insn: Insn) -> Option<u32> {
+        insn.cycles()
+    }
+    fn adc(&mut self, _sar: u8, _mux: u8) -> Option<u16> {
+        None
+    }
+    fn tsens(&mut self) -> Option<u16> {
+        None
+    }
+    fn i2c_read(&mut self, _bus: u8, _address: u8) -> Option<u8> {
+        None
+    }
+    fn i2c_write(&mut self, _bus: u8, _address: u8, _value: u8) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,13 +88,10 @@ pub fn step<B: Bus>(cpu: &mut Cpu, bus: &mut B) -> Result<Event, Trap<B::Error>>
         return Err(Trap::Illegal { pc, raw });
     }
     cpu.pc = cpu.pc.wrapping_add(1) & 0x7ff;
-    let mut cycles = 6u64;
+    let mut cycles = u64::from(bus.instruction_cycles(insn).ok_or(Trap::Peripheral)?);
     let event = match insn.kind {
         Kind::Illegal => unreachable!("illegal instructions return before execution"),
-        Kind::Wait { cycles: wait } => {
-            cycles += u64::from(wait);
-            Event::Continue
-        }
+        Kind::Wait { .. } => Event::Continue,
         Kind::Halt => {
             cycles = 2;
             cpu.halted = true;
@@ -214,13 +232,74 @@ pub fn step<B: Bus>(cpu: &mut Cpu, bus: &mut B) -> Result<Event, Trap<B::Error>>
             }
             Event::Continue
         }
-        Kind::End { wake: false }
-        | Kind::Sleep { .. }
-        | Kind::WriteReg { .. }
-        | Kind::ReadReg { .. }
-        | Kind::I2c { .. }
-        | Kind::Adc { .. }
-        | Kind::Tsens { .. } => return Err(Trap::Peripheral),
+        Kind::ReadReg {
+            addr,
+            peripheral,
+            low,
+            high,
+        } => {
+            let word = bus.read_reg(peripheral, addr).ok_or(Trap::Peripheral)?;
+            let width = u32::from(high - low + 1);
+            let mask = if width == 32 {
+                u32::MAX
+            } else {
+                (1u32 << width) - 1
+            };
+            cpu.regs[0] = ((word >> low) & mask) as u16;
+            Event::Continue
+        }
+        Kind::WriteReg {
+            addr,
+            peripheral,
+            data,
+            low,
+            high,
+        } => {
+            let current = bus.read_reg(peripheral, addr).ok_or(Trap::Peripheral)?;
+            let width = u32::from(high - low + 1);
+            let field_mask = if width == 32 {
+                u32::MAX
+            } else {
+                (1u32 << width) - 1
+            };
+            let mask = field_mask << low;
+            let value = (current & !mask) | ((u32::from(data) << low) & mask);
+            if !bus.write_reg(peripheral, addr, value) {
+                return Err(Trap::Peripheral);
+            }
+            Event::Continue
+        }
+        Kind::Adc { dest, sar, mux, .. } => {
+            cpu.regs[dest as usize] = bus.adc(sar, mux).ok_or(Trap::Peripheral)?;
+            Event::Continue
+        }
+        Kind::Tsens { dest, .. } => {
+            cpu.regs[dest as usize] = bus.tsens().ok_or(Trap::Peripheral)?;
+            Event::Continue
+        }
+        Kind::I2c {
+            addr,
+            data,
+            low,
+            high,
+            bus: i2c_bus,
+            write,
+        } => {
+            let width = u32::from(high - low + 1);
+            let mask = (((1u16 << width) - 1) << low) as u8;
+            if write {
+                let current = bus.i2c_read(i2c_bus, addr).ok_or(Trap::Peripheral)?;
+                let value = (current & !mask) | (data & mask);
+                if !bus.i2c_write(i2c_bus, addr, value) {
+                    return Err(Trap::Peripheral);
+                }
+            } else {
+                cpu.regs[0] =
+                    u16::from(bus.i2c_read(i2c_bus, addr).ok_or(Trap::Peripheral)? & mask);
+            }
+            Event::Continue
+        }
+        Kind::End { wake: false } | Kind::Sleep { .. } => return Err(Trap::Peripheral),
     };
     cpu.insn_count += 1;
     cpu.cycle_count += cycles;

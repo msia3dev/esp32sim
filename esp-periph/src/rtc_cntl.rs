@@ -15,6 +15,7 @@ pub fn reset_cause_name(c: u32) -> &'static str {
 /// RTC_CNTL: reset control, slow-clock time, the RTC watchdog, and the ULP controller registers.
 /// `esp_restart()` on ESP-IDF 5.x arms this watchdog and spins until it resets the chip.
 pub struct RtcCntl { pub ram: RegRam, pub slow_ticks: u64, pub time_latch: u64, pub sw_reset: bool, pub reset_cause: u32, pub ulp: UlpController,
+                     pub ulp_adc: [[u16; 16]; 2], pub ulp_tsens: u16, pub ulp_i2c: [[u8; 256]; 16], pub ulp_adc_sample_cycle: u8, pub ulp_adc_sample_bits: u8,
                      wdt_count: u64, wdt_stage: usize, wdt_unlocked: bool }
 impl RtcCntl {
     pub fn preset_after_bootloader(&mut self) { self.ram.write(0xc0, 0xFFD7_0028); self.ram.write(0xc4, 0xFF0F_00F0); }
@@ -42,12 +43,19 @@ impl RtcCntl {
         if self.wdt_stage >= 4 { self.wdt_stage = 0; }
     }
     pub fn new() -> Self {
-        let mut r = RtcCntl { ram: RegRam::new(), slow_ticks: 0, time_latch: 0, sw_reset: false, reset_cause: RST_POWERON, ulp: UlpController::new(), wdt_count: 0, wdt_stage: 0, wdt_unlocked: false };
+        let mut r = RtcCntl { ram: RegRam::new(), slow_ticks: 0, time_latch: 0, sw_reset: false, reset_cause: RST_POWERON, ulp: UlpController::new(),
+                              ulp_adc: [[0; 16]; 2], ulp_tsens: 128, ulp_i2c: [[0; 256]; 16], ulp_adc_sample_cycle: 2, ulp_adc_sample_bits: 12,
+                              wdt_count: 0, wdt_stage: 0, wdt_unlocked: false };
         r.ram.write(0x38, 1 | (1 << 6));           // RESET_STATE: reset cause POWERON for both CPUs
         r.ram.write(0x74, 0);                        // CLK_CONF
         r.ram.write(0x100, (512 << 11) | 512);       // ULP_CP_CTRL reset values
         r.ram.write(0x104, (1 << 23) | (40 << 14) | (16 << 7) | (8 << 1));
         r.ram.write(0x134, 200 << 8);                // ULP_CP_TIMER_1 reset value
+        r.ram.write(0x818, (10 << 16) | 10);          // SENS_SAR_AMP_CTRL1 reset values
+        r.ram.write(0x81c, 10 << 16);                 // SENS_SAR_AMP_CTRL2 reset value
+        r.ram.write(0x850, 6 << 14);                  // SENS_SAR_TSENS_CTRL clock divider
+        r.ram.write(0xc00, 256); r.ram.write(0xc14, 256); // RTC_I2C SCL low/high
+        r.ram.write(0xc1c, 8); r.ram.write(0xc20, 8);     // RTC_I2C start/stop
         r
     }
     pub fn read(&mut self, off: u32) -> u32 {
@@ -56,7 +64,7 @@ impl RtcCntl {
             0xc => self.ram.read(off) | (1 << 30),  // TIME_UPDATE: valid
             0xd0 => (self.ram.read(off) & !(0xf << 13)) | self.ulp.status_bits(),
             0x1fc => 0x2007270,
-            0x850 => (self.ram.read(off) & !0x1ff) | (1 << 8) | 0x80,   // SENS_SAR_TSENS_CTRL (SENS block at +0x800): TSENS_READY, raw ~ room temperature
+            0x850 => (self.ram.read(off) & !0x1ff) | (1 << 8) | u32::from(self.ulp_tsens & 0xff),
             _ => self.ram.read(off),
         }
     }
@@ -72,6 +80,10 @@ impl RtcCntl {
             0x100 => { self.ram.write(off, v); self.ulp.configure_control(v); effect = WriteEffect::ULP; }
             0x104 => { self.ram.write(off, v); self.ulp.configure_cocpu(v); effect = WriteEffect::ULP; }
             0x134 => { self.ram.write(off, v); self.ulp.set_wake_period(v); effect = WriteEffect::ULP; }
+            0x404 => self.ram.write(0x400, self.ram.read(0x400) | v),       // RTC_GPIO_OUT_W1TS
+            0x408 => self.ram.write(0x400, self.ram.read(0x400) & !v),      // RTC_GPIO_OUT_W1TC
+            0x410 => self.ram.write(0x40c, self.ram.read(0x40c) | v),       // RTC_GPIO_ENABLE_W1TS
+            0x414 => self.ram.write(0x40c, self.ram.read(0x40c) & !v),      // RTC_GPIO_ENABLE_W1TC
             _ => self.ram.write(off, v),
         }
         effect

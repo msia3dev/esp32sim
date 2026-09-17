@@ -256,14 +256,21 @@ pub fn decode(raw: u32) -> Insn {
                 high,
             }
         }
-        3 => Kind::I2c {
-            addr: raw as u8,
-            data: (raw >> 8) as u8,
-            low: ((raw >> 16) & 7) as u8,
-            high: ((raw >> 19) & 7) as u8,
-            bus: ((raw >> 22) & 0xf) as u8,
-            write: raw & (1 << 27) != 0,
-        },
+        3 => {
+            let low = ((raw >> 16) & 7) as u8;
+            let high = ((raw >> 19) & 7) as u8;
+            if low > high || raw & (1 << 26) != 0 {
+                return illegal(raw);
+            }
+            Kind::I2c {
+                addr: raw as u8,
+                data: (raw >> 8) as u8,
+                low,
+                high,
+                bus: ((raw >> 22) & 0xf) as u8,
+                write: raw & (1 << 27) != 0,
+            }
+        }
         4 if raw & 0x0fff_0000 == 0 => Kind::Wait { cycles: raw as u16 },
         5 if raw & 0x0f00_0080 == 0 => {
             let mux = ((raw >> 2) & 0xf) as u8;
