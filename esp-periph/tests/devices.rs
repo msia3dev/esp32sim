@@ -73,6 +73,21 @@ fn rtc_interrupt_raw_enable_status_clear_and_aliases_match_hardware_registers() 
 }
 
 #[test]
+fn rtc_cocpu_wake_trap_and_done_use_the_shared_interrupt_and_lifecycle_registers() {
+    let mut rtc = RtcCntl::new();
+    Device::write(&mut rtc, 0x18, 1);
+    assert_eq!(Device::read(&mut rtc, 0x44) & esp_periph::INT_COCPU, esp_periph::INT_COCPU);
+    rtc.raise_cocpu_trap_interrupt();
+    assert_eq!(Device::read(&mut rtc, 0x44) & esp_periph::INT_COCPU_TRAP, esp_periph::INT_COCPU_TRAP);
+
+    Device::write(&mut rtc, 0x104, (1 << 27) | 1); // RISC-V clock
+    Device::write(&mut rtc, 0x100, 1 << 30);       // force start
+    assert_eq!(rtc.ulp.state, UlpState::Running);
+    Device::write(&mut rtc, 0x104, (1 << 27) | (1 << 25) | 1);
+    assert_eq!(rtc.ulp.state, UlpState::Halted);
+}
+
+#[test]
 fn rtc_io_w1_registers_update_output_and_enable_latches() {
     let mut rtc = RtcCntl::new();
     Device::write(&mut rtc, 0x404, (1 << 10) | (1 << 12));

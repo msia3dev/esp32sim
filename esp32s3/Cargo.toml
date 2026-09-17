@@ -11,3 +11,4 @@ esp-periph = { path = "../esp-periph" }
 esp-soc = { path = "../esp-soc" }
 xtensa-lx7 = { path = "../xtensa-lx7" }
 ulp-fsm = { path = "../ulp-fsm" }
+riscv-rv32 = { path = "../riscv-rv32" }

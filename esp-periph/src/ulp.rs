@@ -100,6 +100,9 @@ impl UlpController {
         };
         self.clock_gate = value & (1 << 27) != 0;
         self.cocpu_clock_force = value & 1 != 0;
+        if self.architecture == UlpArchitecture::RiscV && value & (1 << 25) != 0 {
+            self.halt();
+        }
     }
 
     pub fn set_wake_period(&mut self, value: u32) {

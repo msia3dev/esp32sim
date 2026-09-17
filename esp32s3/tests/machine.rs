@@ -272,6 +272,166 @@ fn ulp_results_are_independent_of_main_cpu_jit_mode() {
 }
 
 #[test]
+fn ulp_riscv_executes_rtc_memory_wakes_main_cpu_and_halts() {
+    let mut m = machine();
+    let words = [
+        0x02a0_0093_u32, // addi x1, x0, 42
+        0x1010_2023,     // sw x1, 0x100(x0)
+        0x0000_8137,     // lui x2, 0x8
+        0x0181_0113,     // addi x2, x2, 0x18
+        0x0010_0193,     // addi x3, x0, 1
+        0x0031_2023,     // sw x3, 0(x2): RTC_CNTL_STATE0.SW_CPU_INT
+        0x0200_01b7,     // lui x3, 0x2000: COCPU_DONE
+        0x1031_2223,     // sw x3, 0x104(x2): converted RTC_CNTL_COCPU_CTRL
+    ];
+    let program: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    esp_soc::SocBus::load_bytes(&mut m.bus, esp32s3::bus::RTC_SLOW_LOW, &program).unwrap();
+    m.bus.write32(RTC_CNTL + 0x104, (1 << 27) | 1).unwrap(); // RISC-V, clock gate and force
+    m.bus.write32(RTC_CNTL + 0x100, (1 << 30) | (512 << 11) | 512).unwrap();
+    m.bus.tick(1_000);
+
+    assert_eq!(m.bus.read32(esp32s3::bus::RTC_SLOW_LOW + 0x100), Ok(42));
+    assert_eq!(m.bus.read32(RTC_CNTL + 0x44).unwrap() & esp_periph::INT_COCPU, esp_periph::INT_COCPU);
+    assert_eq!(m.bus.ulp_riscv.wake_requests, 1);
+    assert_eq!(m.bus.periph.rtc.ulp.state, esp_periph::UlpState::Halted);
+    assert_eq!(m.bus.ulp_riscv.cpu.retired_count, 8);
+}
+
+#[test]
+fn ulp_riscv_fault_is_restricted_and_signals_cocpu_trap() {
+    let mut m = machine();
+    let words = [0x0001_0137_u32, 0x0001_2083]; // lui x2, 0x10; lw x1, 0(x2), outside RTC memory
+    let program: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    esp_soc::SocBus::load_bytes(&mut m.bus, esp32s3::bus::RTC_SLOW_LOW, &program).unwrap();
+    m.bus.write32(RTC_CNTL + 0x104, (1 << 27) | 1).unwrap();
+    m.bus.write32(RTC_CNTL + 0x100, (1 << 30) | (512 << 11) | 512).unwrap();
+    m.bus.tick(1_000);
+
+    assert_eq!(m.bus.ulp_riscv.traps, 1);
+    assert_eq!(m.bus.ulp_riscv.cpu.mcause, 5);
+    assert_eq!(m.bus.read32(RTC_CNTL + 0x44).unwrap() & esp_periph::INT_COCPU_TRAP, esp_periph::INT_COCPU_TRAP);
+    assert_eq!(m.bus.periph.rtc.ulp.state, esp_periph::UlpState::Halted);
+}
+
+#[test]
+fn ulp_riscv_wake_interrupt_releases_waiti() {
+    let mut m = machine();
+    let words = [
+        0x0000_8137_u32, 0x0181_0113, 0x0010_0193, 0x0031_2023,
+        0x0200_01b7, 0x1031_2223,
+    ];
+    let program: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    esp_soc::SocBus::load_bytes(&mut m.bus, esp32s3::bus::RTC_SLOW_LOW, &program).unwrap();
+    m.bus.periph.intmatrix.map[0][esp32s3::periph::SRC_RTC_CORE] = 4;
+    m.cores[0].intenable = 1 << 4;
+    m.cores[0].waiting = true;
+    m.cores[0].ps = 0;
+    m.bus.write32(RTC_CNTL + 0x40, esp_periph::INT_COCPU).unwrap();
+    m.bus.write32(RTC_CNTL + 0x104, (1 << 27) | 1).unwrap();
+    m.bus.write32(RTC_CNTL + 0x100, (1 << 30) | (512 << 11) | 512).unwrap();
+    m.max_cycles = 500;
+    assert!(matches!(m.run(u64::MAX), Stop::Halted));
+    assert!(!m.cores[0].waiting());
+    assert_eq!(m.bus.ulp_riscv.wake_requests, 1);
+}
+
+#[test]
+fn ulp_riscv_timer_restarts_from_reset_vector() {
+    let mut m = machine();
+    let words = [
+        0x0000_8137_u32, 0x1041_0113, // x2=0x8104
+        0x0001_2183,                 // lw x3, 0(x2)
+        0x0200_0237,                 // lui x4, 0x2000: COCPU_DONE
+        0x0041_e1b3,                 // or x3, x3, x4
+        0x0031_2023,                 // sw x3, 0(x2)
+    ];
+    let program: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    esp_soc::SocBus::load_bytes(&mut m.bus, esp32s3::bus::RTC_SLOW_LOW, &program).unwrap();
+    m.bus.write32(RTC_CNTL + 0x104, (1 << 27) | 1).unwrap();
+    m.bus.write32(RTC_CNTL + 0x134, 3 << 8).unwrap();
+    m.bus.write32(RTC_CNTL + 0xfc, 1 << 31).unwrap();
+    m.cores[0].waiting = true;
+    m.cores[0].ps = 0;
+    m.max_cycles = 20_000;
+    assert!(matches!(m.run(u64::MAX), Stop::Halted));
+    assert!(m.bus.periph.rtc.ulp.starts >= 3);
+    assert_eq!(m.bus.periph.rtc.ulp.starts, m.bus.periph.rtc.ulp.halts);
+    assert_eq!(m.bus.ulp_riscv.cpu.retired_count, m.bus.periph.rtc.ulp.starts * 6);
+}
+
+#[test]
+fn ulp_riscv_lr_sc_updates_shared_rtc_memory() {
+    let mut m = machine();
+    let words = [
+        0x1000_0513_u32, // addi x10, x0, 0x100
+        0x0050_0593,     // addi x11, x0, 5
+        0x00b5_2023,     // sw x11, 0(x10)
+        0x1005_262f,     // lr.w x12, (x10)
+        0x0076_0613,     // addi x12, x12, 7
+        0x18c5_26af,     // sc.w x13, x12, (x10)
+        0x0000_8137, 0x1041_0113, 0x0200_01b7, 0x0031_2023,
+    ];
+    let program: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    esp_soc::SocBus::load_bytes(&mut m.bus, esp32s3::bus::RTC_SLOW_LOW, &program).unwrap();
+    m.bus.write32(RTC_CNTL + 0x104, (1 << 27) | 1).unwrap();
+    m.bus.write32(RTC_CNTL + 0x100, (1 << 30) | (512 << 11) | 512).unwrap();
+    m.bus.tick(1_000);
+    assert_eq!(m.bus.read32(esp32s3::bus::RTC_SLOW_LOW + 0x100), Ok(12));
+    assert_eq!(m.bus.ulp_riscv.cpu.x[13], 0, "SC succeeds with the live reservation");
+}
+
+#[test]
+fn ulp_riscv_standard_cycle_csr_advances() {
+    let mut m = machine();
+    let words = [
+        0xc000_20f3_u32, // csrr x1, cycle
+        0x1010_2023,     // sw x1, 0x100(x0)
+        0x0000_8137, 0x1041_0113, 0x0200_01b7, 0x0031_2023,
+    ];
+    let program: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    esp_soc::SocBus::load_bytes(&mut m.bus, esp32s3::bus::RTC_SLOW_LOW, &program).unwrap();
+    m.bus.write32(RTC_CNTL + 0x104, (1 << 27) | 1).unwrap();
+    m.bus.write32(RTC_CNTL + 0x100, (1 << 30) | (512 << 11) | 512).unwrap();
+    m.bus.tick(1_000);
+    assert_eq!(m.bus.read32(esp32s3::bus::RTC_SLOW_LOW + 0x100), Ok(1));
+}
+
+#[test]
+fn public_esp_idf_ulp_riscv_binary_runs_unchanged() {
+    const BINARY: &[u8] = include_bytes!("fixtures/ulp-riscv/esp-idf-v5.2.1-test-app.bin");
+    let mut m = machine();
+    esp_soc::SocBus::load_bytes(&mut m.bus, esp32s3::bus::RTC_SLOW_LOW, BINARY).unwrap();
+    m.bus.write32(esp32s3::bus::RTC_SLOW_LOW + 0x1d0, 4).unwrap(); // RISCV_LIGHT_SLEEP_WAKEUP_TEST
+    m.bus.write32(RTC_CNTL + 0x104, (1 << 27) | (1 << 24) | (1 << 22) | 1).unwrap();
+    m.bus.write32(RTC_CNTL + 0x100, (1 << 30) | (512 << 11) | 512).unwrap();
+    m.bus.tick(20_000);
+
+    assert_eq!(m.bus.read32(esp32s3::bus::RTC_SLOW_LOW + 0x1cc), Ok(1), "main_cpu_reply");
+    assert_eq!(m.bus.read32(esp32s3::bus::RTC_SLOW_LOW + 0x1c8), Ok(4), "command_resp");
+    assert_eq!(m.bus.read32(esp32s3::bus::RTC_SLOW_LOW + 0x1e0), Ok(1), "riscv_counter");
+    assert_eq!(m.bus.read32(RTC_CNTL + 0x44).unwrap() & esp_periph::INT_COCPU, esp_periph::INT_COCPU);
+    assert_eq!(m.bus.periph.rtc.ulp.state, esp_periph::UlpState::Halted);
+    assert_eq!(m.bus.ulp_riscv.traps, 0, "{:?}", m.bus.ulp_riscv.last_trap);
+}
+
+#[test]
+fn public_esp_idf_ulp_riscv_shared_lock_test_completes() {
+    const BINARY: &[u8] = include_bytes!("fixtures/ulp-riscv/esp-idf-v5.2.1-test-app.bin");
+    let mut m = machine();
+    esp_soc::SocBus::load_bytes(&mut m.bus, esp32s3::bus::RTC_SLOW_LOW, BINARY).unwrap();
+    m.bus.write32(esp32s3::bus::RTC_SLOW_LOW + 0x1d0, 6).unwrap(); // RISCV_MUTEX_TEST
+    m.bus.write32(RTC_CNTL + 0x104, (1 << 27) | (1 << 24) | (1 << 22) | 1).unwrap();
+    m.bus.write32(RTC_CNTL + 0x100, (1 << 30) | (512 << 11) | 512).unwrap();
+    m.bus.tick(40_000_000);
+
+    assert_eq!(m.bus.read32(esp32s3::bus::RTC_SLOW_LOW + 0x1dc), Ok(100_000), "riscv_incrementer");
+    assert_eq!(m.bus.read32(esp32s3::bus::RTC_SLOW_LOW + 0x1cc), Ok(1), "main_cpu_reply");
+    assert_eq!(m.bus.read32(esp32s3::bus::RTC_SLOW_LOW + 0x1d0), Ok(7), "command returned to NO_COMMAND");
+    assert_eq!(m.bus.periph.rtc.ulp.state, esp_periph::UlpState::Halted);
+    assert_eq!(m.bus.ulp_riscv.traps, 0, "{:?}", m.bus.ulp_riscv.last_trap);
+}
+
+#[test]
 fn ulp_register_write_can_stop_its_timer_before_halt() {
     let mut m = machine();
     let words = [0x1ffc_003f_u32, 0xb000_0000]; // I_END(); HALT

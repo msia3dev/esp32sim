@@ -2,6 +2,7 @@
 //! memories, external flash + PSRAM through the 512-entry cache MMU, peripherals.
 use crate::periph::{Peripherals, PERIPH_BASE, PERIPH_END};
 use crate::ulp::{RtcSlowBus, UlpFsmEngine};
+use crate::ulp_riscv::{UlpRiscVBus, UlpRiscVEngine};
 use crate::board::Board;
 use std::collections::HashSet;
 use xtensa_lx7::bus::{Bus, Fault};
@@ -85,6 +86,7 @@ pub struct SocBus {
     pub gpio_events: Option<Vec<(u64, u8, bool)>>,
     pub debug: esp_soc::DebugFlags,
     pub ulp_fsm: UlpFsmEngine,
+    pub ulp_riscv: UlpRiscVEngine,
     /// Software TLB: the last resolved mapping per 64 KiB page, so loads, stores and fetches skip
     /// the address-range walk and the flash MMU. Cleared whenever the MMU changes.
     tlb: Vec<TlbEntry>,
@@ -123,7 +125,7 @@ impl SocBus {
         let bus_uninit = SocBus {
             sram: vec![0; SRAM_SIZE], irom: vec![0; (IROM_MASK_HIGH - IROM_MASK_LOW) as usize], drom: vec![0; (DROM_MASK_HIGH - DROM_MASK_LOW) as usize],
             rtc_fast: vec![0; 8192], rtc_slow: vec![0; 8192], flash: vec![0xff; flash_size], psram: vec![0; psram_size],
-            mmu: [MMU_INVALID; MMU_ENTRIES], periph: Peripherals::new(mac), board: Box::new(crate::board::Atech14::new()), cycles: 0, last_fault: None, spi2_dma_fault: None, irq_dirty: false, gpio_events: None, debug: Default::default(), ulp_fsm: UlpFsmEngine::new(),
+            mmu: [MMU_INVALID; MMU_ENTRIES], periph: Peripherals::new(mac), board: Box::new(crate::board::Atech14::new()), cycles: 0, last_fault: None, spi2_dma_fault: None, irq_dirty: false, gpio_events: None, debug: Default::default(), ulp_fsm: UlpFsmEngine::new(), ulp_riscv: UlpRiscVEngine::new(),
             tlb: vec![TlbEntry::EMPTY; TLB_SIZE], page_ver: Vec::new(), ver_base: [0; 7], tick_pending: 0, tick_budget: 0,
         };
         let mut b = bus_uninit;
@@ -1036,6 +1038,7 @@ impl SocBus {
         let mut budget = self.periph.cycles_until_timer().clamp(1, MAX_TICK_DEFER);
         let fast_hz = UlpFsmEngine::rtc_fast_hz(&self.periph.rtc);
         if let Some(deadline) = self.ulp_fsm.cpu_cycles_until_deadline(fast_hz) { budget = budget.min(deadline); }
+        if let Some(deadline) = self.ulp_riscv.cpu_cycles_until_deadline(fast_hz) { budget = budget.min(deadline); }
         if let Some(deadline) = self.board.next_deadline() {
             let until_deadline = u64::from(self.tick_pending)
                 .saturating_add(deadline.saturating_sub(self.cycles))
@@ -1112,6 +1115,9 @@ impl SocBus {
         let version_base = self.ver_base[SRC_RTC_SLOW as usize];
         let mut bus = RtcSlowBus::new(&mut self.periph.rtc, &mut self.rtc_slow, &mut self.page_ver, version_base);
         self.ulp_fsm.reconcile(&mut bus);
+        drop(bus);
+        let mut bus = UlpRiscVBus::new(&mut self.periph.rtc, &mut self.rtc_slow, &mut self.page_ver, version_base);
+        self.ulp_riscv.reconcile(&mut bus);
     }
 
     fn advance_ulp(&mut self, cycles: u32) {
@@ -1122,6 +1128,11 @@ impl SocBus {
         self.ulp_fsm.advance(cycles, fast_hz, &mut bus);
         let changes = bus.take_gpio_changes();
         drop(bus);
+        let mut riscv_bus = UlpRiscVBus::new(&mut self.periph.rtc, &mut self.rtc_slow, &mut self.page_ver, version_base);
+        self.ulp_riscv.advance(cycles, fast_hz, &mut riscv_bus);
+        let mut changes = changes;
+        changes.extend(riscv_bus.take_gpio_changes());
+        drop(riscv_bus);
         if !changes.is_empty() {
             if let Some(events) = &mut self.gpio_events {
                 for &(pin, level) in &changes { events.push((self.cycles, pin, level)); }

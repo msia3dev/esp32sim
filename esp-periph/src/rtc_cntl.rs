@@ -11,6 +11,8 @@ const INT_ENA_W1TS: u32 = 0x138;
 const INT_ENA_W1TC: u32 = 0x13c;
 const INT_WDT: u32 = 1 << 3;
 pub const INT_ULP_CP: u32 = 1 << 5;
+pub const INT_COCPU: u32 = 1 << 13;
+pub const INT_COCPU_TRAP: u32 = 1 << 17;
 
 // ------------------------------------------------------------------ RTC controller
 /// Reset causes (RTC_CNTL_RESET_CAUSE_PROCPU), as the ROM prints them.
@@ -84,6 +86,7 @@ impl RtcCntl {
         match off {
             0x0 => { if v & (1 << 31) != 0 { self.request_reset(RST_SW_SYS); } else if v & (1 << 5) != 0 { self.request_reset(RST_SW_CPU); } self.ram.write(off, v & !((1 << 31) | (1 << 5))); }   // OPTIONS0.SW_SYS_RST / SW_PROCPU_RST
             0xc => { if v & (1 << 31) != 0 { self.time_latch = self.slow_ticks; } self.ram.write(off, v); }
+            0x18 => { if v & 1 != 0 { self.raise_interrupt(INT_COCPU); } self.ram.write(off, v & !1); }
             INT_ENA | INT_RAW => self.ram.write(off, v),
             INT_ST => {}
             INT_CLR => self.ram.write(INT_RAW, self.ram.read(INT_RAW) & !v),
@@ -106,6 +109,7 @@ impl RtcCntl {
     }
 
     pub fn raise_ulp_interrupt(&mut self) { self.raise_interrupt(INT_ULP_CP); }
+    pub fn raise_cocpu_trap_interrupt(&mut self) { self.raise_interrupt(INT_COCPU_TRAP); }
     pub fn interrupt_status(&self) -> u32 { self.ram.read(INT_RAW) & self.ram.read(INT_ENA) }
     fn raise_interrupt(&mut self, mask: u32) { self.ram.write(INT_RAW, self.ram.read(INT_RAW) | mask); }
 }

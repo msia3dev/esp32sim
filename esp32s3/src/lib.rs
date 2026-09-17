@@ -5,6 +5,7 @@ pub mod i2c;
 pub mod soc;
 pub mod timing;
 pub mod ulp;
+pub mod ulp_riscv;
 pub mod wifi;
 pub mod net;
 pub mod nat;
