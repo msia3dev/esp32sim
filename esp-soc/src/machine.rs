@@ -132,7 +132,7 @@ pub struct Machine<S: Soc> {
 /// 64 native (M3 CLI at 256: Pocket Tank 5.4% slower, cheap native quantum switches lose to +15% spin-waiting).
 const QUANTUM: u64 = if cfg!(target_arch = "wasm32") { 256 } else { 64 };
 #[cfg(not(target_arch = "wasm32"))]
-fn uart_tcp_pacing_baud(chip: &str) -> u64 { if chip == "esp32c6" { 230_400 } else { 115_200 } }
+fn uart_tcp_pacing_baud(chip: &str) -> u64 { if chip == "esp32s3" { 115_200 } else { 230_400 } }
 /// EX133 default for `Machine::vq_max`; a build can pin another with `ESP32SIM_VQ_BUILD=<n>`.
 const VQ_DEFAULT: u64 = match option_env!("ESP32SIM_VQ_BUILD") {
     Some(s) => { let b = s.as_bytes(); let (mut i, mut v) = (0, 0u64); while i < b.len() { v = v * 10 + (b[i] - b'0') as u64; i += 1; } v }
