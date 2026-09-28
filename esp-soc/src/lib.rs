@@ -4,12 +4,17 @@
 //! protocol, real-time pacing, the image loaders and the board model. `devices` holds the
 //! chip-neutral models a board is built from.
 pub mod board;
+mod console;
 pub mod debug;
 pub mod devices;
 pub mod elf;
 pub mod host;
 pub mod image;
+pub mod json;
+pub mod load;
 pub mod machine;
+pub mod nat;
+pub mod net;
 pub mod observe;
 pub mod observers;
 pub mod picture;
@@ -17,9 +22,11 @@ pub mod png;
 pub mod soc;
 pub mod storage;
 pub mod web;
+pub mod wifi;
 
 pub use board::{Board, BoardModel, NoBoard, PanelControl};
 pub use debug::DebugFlags;
+pub use load::LoadKind;
 pub use machine::{Console, Debug, Machine, Realtime, Script, ScriptAction};
 pub use observe::{Ctx, Observer, Wants};
 pub use soc::{CoreState, RunUntil, Soc, SocBus, Stop};

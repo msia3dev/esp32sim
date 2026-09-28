@@ -26,6 +26,7 @@ pub mod i2s;
 pub mod rmt;
 pub mod gpspi;
 pub mod rng;
+pub mod intmtx;
 
 pub use device::{Device, WriteEffect};
 pub use mmio::{DeviceSet, Dispatch, Misc, NO_SOURCE};

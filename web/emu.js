@@ -26,23 +26,20 @@
   worker.onmessage = (ev) => {
     const m = ev.data;
     if (m.touchTrace) { window.recordTouchTrace?.(m.touchTrace); return; }
-    if (m.frameTrace) window.recordTouchTrace?.(m.frameTrace);
     if (m.text !== undefined) { onmessage && onmessage(m.text); return; }
     if (m.bin !== undefined) {
-      onmessage && onmessage(m.bin);
-      if (m.frameTrace) window.recordTouchTrace?.({ stage: 'canvas-drawn', atMs: performance.timeOrigin + performance.now(), cycles: m.frameTrace.cycles });
+      try {
+        if (m.frameTrace) window.recordTouchTrace?.(m.frameTrace);
+        onmessage && onmessage(m.bin);
+        if (m.frameTrace) window.recordTouchTrace?.({ stage: 'canvas-drawn', atMs: performance.timeOrigin + performance.now(), cycles: m.frameTrace.cycles });
+      } finally { if (m.ack) worker.postMessage({ op: 'frame-ack' }); }
       return;
     }
     if (m.log !== undefined) { console.log(m.log); onmessage && onmessage(JSON.stringify({ t: 'emu', msg: m.log })); return; }
     if (m.ready) { ready = true; setStatus(failure || 'wasm loaded — choose firmware'); flush(); }
     if (m.created !== undefined) { const r = pending.get('created'); pending.delete('created'); r && r(m.created); }
     if (m.loaded !== undefined) { const r = pending.get('load' + m.loaded); pending.delete('load' + m.loaded); r && r(m.ok); }
-    if (m.restored !== undefined) { const r = pending.get('restored'); pending.delete('restored'); r && r(m.restored); }
-    if (m.stateCleared !== undefined) { const r = pending.get('state-cleared'); pending.delete('state-cleared'); r && r(m.stateCleared); }
-    if (m.stateImported !== undefined) { const r = pending.get('state-imported'); pending.delete('state-imported'); r && r(m.stateImported); }
-    if (m.stateSaved !== undefined) { const r = pending.get('state-saved'); pending.delete('state-saved'); r && r(m.stateSaved); }
-    if (m.stateExport !== undefined) { const r = pending.get('state-export'); pending.delete('state-export'); r && r(m.stateExport); }
-    if (m.started !== undefined) { started = m.started; setStatus(started ? 'running in WebAssembly' : 'boot failed (see console)'); }
+    if (m.started !== undefined) { started = m.started; setStatus(started ? 'running in WebAssembly' : 'boot failed: ' + (m.error || 'see console')); }
     if (m.stopped !== undefined) { started = false; setStatus('stopped: code ' + m.stopped); }
     if (m.netText) { onmessage && onmessage(JSON.stringify({ t: 'serial', src: 'node' + m.netText.node, data: m.netText.data })); }
     if (m.netStat) { onmessage && onmessage(JSON.stringify({ t: 'net', ...m.netStat })); }
@@ -56,7 +53,7 @@
     connect(handler, status) {
       onmessage = handler; setStatus = status; if (failure) setStatus(failure);
       fetch('wasm/esp32sim.wasm').then((r) => { if (!r.ok) throw new Error('wasm/esp32sim.wasm: ' + r.status + (r.status === 404 ? ' — build it: tools/wasm-build.sh' : '')); return r.arrayBuffer(); })
-        .then((buf) => worker.postMessage({ op: 'init', wasm: buf, touchTrace: q.has('touchTrace') }, [buf]))
+        .then((buf) => worker.postMessage({ op: 'init', wasm: buf, frameAck: true, touchTrace: q.has('touchTrace') }, [buf]))
         .catch((e) => setStatus('cannot load wasm: ' + e.message));
       return { send: (d, timing) => { if (!started) return; if (typeof d === 'string') post({ op: 'text', data: d, touchTrace: timing }); else { const b = d.buffer ? d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength) : d; post({ op: 'bin', data: b }, [b]); } } };
     },
@@ -83,8 +80,6 @@
       <label>WiFi <input id="fw_wifi" placeholder="ssid=…,psk=… (optional)" style="width:190px"></label>
       <label>stubs <input id="fw_stubs" placeholder="esp_wifi_start=0" style="width:150px"></label>
       <label><input id="fw_appdirect" type="checkbox"> boot app directly (no ROM)</label>
-      <label><input id="fw_persist" type="checkbox" checked> persist state</label>
-      <label>profile <input id="fw_profile" value="custom" style="width:100px"></label>
     </div>
     <div class="row">
       <label>ROM ELF <input type="file" id="fw_rom"></label>
@@ -94,33 +89,37 @@
       <label>app.elf (symbols) <input type="file" id="fw_elf"></label>
       <label>script <input type="file" id="fw_script"></label>
       <button class="go" id="fw_go">▶ Boot</button>
-      <button id="fw_export" type="button">Export state</button><button id="fw_clear" type="button">Clear state</button>
-      <label>Import <select id="fw_import_kind"><option value="0">flash</option><option value="1">eFuse</option></select><input type="file" id="fw_import"></label>
     </div>`;
   document.body.insertBefore(panel, document.querySelector('main'));
   const $ = (id) => document.getElementById(id);
   const readFile = (f) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsArrayBuffer(f); });
 
+  // Preserve the value text so the Rust parser owns all return-value rules.
+  function stubSpec(spec, symbols = {}) {
+    const split = spec.indexOf('='), name = split < 0 ? spec : spec.slice(0, split);
+    return (symbols[name] || name) + (split < 0 ? '' : spec.slice(split));
+  }
   async function boot(cfg, files) {
     if (started) { location.reload(); return; }
     setStatus('loading firmware…');
-    const ok = await ask('created', { op: 'create', board: cfg.board, flash_mb: cfg.flash_mb, psram_mb: cfg.psram_mb, jit: q.get('jit') !== '0' });
-    if (!ok) { setStatus('unknown board'); return; }
+    let experiments;
+    try { const { experimentsFromParams } = await import('./wasm/experiments.mjs'); experiments = experimentsFromParams(q, cfg.board); }
+    catch (err) { setStatus(err.message); return; }
+    const ok = await ask('created', { op: 'create', board: cfg.board, smoothDisplay: cfg.smoothDisplay === true, flash_mb: cfg.flash_mb, psram_mb: cfg.psram_mb, jit: q.get('jit') !== '0', experiments });
+    if (!ok) { setStatus('could not create emulator: check board and memory sizes (maximum 32 MiB)'); return; }
     for (const [kind, data, at] of files) {
       const key = at !== undefined ? 'loadat' + at : 'load' + KINDS[kind];
       const good = await ask(key, at !== undefined ? { op: 'load', at, data } : { op: 'load', kind: KINDS[kind], data }, [data]);
       if (!good) { setStatus('failed to load ' + (at !== undefined ? 'flash@0x' + at.toString(16) : kind) + ' (see console)'); return; }
     }
-    const stateCapable = !/^(esp32)?c[36]$/.test(cfg.board) && !cfg.board.startsWith('waveshare-c6');
-    const profile = cfg.persist && stateCapable ? `esp32s3:${cfg.board}:${cfg.flash_mb}:${cfg.profile}` : '';
-    if (profile) { const restored = await ask('restored', { op: 'restore-state', profile }); setStatus(restored ? 'persistent state restored' : 'new persistent state created'); }
-    for (const st of cfg.stubs || []) { const [name, v] = st.split('='); post({ op: 'stub', name: (cfg.symbols || {})[name] || name, value: v ? parseInt(v, 0) : 0 }); }
+    for (const st of cfg.stubs || []) post({ op: 'stub', spec: stubSpec(st, cfg.symbols) });
     if (cfg.wifi) post({ op: 'wifi', spec: cfg.wifi });
     post({ op: 'start', appDirect: !!cfg.appDirect });
   }
   // A network manifest boots several motes on one medium (esp32sim_net_*): the same files go to
   // every node, each with its own MAC, position and power-on offset.
   async function bootNet(cfg, files, nodeFiles) {
+    if (q.has('timing') || q.has('quantum')) { setStatus('timing and quantum are unsupported for network mode'); return; }
     setStatus('creating the network…');
     const r = await ask('created', { op: 'net-create', nodes: cfg.nodes, board: cfg.board, flash_mb: cfg.flash_mb, slice_ns: cfg.slice_ns || 0 });
     if (!r) { setStatus('could not create the network'); return; }
@@ -133,7 +132,7 @@
         const good = await ask('load' + 'n' + i + ':' + KINDS[kind], { op: 'net-load', node: i, kind: KINDS[kind], data: copy }, [copy]);
         if (!good) { setStatus(`node ${i}: failed to load ${kind}`); return; }
       }
-      for (const st of [].concat(cfg.nodes[i].stubs || cfg.stubs || [])) { const [name, v] = st.split('='); post({ op: 'net-stub', node: i, name: ((cfg.nodes[i].symbols || cfg.symbols) || {})[name] || name, value: v ? parseInt(v, 0) : 0 }); }
+      for (const st of [].concat(cfg.nodes[i].stubs || cfg.stubs || [])) post({ op: 'net-stub', node: i, spec: stubSpec(st, cfg.nodes[i].symbols || cfg.symbols) });
     }
     post({ op: 'net-start' });
   }
@@ -142,14 +141,8 @@
     const files = [];
     for (const k of ['rom', 'bootloader', 'ptable', 'app', 'elf', 'script']) { const f = $('fw_' + k).files[0]; if (f) files.push([k, await readFile(f)]); }
     if (!files.some((x) => x[0] === 'app')) { setStatus('an app.bin is required'); return; }
-    boot({ board: $('fw_board').value, flash_mb: +$('fw_flash').value, psram_mb: +$('fw_psram').value, wifi: $('fw_wifi').value.trim(), stubs: $('fw_stubs').value.split(/[ ,]+/).filter(Boolean), appDirect: $('fw_appdirect').checked, persist: $('fw_persist').checked, profile: $('fw_profile').value.trim() || 'custom' }, files);
+    boot({ board: $('fw_board').value, flash_mb: +$('fw_flash').value, psram_mb: +$('fw_psram').value, wifi: $('fw_wifi').value.trim(), stubs: $('fw_stubs').value.split(/[ ,]+/).filter(Boolean), appDirect: $('fw_appdirect').checked }, files);
   };
-  const profileKey = () => `esp32s3:${$('fw_board').value}:${+$('fw_flash').value}:${$('fw_profile').value.trim() || 'custom'}`;
-  const download = (name, data) => { if (!data) return; const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([data])); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); };
-  $('fw_export').onclick = async () => { if (!started) { setStatus('boot firmware before exporting state'); return; } const state = await ask('state-export', { op: 'export-state' }); download('esp32sim-flash-state.bin', state.flash); download('esp32sim-efuse-state.bin', state.efuse); };
-  $('fw_clear').onclick = async () => { if (!confirm(`Clear persistent state for ${profileKey()}?`)) return; await ask('state-cleared', { op: 'clear-state', profile: profileKey() }); setStatus('persistent state cleared; reload to start fresh'); };
-  $('fw_import').onchange = async () => { const f = $('fw_import').files[0]; if (!f || !started) { setStatus('boot firmware before importing state'); return; } const data = await readFile(f); const ok = await ask('state-imported', { op: 'import-state', kind: +$('fw_import_kind').value, data }, [data]); setStatus(ok ? 'state imported; reload to boot from it' : 'state import rejected'); };
-  for (const event of ['pagehide', 'visibilitychange']) window.addEventListener(event, () => { if (started) post({ op: 'save-state-now' }); });
   fetch('wasm/fw/demos.json', { cache: 'no-cache' }).then((r) => r.ok ? r.json() : []).then((demos) => {
     const row = $('fw_demos'); if (!demos.length) return; row.style.display = '';
     let parent = '';
@@ -166,12 +159,12 @@
   if (fw) {
     (async () => {
       const man = await (await fetch(`wasm/fw/${fw}.json`, { cache: 'no-cache' })).json();   // manifests are tiny: always revalidate, so a removed demo disappears at once
-      $('fw_board').value = man.board || 'none'; $('fw_flash').value = man.flash_mb || 8; $('fw_psram').value = man.psram_mb || 2; $('fw_wifi').value = man.wifi || ''; $('fw_stubs').value = (man.stubs || []).join(' '); $('fw_profile').value = fw; window.EmuLink.terminal = !!man.terminal; window.EmuLink.lineHint = man.line_hint || ''; window.EmuLink.displayRotate = man.display_rotate; if (man.line_hint) $('line').placeholder = man.line_hint;   // the page opens on the Terminal tab for a manifest that says so
+      $('fw_board').value = man.board || 'none'; $('fw_flash').value = man.flash_mb || 8; $('fw_psram').value = man.psram_mb || 2; $('fw_wifi').value = man.wifi || ''; $('fw_stubs').value = (man.stubs || []).join(' '); window.EmuLink.terminal = !!man.terminal; window.EmuLink.lineHint = man.line_hint || ''; window.EmuLink.displayRotate = man.display_rotate; if (man.line_hint) $('line').placeholder = man.line_hint;   // the page opens on the Terminal tab for a manifest that says so
       const files = [];
       for (const [kind, url] of Object.entries(man.files || {})) for (const u of [].concat(url)) { const r = await fetch(`wasm/fw/${u}`, { cache: 'no-cache' }); if (!r.ok) { fail(missing(u, r.status)); return; } files.push([kind, await r.arrayBuffer()]); }
       // flash_at: { "0x610000": "public/energydata.json" } — a data partition's contents
       for (const [off, u] of Object.entries(man.flash_at || {})) { const r = await fetch(`wasm/fw/${u}`, { cache: 'no-cache' }); if (!r.ok) { fail(missing(u, r.status)); return; } files.push(['flash', await r.arrayBuffer(), parseInt(off, 16)]); }
-      const cfg = { board: man.board, flash_mb: man.flash_mb || 8, psram_mb: man.psram_mb || 2, wifi: man.wifi || '', stubs: man.stubs || [], symbols: man.symbols || {}, appDirect: !!man.app_direct, persist: true, profile: fw, nodes: man.nodes, slice_ns: man.slice_ns };
+      const cfg = { board: man.board, flash_mb: man.flash_mb || 8, psram_mb: man.psram_mb || 2, wifi: man.wifi || '', stubs: man.stubs || [], symbols: man.symbols || {}, appDirect: !!man.app_direct, nodes: man.nodes, slice_ns: man.slice_ns };
       const nodeFiles = [];
       for (const node of man.nodes || []) { const own = []; for (const [kind, url] of Object.entries(node.files || {})) for (const u of [].concat(url)) { const r = await fetch(`wasm/fw/${u}`, { cache: 'no-cache' }); if (!r.ok) { fail(missing(u, r.status)); return; } own.push([kind, await r.arrayBuffer()]); } nodeFiles.push(own); }
       const wait = () => ready ? (man.nodes ? bootNet(cfg, files, nodeFiles) : boot(cfg, files)) : setTimeout(wait, 50);

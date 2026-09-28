@@ -12,33 +12,38 @@ pub struct TimerGroup {
     ram: RegRam,
     pub t: [Timer; 2],
     pub int_raw: u32, pub int_ena: u32,
-    apb_acc: u64,
 }
 #[derive(Default, Clone, Copy)]
 pub struct Timer { pub config: u32, pub count: u64, pub latch: u64, pub alarm: u64, pub load: u64, pub prescale_acc: u64 }
 impl TimerGroup {
-    pub fn new() -> Self { TimerGroup { ram: RegRam::new(), t: [Timer::default(); 2], int_raw: 0, int_ena: 0, apb_acc: 0 } }
+    pub fn new() -> Self { TimerGroup { ram: RegRam::new(), t: [Timer::default(); 2], int_raw: 0, int_ena: 0 } }
     pub fn tick(&mut self, apb_ticks: u64) {
-        let _ = &mut self.apb_acc;
         for i in 0..2 {
             let t = &mut self.t[i];
             if t.config & (1 << 31) == 0 { continue; }   // TIMG_T0_EN
             let div = ((t.config >> 13) & 0xffff) as u64;
             let div = if div == 0 { 65536 } else { div };
             t.prescale_acc += apb_ticks;
-            let steps = t.prescale_acc / div;
+            let mut steps = t.prescale_acc / div;
             t.prescale_acc %= div;
             if steps == 0 { continue; }
             let inc = t.config & (1 << 30) != 0;   // TIMG_T0_INCREASE
-            let old = t.count;
-            t.count = if inc { (t.count + steps) & ((1 << 54) - 1) } else { t.count.wrapping_sub(steps) & ((1 << 54) - 1) };
+            // Steps to the alarm from `c`, if counting reaches it (not already at or past it).
+            let alarm = t.alarm;
+            let gap = |c: u64| if inc { alarm.checked_sub(c) } else { c.checked_sub(alarm) }.filter(|&d| d > 0);
             if t.config & (1 << 10) != 0 {   // TIMG_T0_ALARM_EN
-                let hit = if inc { old < t.alarm && t.count >= t.alarm } else { old > t.alarm && t.count <= t.alarm };
-                if hit {
+                if let Some(d) = gap(t.count).filter(|&d| d <= steps) {
                     self.int_raw |= 1 << i;
-                    if t.config & (1 << 29) != 0 { t.count = t.load; } else { t.config &= !(1 << 10); }   // autoreload
+                    steps -= d;
+                    if t.config & (1 << 29) != 0 {   // autoreload
+                        // q256: a tick can be longer than the reload period, so the steps after the
+                        // alarm count from `load` and cross again every `gap(load)` steps.
+                        t.count = t.load;
+                        if let Some(p) = gap(t.load) { steps %= p; }
+                    } else { t.count = t.alarm; t.config &= !(1 << 10); }
                 }
             }
+            t.count = if inc { (t.count + steps) & ((1 << 54) - 1) } else { t.count.wrapping_sub(steps) & ((1 << 54) - 1) };
         }
     }
     pub fn read(&mut self, off: u32) -> u32 {
@@ -89,7 +94,7 @@ impl Default for TimerGroup { fn default() -> Self { Self::new() } }
 impl Device for TimerGroup {
     fn read(&mut self, off: u32) -> u32 { TimerGroup::read(self, off) }
     fn write(&mut self, off: u32, v: u32) -> WriteEffect { TimerGroup::write(self, off, v); WriteEffect::NONE }
-    fn irq_sources(&self) -> u64 { (self.int_raw & self.int_ena & 1) as u64 }
+    fn irq_sources(&self) -> u64 { (self.int_raw & self.int_ena & 3) as u64 }
     fn clock(&self) -> Option<ClockDomain> { Some(ClockDomain::Apb) }
     fn tick(&mut self, apb_ticks: u64) { TimerGroup::tick(self, apb_ticks) }
     /// APB ticks until the earliest armed alarm.

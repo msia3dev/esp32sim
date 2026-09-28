@@ -23,6 +23,11 @@ impl Soc for S3 {
     const IDLE_CHUNK: u64 = 64 * 8;
     const ROM_DATA_TABLE: &'static [&'static str] = &["_data_start"];
     fn new_core(i: usize) -> Cpu { Cpu::new(if i == 0 { 0xCDCD } else { 0xABAB }) }
+    fn new_core_with_bus(i: usize, bus: &SocBus) -> Cpu {
+        let mut core = Self::new_core(i);
+        core.fetch_cache = bus.fetch_cache.clone();
+        core
+    }
     fn reset_core(c: &mut Cpu, i: usize) { Cpu::reset(c); if i == 1 { c.prid = 0xABAB; } }
     fn boot_core(c: &mut Cpu, entry: u32) {
         Cpu::reset(c);
@@ -46,7 +51,14 @@ impl esp_soc::SocBus for SocBus {
     fn cycles(&self) -> u64 { self.cycles }
     fn next_deadline(&self) -> Option<u64> { Some(SocBus::next_deadline(self)) }
     fn irq_dirty(&mut self) -> &mut bool { &mut self.irq_dirty }
+    // Only the WASM JIT helpers currently stop before deferred device accesses.
+    // `ESP32SIM_VQ_NATIVE` opts a native run in; it is only sound with `--no-jit`.
+    fn can_defer(&self) -> bool { cfg!(target_arch = "wasm32") || std::env::var_os("ESP32SIM_VQ_NATIVE").is_some() }
+    fn set_defer(&mut self, on: bool) { self.defer_mmio = on; self.mmio_deferred = false; }
+    fn take_deferred(&mut self) -> bool { std::mem::take(&mut self.mmio_deferred) }
     fn refresh_irq(&mut self) -> bool {
+        // Inputs are sampled at refresh boundaries. Clearing and reasserting a source
+        // between samples cannot create a second edge at the CPU.
         let dirty = self.periph.lines_dirty() || self.periph.intmatrix_dirty;
         self.periph.intmatrix_dirty = false;
         dirty
@@ -59,8 +71,9 @@ impl esp_soc::SocBus for SocBus {
     fn misc(&mut self) -> &mut Misc { &mut self.periph.misc }
     fn load_bytes(&mut self, addr: u32, data: &[u8]) -> Result<(), String> { SocBus::load_bytes(self, addr, data) }
     fn write_flash(&mut self, offset: usize, data: &[u8]) -> Result<(), String> {
-        if offset + data.len() > self.flash.len() { return Err("flash image too large".into()); }
-        self.flash[offset..offset + data.len()].copy_from_slice(data);
+        let target = self.flash.get_mut(offset..).and_then(|tail| tail.get_mut(..data.len()))
+            .ok_or("flash image too large")?;
+        target.copy_from_slice(data);
         self.note_written(SRC_FLASH, offset, data.len());
         Ok(())
     }
@@ -72,9 +85,10 @@ impl esp_soc::SocBus for SocBus {
     fn import_storage(&mut self, kind: u32, data: &[u8]) -> Result<(), String> { SocBus::import_storage(self, kind, data) }
     /// Copy IRAM/DRAM segments, map IROM/DROM through the MMU, as the 2nd-stage bootloader would.
     fn boot_app(&mut self, app_off: usize) -> Result<u32, String> {
+        let image = self.flash.get(app_off..).ok_or("app offset beyond flash")?;
+        let img = esp_soc::image::parse(image)?;
         self.periph.system.preset_after_bootloader();
         self.periph.rtc.preset_after_bootloader();
-        let img = esp_soc::image::parse(&self.flash[app_off..])?;
         for s in &img.segments {
             let start = app_off + s.file_off as usize;
             let end = start + s.len as usize;
@@ -83,6 +97,10 @@ impl esp_soc::SocBus for SocBus {
             if flash_mapped {
                 // esptool aligns segments so vaddr and flash offset agree modulo 64 KiB
                 if (s.load_addr & 0xffff) != (start as u32 & 0xffff) { return Err(format!("segment {:#x} not page-aligned with flash offset {:#x}", s.load_addr, start)); }
+                let window_end = if s.load_addr < DBUS_HIGH { DBUS_HIGH } else { IBUS_HIGH };
+                if !s.load_addr.checked_add(s.len).is_some_and(|end| end <= window_end) {
+                    return Err("segment beyond the flash window".into());
+                }
                 let first_page = (start as u32) >> 16;
                 let npages = ((s.load_addr & 0xffff) + s.len + 0xffff) >> 16;
                 for i in 0..npages {
@@ -101,6 +119,7 @@ impl esp_soc::SocBus for SocBus {
     /// RTC-domain registers survive, as on silicon. Returns the cause the ROM will report.
     fn reboot(&mut self, mac: [u8; 6]) -> u32 {
         self.flush_ticks();
+        self.cancel_spi2_timing();
         let cause = self.periph.rtc.reset_cause;
         let old = std::mem::replace(&mut self.periph, periph::Peripherals::new(mac));
         let p = &mut self.periph;
@@ -117,12 +136,14 @@ impl esp_soc::SocBus for SocBus {
         p.i2s0.pcm = old.i2s0.pcm; p.i2s0.frames_out = old.i2s0.frames_out; p.i2s1.pcm = old.i2s1.pcm; p.i2s1.frames_out = old.i2s1.frames_out;   // keep the captured audio continuous
         self.mmu = [MMU_INVALID; MMU_ENTRIES];
         self.invalidate_tlb();
+        self.reset_approximate_cache();
         self.attach_board_devices();
         self.refresh_tick_budget();
         self.irq_dirty = true;
         cause
     }
     fn sw_reset(&self) -> bool { self.periph.rtc.sw_reset }
+    fn request_reset(&mut self, cause: u32) { self.periph.rtc.sw_reset = true; self.periph.rtc.reset_cause = cause; }
     fn reset_cause(&self) -> u32 { self.periph.rtc.reset_cause }
     fn last_fault(&self) -> Option<(u32, bool)> { self.last_fault }
     fn console_take(&mut self) -> [Vec<u8>; 4] {
@@ -142,6 +163,9 @@ impl esp_soc::SocBus for SocBus {
     fn gpio_set_input(&mut self, pin: u8, level: bool) {
         let old_input = self.periph.gpio.input;
         self.periph.gpio.set_input(pin, level);
+        // Host edges queue PCNT work without going through the MMIO refresh hook.
+        // Recompute the threshold without dropping cycles already pending.
+        self.refresh_tick_budget();
         self.irq_dirty |= old_input != self.periph.gpio.input;
         if let Some(ev) = &mut self.gpio_events { ev.push((self.cycles, pin, level)); }
     }
@@ -160,7 +184,7 @@ impl esp_soc::SocBus for SocBus {
         { let w = &p.wifi;
           if w.tx_frames + w.rx_frames > 0 { s += &format!("[emu] wifi: {} frames sent by the station, {} received ({} dropped: no descriptor){}\n", w.tx_frames, w.rx_frames, w.rx_dropped, w.ap.as_ref().map_or(String::new(), |ap| format!("; AP: {} beacons, {} probe responses, {} data frames from the station, state {:?}", ap.stats.0, ap.stats.1, ap.stats.2, ap.state))); }
           if let Some(n) = &w.net { s += &format!("[emu] net: {} DHCP leases, {} ARP replies, {} DNS answers, {} NTP answers, {} TCP refused, {} pings, {} frames ignored\n", n.dhcp_acks, n.arp_replies, n.dns_answers, n.ntp_answers, n.tcp_rejects, n.pings, n.unhandled);
-            if let Some(t) = &n.nat { s += &format!("[emu] nat: {} TCP connections ({} failed), {} UDP flows, {} bytes out, {} bytes in\n", t.tcp_opened, t.tcp_refused, t.udp_flows, t.bytes_to_host, t.bytes_to_guest); } } }
+            if let Some(t) = &n.nat { s += &format!("[emu] nat: {} TCP connections ({} failed), {} UDP flows ({} evicted, {} send errors), {} bytes out, {} bytes in\n", t.tcp_opened, t.tcp_refused, t.udp_flows, t.udp_evicted, t.udp_send_errors, t.bytes_to_host, t.bytes_to_guest); } } }
         { let (a, sh, r) = (&p.aes, &p.sha, &p.rsa);
           if a.blocks + sh.blocks + r.ops > 0 { s += &format!("[emu] crypto: {} AES blocks, {} SHA blocks, {} RSA/MPI operations\n", a.blocks, sh.blocks, r.ops); } }
         if let Some(r) = p.rtc.ulp.report() { s += &r; s += "\n"; }
@@ -193,6 +217,31 @@ impl esp_soc::SocBus for SocBus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matrix_routes_sampled_edges_and_nmi_to_machine_cores() {
+        for irq in [10, 14, 22, 28, 30] {
+            let mut m = Machine::new([0; 6], SocBus::new(8 << 20, 2 << 20, [0; 6]));
+            m.bus.periph.intmatrix.map[0][periph::SRC_FROM_CPU0] = irq;
+            m.bus.periph.intmatrix_dirty = true;
+            m.cores[0].ps = if irq == 14 { ps::EXCM | 15 } else { 0 };
+            m.cores[0].intenable = if irq == 14 { 0 } else { 1 << irq };
+            m.sync_irq();
+            m.bus.periph.system.write(0x30, 1);
+            m.sync_irq();
+            assert_ne!(m.cores[0].check_interrupts_pending() & (1 << irq), 0);
+            assert!(m.cores[0].check_interrupts().is_some());
+            // Acknowledgment while the source remains high cannot manufacture another edge.
+            m.cores[0].interrupt &= !(1 << irq);
+            m.sync_irq();
+            assert_eq!(m.cores[0].interrupt & (1 << irq), 0);
+            m.bus.periph.system.write(0x30, 0);
+            m.sync_irq();
+            m.bus.periph.system.write(0x30, 1);
+            m.sync_irq();
+            assert_ne!(m.cores[0].interrupt & (1 << irq), 0);
+        }
+    }
 
     #[test]
     fn primary_core_is_not_controlled_by_core_one_reset_registers() {

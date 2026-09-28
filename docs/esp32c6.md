@@ -306,6 +306,13 @@ The firmware that lives on this board — the owner's IEEE 802.15.4 energy scann
 ENERGY_SCAN_DIR=~/work/esp32/energy_scan examples/waveshare-c6-lcd147/run.sh --max-seconds 8 --tft-png lcd.png
 ```
 
+- Colours are the real module's, checked against the board: Waveshare's driver sets RAMCTRL
+  (`0xB0: 0x00, 0xE8`) so pixels arrive low byte first, which is how LVGL without
+  `LV_COLOR_16_SWAP` writes them, and the glass exchanges red and blue unless MADCTL's BGR bit
+  is set. Firmware that looks right here looks right there: BGR set, RGB565 as it is in memory.
+  (Until 2026-09-21 the model read high byte first and had the BGR rule the other way round, so
+  firmware tuned to it showed green as blue on the board, and the scanner's red bars were
+  yellow-green here.)
 - The ST7789 goes through `esp_lcd`'s SPI panel IO: every transfer is a GDMA out-channel
   descriptor chain (the driver enables DMA for the bus), so the C6's GDMA layout and the SPI's
   DMA data phase both had to exist before the first pixel arrived. LVGL flushes ~500 frames a
@@ -339,7 +346,15 @@ machine wants to see, as the Xtensa block interpreter always did.
 - **`--boot app`** maps the image through the unified MMU and jumps to it, but the system
   registers the bootloader would have set up are not preset; ROM boot is the tested path.
 - **Watchdogs.** The LP_WDT and the TIMG watchdogs are register RAM: they never fire.
-- **WiFi 6, BLE, the LP core** — nothing of those radios or the second core is modelled. The
+- **WiFi**: an unmodified ESP-IDF station scans, joins the virtual access point (open or WPA2-PSK),
+  takes a lease and talks to the virtual network or, with `--net nat`, the host's:
+  `--wifi ssid=esp32sim,psk=esp32sim-pass`, the S3's option and the S3's access point
+  (`esp-soc/src/wifi.rs`). The MAC model is `wifi.rs`, the frames move in `bus.rs`;
+  `docs/wifi-c6-plan.md` has the register map and what differs from the S3. One station, legacy
+  rates, no power save, no TSF; the PHY calibration is the `bb_init` stub as for 802.15.4. The
+  specimen is `examples/c6-wifi-station`. It runs in the browser build too (a manifest's `wifi`,
+  as on the S3, without NAT); the example's README has the local manifest for it.
+- **BLE, the LP core** — nothing of that radio or the second core is modelled. The
   802.15.4 MAC sends, receives, acknowledges and filters (above); enhanced ACKs and security are not there.
 - **Peripherals on demand**: GDMA, I2C, SPI2, LEDC, RMT, ADC, TWAI, PARL_IO. Each shows up as an
   unknown register with `--log-periph` the moment a firmware wants it. The registers hello_world

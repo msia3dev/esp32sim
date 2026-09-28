@@ -12,3 +12,6 @@ esp-soc = { path = "../esp-soc" }
 xtensa-lx7 = { path = "../xtensa-lx7" }
 ulp-fsm = { path = "../ulp-fsm" }
 riscv-rv32 = { path = "../riscv-rv32" }
+
+[features]
+cache-inline = ["xtensa-lx7/wasm-cache-inline"]

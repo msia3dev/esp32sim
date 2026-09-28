@@ -3,13 +3,8 @@ use crate::regram::RegRam;
 use crate::ulp::UlpController;
 use emu_core::ClockDomain;
 
-const INT_ENA: u32 = 0x40;
-const INT_RAW: u32 = 0x44;
-const INT_ST: u32 = 0x48;
-const INT_CLR: u32 = 0x4c;
-const INT_ENA_W1TS: u32 = 0x138;
-const INT_ENA_W1TC: u32 = 0x13c;
-const INT_WDT: u32 = 1 << 3;
+const INT_ENA: u32 = 0x40; const INT_RAW: u32 = 0x44; const INT_ST: u32 = 0x48; const INT_CLR: u32 = 0x4c;
+const INT_ENA_W1TS: u32 = 0x138; const INT_ENA_W1TC: u32 = 0x13c; const INT_WDT: u32 = 1 << 3;
 pub const INT_ULP_CP: u32 = 1 << 5;
 pub const INT_COCPU: u32 = 1 << 13;
 pub const INT_COCPU_TRAP: u32 = 1 << 17;
@@ -23,21 +18,22 @@ pub fn reset_cause_name(c: u32) -> &'static str {
             12 => "RTC_SW_CPU_RESET", 13 => "RTCWDT_CPU_RESET", 15 => "RTCWDT_BROWN_OUT_RESET", 16 => "RTCWDT_RTC_RESET", 17 => "TG1WDT_CPU_RESET", 18 => "SUPER_WDT_RESET", _ => "?" }
 }
 
-/// RTC_CNTL: reset control, slow-clock time, the RTC watchdog, and the ULP controller registers.
+/// RTC_CNTL: reset control, slow-clock time, the RTC watchdog and the ULP controller.
+/// WDTCONFIG0..WDTWPROTECT live at 0x98..0xb0 on S3 and 0x90..0xa8 on C3.
 /// `esp_restart()` on ESP-IDF 5.x arms this watchdog and spins until it resets the chip.
 pub struct RtcCntl { pub ram: RegRam, pub slow_ticks: u64, pub time_latch: u64, pub sw_reset: bool, pub reset_cause: u32, pub ulp: UlpController,
                      pub ulp_adc: [[u16; 16]; 2], pub ulp_tsens: u16, pub ulp_i2c: [[u8; 256]; 16], pub ulp_adc_sample_cycle: u8, pub ulp_adc_sample_bits: u8,
-                     wdt_count: u64, wdt_stage: usize, wdt_unlocked: bool }
+                     wdt_base: u32, wdt_count: u64, wdt_stage: usize, wdt_unlocked: bool }
 impl RtcCntl {
     pub fn preset_after_bootloader(&mut self) { self.ram.write(0xc0, 0xFFD7_0028); self.ram.write(0xc4, 0xFF0F_00F0); }
     fn request_reset(&mut self, cause: u32) { if !self.sw_reset { self.sw_reset = true; self.reset_cause = cause; } }
     /// Advance the watchdog by RTC slow-clock ticks.
     pub fn wdt_tick(&mut self, ticks: u64) {
-        let conf0 = self.ram.read(0x98);
+        let conf0 = self.ram.read(self.wdt_base);
         if conf0 & (1 << 31) == 0 { return; }
         self.wdt_count += ticks;
         while self.wdt_stage < 4 {
-            let timeout = self.ram.read(0x9c + 4 * self.wdt_stage as u32) as u64;
+            let timeout = self.ram.read(self.wdt_base + 4 + 4 * self.wdt_stage as u32) as u64;
             let action = (conf0 >> (28 - 3 * self.wdt_stage as u32)) & 7;
             if action == 0 { self.wdt_stage += 1; continue; }              // stage disabled: skip
             if self.wdt_count < timeout { break; }
@@ -53,20 +49,19 @@ impl RtcCntl {
         }
         if self.wdt_stage >= 4 { self.wdt_stage = 0; }
     }
-    pub fn new() -> Self {
+    pub fn new() -> Self { Self::with_wdt_base(0x98) }
+    pub fn new_c3() -> Self { Self::with_wdt_base(0x90) }
+    fn with_wdt_base(wdt_base: u32) -> Self {
         let mut r = RtcCntl { ram: RegRam::new(), slow_ticks: 0, time_latch: 0, sw_reset: false, reset_cause: RST_POWERON, ulp: UlpController::new(),
                               ulp_adc: [[0; 16]; 2], ulp_tsens: 128, ulp_i2c: [[0; 256]; 16], ulp_adc_sample_cycle: 2, ulp_adc_sample_bits: 12,
-                              wdt_count: 0, wdt_stage: 0, wdt_unlocked: false };
+                              wdt_base, wdt_count: 0, wdt_stage: 0, wdt_unlocked: false };
         r.ram.write(0x38, 1 | (1 << 6));           // RESET_STATE: reset cause POWERON for both CPUs
         r.ram.write(0x74, 0);                        // CLK_CONF
         r.ram.write(0x100, (512 << 11) | 512);       // ULP_CP_CTRL reset values
         r.ram.write(0x104, (1 << 23) | (40 << 14) | (16 << 7) | (8 << 1));
         r.ram.write(0x134, 200 << 8);                // ULP_CP_TIMER_1 reset value
-        r.ram.write(0x818, (10 << 16) | 10);          // SENS_SAR_AMP_CTRL1 reset values
-        r.ram.write(0x81c, 10 << 16);                 // SENS_SAR_AMP_CTRL2 reset value
-        r.ram.write(0x850, 6 << 14);                  // SENS_SAR_TSENS_CTRL clock divider
-        r.ram.write(0xc00, 256); r.ram.write(0xc14, 256); // RTC_I2C SCL low/high
-        r.ram.write(0xc1c, 8); r.ram.write(0xc20, 8);     // RTC_I2C start/stop
+        r.ram.write(0x818, (10 << 16) | 10); r.ram.write(0x81c, 10 << 16);
+        r.ram.write(0x850, 6 << 14); r.ram.write(0xc00, 256); r.ram.write(0xc14, 256); r.ram.write(0xc1c, 8); r.ram.write(0xc20, 8);
         r
     }
     pub fn read(&mut self, off: u32) -> u32 {
@@ -83,6 +78,7 @@ impl RtcCntl {
     }
     pub fn write(&mut self, off: u32, v: u32) -> WriteEffect {
         let mut effect = WriteEffect::NONE;
+        let wdt = self.wdt_base;
         match off {
             0x0 => { if v & (1 << 31) != 0 { self.request_reset(RST_SW_SYS); } else if v & (1 << 5) != 0 { self.request_reset(RST_SW_CPU); } self.ram.write(off, v & !((1 << 31) | (1 << 5))); }   // OPTIONS0.SW_SYS_RST / SW_PROCPU_RST
             0xc => { if v & (1 << 31) != 0 { self.time_latch = self.slow_ticks; } self.ram.write(off, v); }
@@ -92,17 +88,17 @@ impl RtcCntl {
             INT_CLR => self.ram.write(INT_RAW, self.ram.read(INT_RAW) & !v),
             INT_ENA_W1TS => self.ram.write(INT_ENA, self.ram.read(INT_ENA) | v),
             INT_ENA_W1TC => self.ram.write(INT_ENA, self.ram.read(INT_ENA) & !v),
-            0xb0 => { self.wdt_unlocked = v == 0x50D8_3AA1; self.ram.write(off, v); }
-            0x98..=0xa8 => { if self.wdt_unlocked { if off == 0x98 && (v ^ self.ram.read(0x98)) & (1 << 31) != 0 { self.wdt_count = 0; self.wdt_stage = 0; } self.ram.write(off, v); } }
-            0xac => { if self.wdt_unlocked && v & (1 << 31) != 0 { self.wdt_count = 0; self.wdt_stage = 0; } }   // WDTFEED
+            _ if off == wdt + 0x18 => { self.wdt_unlocked = v == 0x50D8_3AA1; self.ram.write(off, v); }
+            _ if (wdt..=wdt + 0x10).contains(&off) => { if self.wdt_unlocked { if off == wdt && (v ^ self.ram.read(wdt)) & (1 << 31) != 0 { self.wdt_count = 0; self.wdt_stage = 0; } self.ram.write(off, v); } }
+            _ if off == wdt + 0x14 => { if self.wdt_unlocked && v & (1 << 31) != 0 { self.wdt_count = 0; self.wdt_stage = 0; } }   // WDTFEED
             0xfc => { self.ram.write(off, v); self.ulp.configure_timer(v); effect = WriteEffect::ULP; }
             0x100 => { self.ram.write(off, v); self.ulp.configure_control(v); effect = WriteEffect::ULP; }
             0x104 => { self.ram.write(off, v); self.ulp.configure_cocpu(v); effect = WriteEffect::ULP; }
             0x134 => { self.ram.write(off, v); self.ulp.set_wake_period(v); effect = WriteEffect::ULP; }
-            0x404 => self.ram.write(0x400, self.ram.read(0x400) | v),       // RTC_GPIO_OUT_W1TS
-            0x408 => self.ram.write(0x400, self.ram.read(0x400) & !v),      // RTC_GPIO_OUT_W1TC
-            0x410 => self.ram.write(0x40c, self.ram.read(0x40c) | v),       // RTC_GPIO_ENABLE_W1TS
-            0x414 => self.ram.write(0x40c, self.ram.read(0x40c) & !v),      // RTC_GPIO_ENABLE_W1TC
+            0x404 => self.ram.write(0x400, self.ram.read(0x400) | v),
+            0x408 => self.ram.write(0x400, self.ram.read(0x400) & !v),
+            0x410 => self.ram.write(0x40c, self.ram.read(0x40c) | v),
+            0x414 => self.ram.write(0x40c, self.ram.read(0x40c) & !v),
             _ => self.ram.write(off, v),
         }
         effect

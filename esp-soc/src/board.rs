@@ -114,6 +114,15 @@ pub trait BoardModel {
     /// Prefer waiting one push interval for a quiet pixel stream. The UI still publishes on
     /// the next opportunity during continuous changes so animation cannot starve.
     fn display_quiet_push(&self) -> bool { false }
+    /// Page pushes (display, audio, input poll) per emulated second. A panel that is drawn on
+    /// interactively wants more than the default; one that rescans a large frame does not.
+    fn display_push_hz(&self) -> u64 { 50 }
+    /// Opt in to interactive host publication before execution. Returns false if unsupported.
+    fn set_smooth_display(&mut self, _on: bool) -> bool { false }
+    /// Select a scripted IMU motion (0 = still) before execution. Returns false if unsupported.
+    fn set_imu_motion(&mut self, _mode: u32) -> bool { false }
+    /// The scripted IMU motion selected by `set_imu_motion` (0 when unsupported).
+    fn imu_motion(&self) -> u32 { 0 }
     /// Raw display memory for a debug PNG: (pixels, columns, rows).
     fn gram(&self) -> Option<(Vec<u16>, usize, usize)> { None }
     /// LED ring / strip: colours and a change counter.

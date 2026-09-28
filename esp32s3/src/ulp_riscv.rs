@@ -110,6 +110,7 @@ impl Bus for UlpRiscVBus<'_> {
     }
     fn page_versions(&self) -> &[u32] { self.versions }
     fn code_page(&mut self, pc: u32) -> u32 { self.version_base as u32 + (pc >> VPAGE_SHIFT) }
+    fn note_code_page(&mut self, _vidx: u32) {}
 }
 
 pub struct UlpRiscVEngine {

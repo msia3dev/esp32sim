@@ -48,7 +48,7 @@ pub trait Soc: 'static {
     const ROM_ELF: &'static str;
     const CPU_HZ: u64;
     const CORES: usize;
-    /// How far time jumps when every core sleeps (a multiple of the 64-instruction quantum).
+    /// How far time jumps when every core sleeps (at most; deadlines and limits cut it).
     const IDLE_CHUNK: u64;
     /// Symbols, in order of preference, that start the ROM's RAM-initialiser table.
     const ROM_DATA_TABLE: &'static [&'static str];
@@ -57,6 +57,8 @@ pub trait Soc: 'static {
     /// Bytes per table entry: (dst_start, dst_end, rom_src[, 0]) — 16 on the S3 and C3, 12 on the C6.
     const ROM_DATA_TABLE_STRIDE: u32 = 16;
     fn new_core(i: usize) -> Self::Core;
+    /// Connect core-local state to resources owned by this machine's bus.
+    fn new_core_with_bus(i: usize, _bus: &Self::Bus) -> Self::Core { Self::new_core(i) }
     /// Bring core `i` back to its reset state (after a chip reset or a release from reset).
     fn reset_core(core: &mut Self::Core, i: usize);
     /// Set a core up to start the app image at `entry` as the 2nd-stage bootloader would have.
@@ -71,6 +73,12 @@ pub trait SocBus: Bus {
     /// CPU cycles from the current device horizon to the next transition that may wake a core.
     fn next_deadline(&self) -> Option<u64> { None }
     fn irq_dirty(&mut self) -> &mut bool;
+    /// Arm or disarm device-register deferral for a multi-quantum run (EX133); clears the flag.
+    /// Whether `set_defer` is honoured; without it a multi-quantum run is never attempted.
+    fn can_defer(&self) -> bool { false }
+    fn set_defer(&mut self, on: bool) { let _ = on; }
+    /// Whether the last dispatch stopped in front of a device-register access; clears it.
+    fn take_deferred(&mut self) -> bool { false }
     /// Re-derive the interrupt lines after a device change; true if a core's input may differ.
     fn refresh_irq(&mut self) -> bool;
     /// Deliver deferred device time now (a bus that defers it).
@@ -93,6 +101,9 @@ pub trait SocBus: Bus {
     /// Chip reset: re-create the digital peripherals, keep what survives on silicon. Returns the cause.
     fn reboot(&mut self, mac: [u8; 6]) -> u32;
     fn sw_reset(&self) -> bool;
+    /// The board's reset button: the chip resets with this cause at the next scheduling round,
+    /// through the same path as a reset the firmware asked for.
+    fn request_reset(&mut self, cause: u32);
     fn reset_cause(&self) -> u32;
     fn last_fault(&self) -> Option<(u32, bool)>;
     /// Console bytes since the last call: USB-Serial/JTAG, UART0, UART1, UART2.

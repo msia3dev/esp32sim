@@ -15,6 +15,12 @@ panel with picture upload / webcam and speaker meter; bare: console only), the U
 UART0 consoles, an action box for the SDK's JSON protocol, and audio through WebAudio
 (click 🔇 once — browsers require a user gesture).
 
+The native server accepts browser WebSocket connections only from pages at
+`http://127.0.0.1:PORT` or `http://localhost:PORT`, using the server's port. It checks
+the browser's `Origin` header, which identifies the page's scheme, host and port.
+Local native clients may omit `Origin`; the server treats those tools as trusted.
+See the [Origin check](../esp-soc/src/web.rs) for the implementation.
+
 The header shows emulated time, instructions, frames, and `real time` / `⚠ N% of real time` /
 resync count. The percentage is emulated seconds per wall second over the last second: a
 resynchronisation resets the lag but not this, so a run that cannot keep up stays visible. The audio buffer is adaptive: it starts at 60 ms and grows on underrun (up to
@@ -54,6 +60,7 @@ Text frames:
 | --- | --- |
 | `btn` | `pin`, `v` (1 = pressed) |
 | `knobpress` | `v` |
+| `reset` | none: the board's reset button. The page's Restart sends it to a native run; in the browser build Restart reloads the page, which is the same thing there. Honoured when the run can come back up: through the ROM, or for `--boot app` by entering the app again; ignored with `--no-reboot` |
 | `knob` | `d` (+1 cw / −1 ccw per detent); the emulator queues the quadrature edges 2 ms apart |
 | `serial` | `line`, optional `src` (`usb` default, `uart0`, `uart1`) — the line plus a newline into that console's RX |
 | `key` | `src`, `data` — bytes exactly as typed, no newline added: the page's console is a terminal (click it, type; Enter is CR, Backspace DEL, arrows and Ctrl-letters their escape/control codes, paste sends the text). The **Terminal** tab (`web/terminal.js`) is a real VT100 on UART0 — xterm.js (MIT; `tools/fetch-web-vendor.sh` puts it in `web/vendor/xterm`, pinned by hash — not committed), 100×30 — so cursor movement, colours and full-screen programs render; it encodes its own keys into the same `key` message |
