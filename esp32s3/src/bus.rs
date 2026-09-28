@@ -687,7 +687,7 @@ impl SocBus {
         if Self::is_periph(addr) { self.last_fault = Some((addr, true)); return Err(Fault::Prohibited); }
         if (RTC_SLOW_LOW..RTC_SLOW_HIGH).contains(&addr) { self.flush_ticks(); }
         match self.lookup(addr) {
-            Some(e) if e.writable != 0 => { if CPU { self.price_cached_data(e, addr, 1, true); } let rel = (addr - e.lo) as usize; self.buf_mut(e.src as u8)[e.off as usize + rel] = v; if e.code != 0 { self.bump(e.vbase, rel, 1); } Ok(()) }
+            Some(e) if e.writable != 0 => { if CPU { self.price_cached_data(e, addr, 1, true); } let rel = (addr - e.lo) as usize; self.buf_mut(e.src as u8)[e.off as usize + rel] = v; if e.code != 0 || e.src as u8 == SRC_RTC_SLOW { self.bump(e.vbase, rel, 1); } Ok(()) }
             _ => { self.last_fault = Some((addr, true)); Err(Fault::Prohibited) }
         }
     }
@@ -695,7 +695,7 @@ impl SocBus {
         if Self::is_periph(addr) { self.last_fault = Some((addr, true)); return Err(Fault::Prohibited); }
         if (RTC_SLOW_LOW..RTC_SLOW_HIGH).contains(&addr) { self.flush_ticks(); }
         match self.lookup(addr) {
-            Some(e) if e.writable != 0 && e.hi - addr >= 2 => { if CPU { self.price_cached_data(e, addr, 2, true); } let rel = (addr - e.lo) as usize; let o = e.off as usize + rel; self.buf_mut(e.src as u8)[o..o + 2].copy_from_slice(&v.to_le_bytes()); if e.code != 0 { self.bump(e.vbase, rel, 2); } Ok(()) }
+            Some(e) if e.writable != 0 && e.hi - addr >= 2 => { if CPU { self.price_cached_data(e, addr, 2, true); } let rel = (addr - e.lo) as usize; let o = e.off as usize + rel; self.buf_mut(e.src as u8)[o..o + 2].copy_from_slice(&v.to_le_bytes()); if e.code != 0 || e.src as u8 == SRC_RTC_SLOW { self.bump(e.vbase, rel, 2); } Ok(()) }
             Some(e) if e.writable != 0 => { let b = v.to_le_bytes(); self.write8_access::<CPU>(addr, b[0])?; self.write8_access::<CPU>(addr + 1, b[1]) }
             _ => { self.last_fault = Some((addr, true)); Err(Fault::Prohibited) }
         }
@@ -707,7 +707,7 @@ impl SocBus {
         }
         if (RTC_SLOW_LOW..RTC_SLOW_HIGH).contains(&addr) { self.flush_ticks(); }
         match self.lookup(addr) {
-            Some(e) if e.writable != 0 && e.hi - addr >= 4 => { if CPU { self.price_cached_data(e, addr, 4, true); } let rel = (addr - e.lo) as usize; let o = e.off as usize + rel; self.buf_mut(e.src as u8)[o..o + 4].copy_from_slice(&v.to_le_bytes()); if e.code != 0 { self.bump(e.vbase, rel, 4); } Ok(()) }
+            Some(e) if e.writable != 0 && e.hi - addr >= 4 => { if CPU { self.price_cached_data(e, addr, 4, true); } let rel = (addr - e.lo) as usize; let o = e.off as usize + rel; self.buf_mut(e.src as u8)[o..o + 4].copy_from_slice(&v.to_le_bytes()); if e.code != 0 || e.src as u8 == SRC_RTC_SLOW { self.bump(e.vbase, rel, 4); } Ok(()) }
             Some(e) if e.writable != 0 => { let b = v.to_le_bytes(); for i in 0..4 { self.write8_access::<CPU>(addr + i, b[i as usize])?; } Ok(()) }
             _ => { self.last_fault = Some((addr, true)); Err(Fault::Prohibited) }
         }
