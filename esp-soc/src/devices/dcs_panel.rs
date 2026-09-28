@@ -35,7 +35,7 @@ impl DcsPanel {
     /// ST7735: 132 × 162 of RAM behind the 0.96" and 1.8" modules.
     pub fn st7735() -> Self { Self::new(132, 162) }
     /// ST7789: 240 × 320 of RAM behind the 1.47", 1.69" and 2.0" modules.
-    pub fn st7789() -> Self { let mut p = Self::new(240, 320); p.ramctrl = true; p }
+    pub fn st7789() -> Self { let mut p = Self::new(240, 320); p.ramctrl = true; p.colmod = 0x55; p }
 
     /// A hardware or software reset: every register back to power-on, the RAM kept (as on silicon).
     pub fn reset(&mut self) {
