@@ -240,7 +240,7 @@ impl Cpu {
         self.interrupt = 0;
         self.ext_irq_lines = 0;
         self.lcount = 0;
-        self.cpenable = 0;
+        self.cpenable = 0xff; // every configured coprocessor is enabled after reset
         self.icountlevel = 0;
         self.memctl = 1;      // observed reset value on ESP32-S3 silicon (rsr.memctl in the ROM reset path)
         self.waiting = false;
