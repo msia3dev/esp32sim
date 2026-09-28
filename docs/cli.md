@@ -14,13 +14,13 @@ PSRAM and register presets.
 ## Images and boot
 | Flag | Meaning |
 | --- | --- |
-| `--boot rom\|app` | `rom`: start at the mask ROM reset vector (real boot chain). `app`: load the app image segments and jump to its entry |
+| `--boot rom\|app\|download` | `rom`: start at the mask ROM reset vector (real boot chain). `app`: load the app image segments and jump to its entry. `download`: boot the ROM with the chip's UART-download strap (`0x7` on S3, `0x2` on C3/C6); explicit `--strap` wins |
 | `--bootloader F`, `--ptable F`, `--app F` | written to flash at 0x0 / 0x8000 / 0x10000 |
 | `--ptable-offset 0xNNNN` | where `--ptable` (and thus the partition table itself) is written, default 0x8000 — match your project's `CONFIG_PARTITION_TABLE_OFFSET` if it isn't the default (a bootloader built with Secure Boot V2 + Flash Encryption is often larger than the default 0x8000 gap and needs this pushed out, or it'll silently overlap and corrupt the tail of the bootloader image) |
 | `--app-offset 0xNNNN` | where `--app` is written (and, in `--boot app`, where its image is read from), default 0x10000 — match the offset of the partition you're booting (e.g. the `factory` app partition's actual offset from your partition table), which can differ once earlier partitions have been resized or reordered |
 | `--flash-image F` | whole flash dump written at 0 |
-| `--flash-state F` | persistent mutable ESP32-S3 logical flash; create from seed images when missing, otherwise load it and ignore the seeds |
-| `--efuse-state F` | persistent mutable ESP32-S3 physical eFuse state: native 336-byte payload or compatible 1 KiB QEMU backing file |
+| `--flash-state F` | persistent mutable logical flash on S3/C3/C6; create from seed images when missing, otherwise load it and ignore the seeds |
+| `--efuse-state F` | persistent mutable S3/C3/C6 physical eFuse state: native 336-byte payload or compatible 1 KiB QEMU backing file |
 | `--chip s3\|c3\|c6` | which chip (default s3) |
 | `--rom F` | mask ROM ELF (default: the chip's in `~/.espressif/tools/esp-rom-elfs/*/`) |
 | `--mac xx:xx:xx:xx:xx:xx` | the station MAC the efuses report |
@@ -64,6 +64,7 @@ browser profiles and security considerations.
 | `--max-insns N` | cap scheduler work across all reboots (details below); unavailable with `--cooja`, which uses `--max-seconds` |
 | `--script F` | host actions at emulated times (below) |
 | `--console usb\|uart0\|both\|all\|none`, `--console-prefix` | which consoles to print |
+| `--uart-tcp HOST:PORT` | expose UART0 as a raw binary TCP server; implies real-time pacing and removes UART0 from stdout |
 | `--realtime` | pace to wall time without the UI |
 | `--web PORT [--web-dir DIR]` | browser UI (implies real time) |
 | `--cam-image F`, `--cam-fps N` | camera source for boards with a camera |
@@ -78,6 +79,26 @@ core does not add to that count. It checks the cap between scheduling rounds, so
 the current round past the requested number. With an approximate cost model, it counts
 scheduled events. Use `--max-seconds` for a predictable duration. The final execution report
 separately lists the actual instruction count for each core.
+
+### esptool over UART TCP
+
+Start the S3 in UART download mode with persistent flash and a raw UART0 socket:
+
+```sh
+esp32sim --chip s3 --board none --boot download --flash-mb 8 \
+  --flash-state .state/device-flash.bin --uart-tcp 127.0.0.1:5555 --console none
+```
+
+TCP has no RTS/DTR reset control, so use esptool's no-reset options. ROM mode works with
+`--no-stub`; for uploaded flashers use the modern v2 stub (`ESPTOOL_STUB_VERSION=2`). The legacy
+S3 v1.3.0 stub has an upstream hard-coded classic-ESP32 address and is intentionally unsupported.
+After flashing, restart esp32sim in normal ROM boot using the same `--flash-state` file.
+
+C3 and C6 use the same socket workflow with `--chip c3` or `--chip c6`; their ROM loader and
+modern v2 stub support flash identification, compressed writes, and digest verification.
+Their writes persist across processes when the same `--flash-state` file is reused.
+The ROM loaders support write, verify and read-back but not `erase_region`; the v2 stubs add
+bounded erase and chip erase. Normal ROM boot from esptool-flashed ESP-IDF images is supported.
 
 ## Outputs
 | Flag | Meaning |

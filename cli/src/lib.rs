@@ -48,6 +48,7 @@ fn cache_config() -> Result<esp32s3::approximate_cache::CacheConfig, String> {
 
 fn hex(s: &str, what: &str) -> u32 { u32::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or_else(|_| { eprintln!("--{}: bad hex {}", what, s); std::process::exit(2) }) }
 fn pair(s: &str, dflt: usize) -> (u32, usize) { match s.split_once(',') { Some((a, n)) => (hex(a, "addr"), n.parse().unwrap_or(dflt)), None => (hex(s, "addr"), dflt) } }
+fn download_strap(chip: &str) -> u32 { if chip == "esp32s3" { 0x7 } else { 0x2 } }
 
 use esp_soc::load::stub_spec;
 
@@ -72,7 +73,7 @@ pub struct Opts {
     pub board: String, pub wifi: Option<String>, pub net: String, pub cam_image: Option<String>, pub cam_fps: f64,
     pub spi2_timing: bool, pub measured_te: bool,
     pub max_insns: u64, pub max_seconds: Option<f64>, pub script: Option<String>, pub serial: Option<String>,
-    pub console: Option<String>, pub console_prefix: bool, pub realtime: bool, pub web_port: Option<u16>, pub web_dir: Option<String>, pub no_reboot: bool,
+    pub console: Option<String>, pub console_prefix: bool, pub realtime: bool, pub uart_tcp: Option<String>, pub web_port: Option<u16>, pub web_dir: Option<String>, pub no_reboot: bool,
     pub wav: Option<String>, pub tft_png: Option<String>, pub gram_png: Option<String>, pub dump: bool,
     pub trace: bool, pub trace_from: u64, pub breaks: Vec<u32>, pub watch: Option<u32>, pub peeks: Vec<(u32, usize)>, pub disasms: Vec<(u32, usize)>,
     pub profile: bool, pub profile_blocks: bool, pub coverage: Option<Option<String>>, pub irq_latency: bool, pub vcd: Option<String>,
@@ -127,6 +128,7 @@ pub fn parse(args: &[String], default_chip: &str) -> Opts {
             "--console" => o.console = Some(next()),
             "--console-prefix" => o.console_prefix = true,
             "--realtime" => o.realtime = true,
+            "--uart-tcp" => o.uart_tcp = Some(next()),
             "--web" => o.web_port = Some(next().parse().expect("port")),
             "--web-dir" => o.web_dir = Some(next()),
             "--no-reboot" => o.no_reboot = true,
@@ -197,6 +199,7 @@ pub fn run_cli(default_chip: &str) {
 fn run_cooja(o: &mut Opts) {
     if !matches!(o.chip.as_str(), "c6" | "esp32c6") { eprintln!("--cooja: only the ESP32-C6 speaks the Cooja-NG lock-step protocol"); std::process::exit(2); }
     if o.max_insns != u64::MAX { eprintln!("--cooja: --max-insns is unsupported; use --max-seconds"); std::process::exit(2); }
+    if o.uart_tcp.is_some() { eprintln!("--uart-tcp cannot be combined with --cooja"); std::process::exit(2); }
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let hello = match cooja::read_hello(&mut input) { Ok(h) => h, Err(e) => { eprintln!("[cooja] {}", e); std::process::exit(2) } };
@@ -232,6 +235,7 @@ fn setup_s3(o: &Opts) -> esp32s3::Machine {
     m.bus.spi2_timing = o.spi2_timing;
     m.bus.attach_board_devices();
     if !o.debug.is_empty() { let mut f = esp_soc::DebugFlags::from_env(); for d in &o.debug { f.parse(d); } m.set_debug(&f); }
+    if let Some(path) = &o.flash_state { let loaded = m.bus.configure_flash_state(path).unwrap_or_else(|e| { eprintln!("--flash-state: {e}"); std::process::exit(2) }); eprintln!("[emu] flash state: {} ({})", path, if loaded { "loaded" } else { "new" }); }
     if let Some(spec) = &o.wifi {
         let cfg = esp32s3::wifi::ApConfig::parse(spec).unwrap_or_else(|e| { eprintln!("--wifi: {e}"); std::process::exit(2) });
         eprintln!("[emu] virtual AP '{}' bssid {} channel {} ({})", cfg.ssid, esp32s3::wifi::mac_str(&cfg.bssid), cfg.channel, if cfg.psk.is_some() { "WPA2-PSK" } else { "open" });
@@ -282,6 +286,8 @@ fn setup_c3(o: &Opts) -> esp32c3::Machine {
     let mut m = esp32c3::machine(o.mac.unwrap_or([0x60, 0x55, 0xf9, 0x00, 0x11, 0x22]), o.flash_mb.unwrap_or(4) << 20);
     m.bus.set_flash_size(o.flash_mb.unwrap_or(4) << 20);   // the JEDEC capacity follows the size
     if !o.debug.is_empty() { let mut f = esp_soc::DebugFlags::from_env(); for d in &o.debug { f.parse(d); } m.set_debug(&f); }
+    if let Some(path) = &o.flash_state { let loaded = m.bus.configure_flash_state(path).unwrap_or_else(|e| { eprintln!("--flash-state: {e}"); std::process::exit(2) }); eprintln!("[emu] flash state: {} ({})", path, if loaded { "loaded" } else { "new" }); }
+    if let Some(path) = &o.efuse_state { let loaded = m.bus.configure_efuse_state(path).unwrap_or_else(|e| { eprintln!("--efuse-state: {e}"); std::process::exit(2) }); eprintln!("[emu] eFuse state: {} ({})", path, if loaded { "loaded" } else { "new" }); }
     for (flag, on) in [("--board", o.board != "atech14" && o.board != "none"), ("--wifi", o.wifi.is_some()), ("--cam-image", o.cam_image.is_some()), ("--psram-mb", o.psram_mb.is_some()), ("--efuse-regs", o.efuse_regs.is_some()), ("--regs-init", o.regs_init.is_some()), ("--regstat", o.regstat.is_some())] {
         if on { eprintln!("{} is not available on the C3", flag); std::process::exit(2); }
     }
@@ -294,6 +300,8 @@ fn setup_c6(o: &Opts) -> esp32c6::Machine {
     if !o.debug.is_empty() { let mut f = esp_soc::DebugFlags::from_env(); for d in &o.debug { f.parse(d); } m.set_debug(&f); }
     let name = if o.board == "atech14" { "none" } else { o.board.as_str() };   // the S3 default means "bare module" here
     match esp32c6::board::make_board(name) { Some(b) => m.bus.board = b, None => { eprintln!("--board {}: none or waveshare-c6-lcd147 on the C6", name); std::process::exit(2) } }
+    if let Some(path) = &o.flash_state { let loaded = m.bus.configure_flash_state(path).unwrap_or_else(|e| { eprintln!("--flash-state: {e}"); std::process::exit(2) }); eprintln!("[emu] flash state: {} ({})", path, if loaded { "loaded" } else { "new" }); }
+    if let Some(path) = &o.efuse_state { let loaded = m.bus.configure_efuse_state(path).unwrap_or_else(|e| { eprintln!("--efuse-state: {e}"); std::process::exit(2) }); eprintln!("[emu] eFuse state: {} ({})", path, if loaded { "loaded" } else { "new" }); }
     if let Some(spec) = &o.wifi {
         let cfg = esp_soc::wifi::ApConfig::parse(spec).unwrap_or_else(|e| { eprintln!("--wifi: {e}"); std::process::exit(2) });
         eprintln!("[emu] virtual AP '{}' bssid {} channel {} ({})", cfg.ssid, esp_soc::wifi::mac_str(&cfg.bssid), cfg.channel, if cfg.psk.is_some() { "WPA2-PSK" } else { "open" });
@@ -418,16 +426,26 @@ fn prepare<S: Soc>(m: &mut Machine<S>, o: &Opts) -> String {
     if o.no_jit { for c in &mut m.cores { c.set_jit(false); } }
     match boot.as_str() {
         "app" => match m.boot_app(o.app_offset.unwrap_or(0x10000) as usize) { Ok(entry) => eprintln!("[emu] app boot: entry {:#010x} {}", entry, m.sym(entry)), Err(e) => { eprintln!("[emu] {}", e); std::process::exit(2) } },
-        "rom" => { m.boot_rom(); eprintln!("[emu] ROM boot from reset vector {:#010x}", m.cores[0].pc()); }
-        _ => { eprintln!("--boot app|rom"); std::process::exit(2); }
+        "rom" | "download" => { m.boot_rom(); eprintln!("[emu] ROM boot from reset vector {:#010x}", m.cores[0].pc()); }
+        _ => { eprintln!("--boot app|rom|download"); std::process::exit(2); }
     }
     // Match a real board's boot conditions: the ROM prints the reset cause and the strapping-derived boot mode
     if let Some(c) = o.reset_cause { m.bus.set_reset_cause(c); }
     if let Some(v) = o.strap { m.bus.set_strap(v); }
+    else if boot == "download" {
+        let strap = download_strap(S::NAME);
+        m.bus.set_strap(strap);
+        eprintln!("[emu] {} UART download strap {:#x}", S::NAME, strap);
+    }
     for &(a, n) in &o.peeks { eprintln!("[peek before run]\n{}", m.peek(a, n)); }
     m.dbg.stop_after_exceptions = o.stop_exc;
     m.console.mask = console_mask(&console);
     m.console.prefix = o.console_prefix;
+    if let Some(addr) = &o.uart_tcp {
+        let uart_tcp = esp_soc::UartTcp::start(addr).unwrap_or_else(|e| { eprintln!("--uart-tcp {}: {}", addr, e); std::process::exit(2) });
+        eprintln!("[emu] UART0 TCP: {}", uart_tcp.local_addr()); m.uart_tcp = Some(uart_tcp);
+        m.console.mask &= !2; m.rt.enabled = true;
+    }
     if let Some(p) = &o.regtrace { m.add_observer(Box::new(RegTrace::new(std::fs::File::create(p).expect("regtrace file"), o.regtrace_max, o.regtrace_from_pc))); }
     if let Some(port) = o.web_port {
         let dir = o.web_dir.clone().unwrap_or_else(|| { let exe = std::env::current_exe().unwrap(); let mut d = exe.parent().unwrap().to_path_buf(); for _ in 0..3 { if d.join("web").exists() { break; } d = d.parent().unwrap().to_path_buf(); } d.join("web").to_string_lossy().to_string() });

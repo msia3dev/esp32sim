@@ -7,7 +7,9 @@
 
 use crate::periph::{Peripherals, CPU_SUB_BASE, CPU_SUB_END, PERIPH_BASE, PERIPH_END};
 use esp_periph::read_desc;
+use esp_soc::StateFile;
 use riscv_rv32::bus::{Bus, Fault};
+use std::path::PathBuf;
 
 /// GPIO matrix output signal of RMT TX channel 0 (soc/gpio_sig_map.h); channel n is this + n.
 pub const RMT_SIG_OUT0: u32 = 71;
@@ -46,7 +48,13 @@ pub struct SocBus {
     /// GPIO edges for observers, while one wants them: (cycle, pin, level)
     pub gpio_events: Option<Vec<(u64, u8, bool)>>,
     pub debug: esp_soc::DebugFlags,
+    flash_state: Option<StateSlot>,
+    efuse_state: Option<StateSlot>,
+    storage_error: Option<String>,
+    storage_generation: u64,
 }
+
+struct StateSlot { path: PathBuf, file: Option<StateFile>, loaded: bool }
 
 impl SocBus {
     pub fn new(flash_size: usize, mac: [u8; 6]) -> Self {
@@ -58,6 +66,67 @@ impl SocBus {
             mmu: [0; MMU_ENTRIES], mmu_index: 0, mmu_power_ctrl: 0,
             periph: Peripherals::new(mac), board: Box::new(esp_soc::NoBoard),
             cycles: 0, last_fault: None, irq_dirty: true, gpio_events: None, debug: Default::default(),
+            flash_state: None, efuse_state: None, storage_error: None, storage_generation: 0,
+        }
+    }
+
+    pub fn configure_flash_state(&mut self, path: impl Into<PathBuf>) -> Result<bool, String> {
+        let path = path.into();
+        match StateFile::open(&path, self.flash.len())? {
+            Some((file, bytes)) => { self.flash = bytes; self.flash_state = Some(StateSlot { path, file: Some(file), loaded: true }); Ok(true) }
+            None => { self.flash_state = Some(StateSlot { path, file: None, loaded: false }); Ok(false) }
+        }
+    }
+
+    pub fn configure_efuse_state(&mut self, path: impl Into<PathBuf>) -> Result<bool, String> {
+        let path = path.into();
+        match StateFile::open_sizes(&path, &[esp_periph::EFUSE_STATE_BYTES, 1024])? {
+            Some((file, bytes)) => { self.periph.efuse.load_state(&bytes[..esp_periph::EFUSE_STATE_BYTES])?; self.efuse_state = Some(StateSlot { path, file: Some(file), loaded: true }); Ok(true) }
+            None => { self.efuse_state = Some(StateSlot { path, file: None, loaded: false }); Ok(false) }
+        }
+    }
+
+    pub fn persistent_flash_loaded(&self) -> bool { self.flash_state.as_ref().is_some_and(|state| state.loaded) }
+    pub fn persistent_efuse_loaded(&self) -> bool { self.efuse_state.as_ref().is_some_and(|state| state.loaded) }
+    pub fn initialize_storage(&mut self) -> Result<(), String> {
+        if let Some(state) = &mut self.flash_state {
+            if state.file.is_none() { state.file = Some(StateFile::create(&state.path, &self.flash)?); }
+        }
+        if let Some(state) = &mut self.efuse_state {
+            if state.file.is_none() { state.file = Some(StateFile::create(&state.path, &self.periph.efuse.state_bytes())?); }
+        }
+        Ok(())
+    }
+    pub fn flush_storage(&mut self) -> Result<(), String> {
+        if let Some(file) = self.flash_state.as_mut().and_then(|state| state.file.as_mut()) { file.sync()?; }
+        if let Some(file) = self.efuse_state.as_mut().and_then(|state| state.file.as_mut()) { file.sync()?; }
+        if let Some(error) = self.storage_error.take() { return Err(error); }
+        Ok(())
+    }
+    pub fn storage_generation(&self) -> u64 { self.storage_generation }
+    pub fn export_storage(&self, kind: u32) -> Option<Vec<u8>> { match kind { 0 => Some(self.flash.clone()), 1 => Some(self.periph.efuse.state_bytes()), _ => None } }
+    pub fn import_storage(&mut self, kind: u32, data: &[u8]) -> Result<(), String> {
+        match kind {
+            0 => {
+                if data.len() != self.flash.len() { return Err(format!("flash state is {} bytes, expected {}", data.len(), self.flash.len())); }
+                self.flash.copy_from_slice(data); Ok(())
+            }
+            1 => self.periph.efuse.load_state(data),
+            _ => Err(format!("unknown persistent state kind {}", kind)),
+        }
+    }
+    fn persist_flash(&mut self, offset: usize, len: usize) {
+        let end = offset.saturating_add(len).min(self.flash.len());
+        if end <= offset { return; }
+        self.storage_generation = self.storage_generation.wrapping_add(1);
+        if let Some(file) = self.flash_state.as_mut().and_then(|state| state.file.as_mut()) {
+            if let Err(error) = file.write_range(offset, &self.flash[offset..end]) { self.storage_error.get_or_insert(error); }
+        }
+    }
+    fn persist_efuse(&mut self) {
+        self.storage_generation = self.storage_generation.wrapping_add(1);
+        if let Some(file) = self.efuse_state.as_mut().and_then(|state| state.file.as_mut()) {
+            if let Err(error) = file.write_range(0, &self.periph.efuse.state_bytes()).and_then(|_| file.sync()) { self.storage_error.get_or_insert(error); }
         }
     }
 
@@ -99,6 +168,7 @@ impl SocBus {
         } else {
             self.periph.read32(addr & !3)
         };
+        if (PERIPH_BASE..PERIPH_END).contains(&addr) && addr & 0xfff == 0 && matches!((addr - PERIPH_BASE) >> 12, 0x00 | 0x10) { self.irq_dirty = true; }
         match size { 1 => (w >> ((addr & 3) * 8)) & 0xff, 2 => (w >> ((addr & 2) * 8)) & 0xffff, _ => w }
     }
 
@@ -125,6 +195,7 @@ impl SocBus {
         }
         let v = if size == 4 { v } else { merge(self.periph.read32(a)) };
         self.periph.write32(a, v);
+        if self.periph.efuse.take_dirty() { self.persist_efuse(); }
         // A SPI flash command must complete before the guest reads its result (see the C3 notes:
         // running it at the quantum boundary loses the race and reads back zeros).
         if self.periph.spi_exec { self.run_spi(); }
@@ -384,7 +455,9 @@ impl SocBus {
         self.periph.spi_exec = false;
         let mut no_psram = Vec::new();
         self.periph.spi1.0.execute(&mut self.flash, &mut no_psram);
-        self.periph.spi1.0.dirty.clear();
+        for (memory, offset, len) in std::mem::take(&mut self.periph.spi1.0.dirty) {
+            if memory == esp_periph::DirtyMem::Flash { self.persist_flash(offset, len); }
+        }
     }
 
     /// Write straight into flash (image loaders, not the guest).
@@ -487,4 +560,42 @@ impl Bus for SocBus {
     /// a peripheral write may have moved a line: the core's run stops so the machine re-derives it
     #[inline(always)]
     fn block_break(&self) -> bool { self.irq_dirty }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("esp32sim-c6-{name}-state-{}.bin", std::process::id()))
+    }
+
+    #[test]
+    fn flash_program_survives_a_new_bus() {
+        const SPI1: u32 = 0x6000_3000;
+        let path = state_path("flash"); let _ = std::fs::remove_file(&path);
+        {
+            let mut bus = SocBus::new(0x2000, [0; 6]);
+            assert!(!bus.configure_flash_state(&path).unwrap()); bus.initialize_storage().unwrap();
+            bus.periph.spi1.0.regs.write(0x4, 0x120); bus.periph.spi1.0.regs.write(0x24, 31); bus.periph.spi1.0.w[0] = 0x4433_2211;
+            bus.write32(SPI1, 1 << 25).unwrap(); bus.flush_storage().unwrap();
+        }
+        let mut bus = SocBus::new(0x2000, [0; 6]); assert!(bus.configure_flash_state(&path).unwrap());
+        assert_eq!(&bus.flash[0x120..0x124], &[0x11, 0x22, 0x33, 0x44]); std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn efuse_identity_and_burn_survive_a_new_bus() {
+        const EFUSE: u32 = 0x600b_0800;
+        let path = state_path("efuse"); let _ = std::fs::remove_file(&path);
+        let identity;
+        {
+            let mut bus = SocBus::new(0x2000, [0; 6]);
+            identity = bus.periph.efuse.read(0x50);
+            assert!(!bus.configure_efuse_state(&path).unwrap()); bus.initialize_storage().unwrap();
+            bus.write32(EFUSE, 0x55).unwrap(); bus.write32(EFUSE + 0x1d4, (4 << 2) | 2).unwrap(); bus.flush_storage().unwrap();
+        }
+        let mut bus = SocBus::new(0x2000, [0; 6]); assert!(bus.configure_efuse_state(&path).unwrap());
+        assert_eq!(bus.periph.efuse.read(0x50), identity); assert_eq!(bus.periph.efuse.read(0x9c), 0x55); std::fs::remove_file(path).unwrap();
+    }
 }

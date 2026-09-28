@@ -21,6 +21,8 @@ pub mod picture;
 pub mod png;
 pub mod soc;
 pub mod storage;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod uart_tcp;
 pub mod web;
 pub mod wifi;
 
@@ -31,3 +33,5 @@ pub use machine::{Console, Debug, Machine, Realtime, Script, ScriptAction};
 pub use observe::{Ctx, Observer, Wants};
 pub use soc::{CoreState, RunUntil, Soc, SocBus, Stop};
 pub use storage::StateFile;
+#[cfg(not(target_arch = "wasm32"))]
+pub use uart_tcp::UartTcp;
