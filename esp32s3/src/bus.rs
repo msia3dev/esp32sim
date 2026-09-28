@@ -169,8 +169,17 @@ impl SocBus {
     pub fn configure_efuse_state(&mut self, path: impl Into<PathBuf>) -> Result<bool, String> { let path = path.into(); match StateFile::open_sizes(&path, &[crate::periph::EFUSE_STATE_BYTES, 1024])? { Some((file, bytes)) => { self.periph.efuse.load_state(&bytes[..crate::periph::EFUSE_STATE_BYTES])?; self.efuse_state = Some(StateSlot { path, file: Some(file), loaded: true }); Ok(true) }, None => { self.efuse_state = Some(StateSlot { path, file: None, loaded: false }); Ok(false) } } }
     pub fn persistent_flash_loaded(&self) -> bool { self.flash_state.as_ref().is_some_and(|s| s.loaded) }
     pub fn persistent_efuse_loaded(&self) -> bool { self.efuse_state.as_ref().is_some_and(|s| s.loaded) }
-    pub fn initialize_storage(&mut self) -> Result<(), String> { if let Some(s) = &mut self.flash_state { if s.file.is_none() { s.file = Some(StateFile::create(&s.path, &self.flash)?); } } if let Some(s) = &mut self.efuse_state { if s.file.is_none() { s.file = Some(StateFile::create(&s.path, &self.periph.efuse.state_bytes())?); } } Ok(()) }
-    pub fn flush_storage(&mut self) -> Result<(), String> { if let Some(f) = self.flash_state.as_mut().and_then(|s| s.file.as_mut()) { f.sync()?; } if let Some(f) = self.efuse_state.as_mut().and_then(|s| s.file.as_mut()) { f.sync()?; } if let Some(e) = self.storage_error.take() { return Err(e); } Ok(()) }
+    pub fn initialize_storage(&mut self) -> Result<(), String> {
+        if let Some(s) = &mut self.flash_state { if s.file.is_none() { s.file = Some(StateFile::create(&s.path, &self.flash)?); } }
+        if let Some(s) = &mut self.efuse_state { if s.file.is_none() { s.file = Some(StateFile::create(&s.path, &self.periph.efuse.state_bytes())?); } }
+        Ok(())
+    }
+    pub fn flush_storage(&mut self) -> Result<(), String> {
+        if let Some(f) = self.flash_state.as_mut().and_then(|s| s.file.as_mut()) { f.sync()?; }
+        if let Some(f) = self.efuse_state.as_mut().and_then(|s| s.file.as_mut()) { f.sync()?; }
+        if let Some(e) = self.storage_error.take() { return Err(e); }
+        Ok(())
+    }
     pub fn storage_generation(&self) -> u64 { self.storage_generation }
     pub fn export_storage(&self, kind: u32) -> Option<Vec<u8>> { match kind { 0 => Some(self.flash.clone()), 1 => Some(self.periph.efuse.state_bytes()), _ => None } }
     pub fn import_storage(&mut self, kind: u32, data: &[u8]) -> Result<(), String> { match kind { 0 if data.len() == self.flash.len() => { self.flash.copy_from_slice(data); self.rebuild_page_table(); Ok(()) }, 0 => Err(format!("flash state is {} bytes, expected {}", data.len(), self.flash.len())), 1 => self.periph.efuse.load_state(data), _ => Err(format!("unknown persistent state kind {}", kind)) } }
