@@ -283,7 +283,7 @@ fn main_cpu_rtc_access_orders_after_ulp_completion_at_the_same_cycle() {
     esp_soc::SocBus::load_bytes(&mut m.bus, esp32s3::bus::RTC_SLOW_LOW, &program).unwrap();
     m.bus.write32(RTC_CNTL + 0x104, (1 << 27) | (1 << 23)).unwrap();
     m.bus.write32(RTC_CNTL + 0x100, (1 << 30) | (1 << 28) | (512 << 11) | 512).unwrap();
-    m.bus.tick(72);
+    m.bus.tick(120);
     m.bus.write32(RTC_CNTL + 0x4c, esp_periph::INT_ULP_CP).unwrap();
     assert_eq!(m.bus.read32(RTC_CNTL + 0x44).unwrap() & esp_periph::INT_ULP_CP, 0, "ULP completion is applied before the main-CPU W1C access");
     assert_eq!(m.bus.ulp_fsm.wake_requests, 1);
