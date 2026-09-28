@@ -120,7 +120,8 @@ fn idle_machine_advances_to_the_ulp_timer_deadline() {
     assert!(m.bus.next_deadline() <= 2 * 1600);
     m.cores[0].waiting = true; m.cores[0].ps = 0; m.max_cycles = 5_000;
     assert!(matches!(m.run(u64::MAX), Stop::Halted));
-    assert_eq!(m.bus.periph.rtc.ulp.state, esp_periph::UlpState::Running);
+    assert_eq!(m.bus.periph.rtc.ulp.state, esp_periph::UlpState::WakeDelay);
+    assert!(m.bus.periph.rtc.ulp.starts >= 1);
     assert_eq!(m.bus.periph.rtc.ulp.entry_pc, 7);
 }
 
@@ -301,6 +302,7 @@ fn ulp_decode_cache_follows_rtc_page_versions() {
 
     m.bus.write32(esp32s3::bus::RTC_SLOW_LOW, 0xb000_0000).unwrap(); // replace loop with HALT
     m.bus.tick(72);
+    m.bus.flush_ticks();
     assert!(m.bus.ulp_fsm.cpu.halted);
     assert_eq!(m.bus.ulp_fsm.decode_misses, 2, "the main-CPU write invalidates cached ULP decode");
 }
@@ -315,7 +317,7 @@ fn long_ulp_wait_uses_one_retirement_and_one_deadline() {
     m.bus.write32(RTC_CNTL + 0x100, (1 << 30) | (1 << 28) | (512 << 11) | 512).unwrap();
     let fast_hz = esp32s3::ulp::UlpFsmEngine::rtc_fast_hz(&m.bus.periph.rtc);
     assert_eq!(m.bus.ulp_fsm.cpu_cycles_until_deadline(fast_hz), Some(65_541 * 12));
-    assert_eq!(m.bus.next_deadline(), 256, "the generic device backstop remains conservative");
+    assert_eq!(m.bus.next_deadline(), 32_768, "the quiet-device backstop remains conservative");
     m.cores[0].waiting = true;
     m.cores[0].ps = 0;
     m.max_cycles = 65_541 * 12 + 24;
