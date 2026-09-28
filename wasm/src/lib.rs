@@ -153,12 +153,20 @@ pub unsafe extern "C" fn esp32sim_new(board: *const u8, board_len: usize, flash_
 }
 
 #[no_mangle]
+/// # Safety
+/// `e` must point to a live emulator for the duration of this call.
 pub unsafe extern "C" fn esp32sim_state_generation(e: *mut Emu) -> f64 { unsafe { &*e }.m.storage_generation() as f64 }
 #[no_mangle]
+/// # Safety
+/// `e` must point to a live emulator with exclusive access for this call.
 pub unsafe extern "C" fn esp32sim_state_export(e: *mut Emu, kind: u32) -> usize { let e = unsafe { &mut *e }; e.state_out = e.m.export_storage(kind).unwrap_or_default(); e.state_out.len() }
 #[no_mangle]
+/// # Safety
+/// `e` must point to a live emulator; the returned pointer is invalidated by the next export or deletion.
 pub unsafe extern "C" fn esp32sim_state_ptr(e: *const Emu) -> *const u8 { unsafe { &*e }.state_out.as_ptr() }
 #[no_mangle]
+/// # Safety
+/// `e` must be live and exclusively accessible; `ptr` must be readable for `len` bytes.
 pub unsafe extern "C" fn esp32sim_state_import(e: *mut Emu, kind: u32, ptr: *const u8, len: usize) -> u32 { let e = unsafe { &mut *e }; match e.m.import_storage(kind, unsafe { bytes(ptr, len) }) { Ok(()) => 0, Err(message) => { log(&format!("[emu] state import: {message}")); 1 } } }
 
 /// The page is the one client: messages queue in a `WebServer` sink; the worker paces the run.
