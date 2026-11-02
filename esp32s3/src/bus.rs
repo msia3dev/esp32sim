@@ -937,9 +937,11 @@ impl SocBus {
     pub fn refresh_tick_budget(&mut self) {
         let cap = if self.cadence_active() { MAX_TICK_DEFER } else { QUIET_TICK_DEFER };
         let mut budget = self.periph.cycles_until_timer().clamp(1, cap);
-        let fast_hz = UlpFsmEngine::rtc_fast_hz(&self.periph.rtc);
-        if let Some(deadline) = self.ulp_fsm.cpu_cycles_until_deadline(fast_hz) { budget = budget.min(deadline); }
-        if let Some(deadline) = self.ulp_riscv.cpu_cycles_until_deadline(fast_hz) { budget = budget.min(deadline); }
+        if self.ulp_service_needed() {
+            let fast_hz = UlpFsmEngine::rtc_fast_hz(&self.periph.rtc);
+            if let Some(deadline) = self.ulp_fsm.cpu_cycles_until_deadline(fast_hz) { budget = budget.min(deadline); }
+            if let Some(deadline) = self.ulp_riscv.cpu_cycles_until_deadline(fast_hz) { budget = budget.min(deadline); }
+        }
         if let Some((deadline, _)) = &self.spi2_scheduled {
             let until = u64::from(self.tick_pending).saturating_add(deadline.saturating_sub(self.cycles));
             budget = budget.min(until.clamp(1, u64::from(MAX_TICK_DEFER)) as u32);
@@ -1015,7 +1017,13 @@ impl SocBus {
         0
     }
 
+    #[inline]
+    fn ulp_service_needed(&self) -> bool {
+        self.periph.rtc.ulp.state != esp_periph::UlpState::Off || self.ulp_fsm.is_active() || self.ulp_riscv.is_active()
+    }
+
     fn reconcile_ulp(&mut self) {
+        if !self.ulp_service_needed() { return; }
         let version_base = self.ver_base[SRC_RTC_SLOW as usize];
         let mut bus = RtcSlowBus::new(&mut self.periph.rtc, &mut self.rtc_slow, &mut self.page_ver, version_base);
         self.ulp_fsm.reconcile(&mut bus);
@@ -1025,6 +1033,7 @@ impl SocBus {
     }
 
     fn advance_ulp(&mut self, cycles: u32) {
+        if !self.ulp_service_needed() { return; }
         let interrupt_before = self.periph.rtc.interrupt_status();
         let fast_hz = UlpFsmEngine::rtc_fast_hz(&self.periph.rtc);
         let version_base = self.ver_base[SRC_RTC_SLOW as usize];

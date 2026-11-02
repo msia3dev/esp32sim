@@ -1,0 +1,8 @@
+{
+  "kind": "one-second Node 22 differential-test diagnostic, no completion verdict",
+  "raw_sha256": "22b442e9ab04260795e45a570fda61ec129b421ea99a30ca9a455e6c9d1c0819",
+  "main_thread_samples": 624,
+  "samples_in_v8_wasm_table_update": 417,
+  "interpretation": "The sampled process was executing WASM instance/table bookkeeping. No throughput conclusion.",
+  "redactions": "Removed headers, thread/process IDs, addresses, unrelated threads and all binary/system inventories; raw capture deleted."
+}

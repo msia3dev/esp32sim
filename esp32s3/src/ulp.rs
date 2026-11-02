@@ -209,6 +209,9 @@ impl UlpFsmEngine {
         }
     }
 
+    #[inline]
+    pub(crate) fn is_active(&self) -> bool { self.active }
+
     pub(crate) fn reconcile(&mut self, bus: &mut RtcSlowBus<'_>) {
         if bus.rtc.ulp.state == UlpState::Reset {
             self.cpu.reset_architecture(bus.rtc.ulp.entry_pc);

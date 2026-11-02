@@ -8,20 +8,26 @@ p.add_argument('--candidate', type=Path, required=True)
 p.add_argument('--assets', type=Path, required=True)
 p.add_argument('--output', type=Path, required=True)
 p.add_argument('--pairs', type=int, default=3)
+p.add_argument('--workload', action='append')
+p.add_argument('--pocket-max-insns', type=int, default=0)
+p.add_argument('--candidate-revision', required=True)
+p.add_argument('--source-manifest', default='source-hashes.json')
 a = p.parse_args()
 if a.pairs < 1: p.error('--pairs must be positive')
 def sha(data): return hashlib.sha256(data).hexdigest()
 workloads = [('hello', 's3', 'none'), ('c3-hello', 'c3', 'none'), ('c6-hello', 'c6', 'none'), ('pocket-tank', 's3', 'waveshare-amoled18-v2')]
-result = {'baseline_revision': '9fdeb323837d090b038a1036d2f344566546d466', 'candidate': 'integration tree; see source-hashes.json',
+result = {'baseline_revision': '9fdeb323837d090b038a1036d2f344566546d466', 'candidate_revision': a.candidate_revision, 'source_manifest': a.source_manifest,
           'environment': {'os': platform.system(), 'arch': platform.machine(), 'rust': subprocess.check_output(['rustc', '--version'], text=True).strip()},
           'conditions': 'serial alternating pairs, no imposed load gate; short CPU samples, no isolated speed claim',
           'clock': 'delta RUSAGE_CHILDREN.ru_utime with one subprocess at a time',
           'binary_sha256': {k: sha(v.read_bytes()) for k, v in [('baseline', a.baseline), ('candidate', a.candidate)]}, 'workloads': []}
 for name, chip, board in workloads:
+    if a.workload and name not in a.workload: continue
     manifest = json.loads((a.assets / (name + '.json')).read_text())
     files = manifest['files']
     args = ['--chip', chip, '--board', board, '--boot', 'rom', '--console', 'uart0', '--no-dump', '--max-seconds', '30', '--flash-mb', str(manifest['flash_mb'])]
     if chip == 's3': args += ['--psram-mb', str(manifest['psram_mb'])]
+    if name == 'pocket-tank' and a.pocket_max_insns: args += ['--max-insns', str(a.pocket_max_insns)]
     inputs = {}
     for flag in ['rom', 'bootloader', 'ptable', 'app']:
         f = a.assets / files[flag]; inputs[files[flag]] = sha(f.read_bytes()); args += ['--' + flag, str(f)]

@@ -80,3 +80,35 @@ while native/WASM builds and smoke tests ran concurrently (emulator still alive)
 Five of six external checks passed in that run. Earlier, all six passed. This
 negative result is retained; the quiet final rerun is recorded below. No raw
 serial stream, host inventory or private temporary-state path is committed.
+
+The first WASM differential invocation used local Node 22.22.2 and was stopped
+without a verdict after more than five minutes. A one-second diagnostic sampled
+WASM instance/table bookkeeping, not idle waiting; its numeric summary, raw hash
+and redactions are in `jit-diagnostic.json`. The raw diagnostic was removed. A
+profiling build also wrote the shared test-artifact path during that invocation;
+therefore the final differential check is rebuilt and run sequentially under
+CI's Node 24 major version, after profiling compilation. No browser speed claim
+is inferred from this runtime change or the incomplete invocation.
+
+## Disabled-feature guard follow-up (EX114 / EX203)
+
+The first three alternating hello pairs on merge `60832194` retained identical
+per-core work, cycles and console hashes but measured median CPU increases of
+7.09% (S3), 4.21% (C3) and 1.72% (C6); the full samples are preserved in
+`cpu-initial.json`, with `source-hashes.json` identifying that source. The full
+30-second Pocket Tank campaign was stopped during its long-running warmup phase,
+without a Pocket Tank verdict. Its original harness is retained at `60832194`.
+
+This is a narrow EX114 retry on the combined merge, cross-referenced with EX203's
+opt-in transport contract: ULP helper setup is skipped only when the current
+controller state is Off and both private engine-active flags are false. Reset,
+Running, WakeDelay and active-engine cleanup still enter the existing path. No
+public statistics counter is used as a lifetime invariant. All peripheral clocks
+and controller deadlines still run. A missing UART TCP bridge is checked at the
+hot call site before entering its polling helper.
+
+The follow-up Pocket Tank comparison explicitly limits total instructions while
+retaining the 30-second upper bound. It is a bounded prefix, not a full inference
+throughput measurement. The harness records its exact arguments, input hashes,
+per-core counts, cycles, console hashes, alternating order and numeric CPU samples.
+No quiet-machine load gate is imposed; no other task builds/tests run concurrently.

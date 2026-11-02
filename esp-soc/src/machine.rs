@@ -527,7 +527,7 @@ impl<S: Soc> Machine<S> {
     pub fn run(&mut self, max_insns: u64) -> Stop {
         self.web_poll_input();
         #[cfg(not(target_arch = "wasm32"))]
-        self.uart_tcp_poll_input();
+        if self.uart_tcp.is_some() { self.uart_tcp_poll_input(); }
         self.refresh_irq();
         if self.bus.board_ref().uses_gpio_waveform() {
             if self.has_timing_model() { return Stop::CostModelLifecycle { kind: LifecycleKind::Attach, reason: GPIO_WAVEFORM_TIMING_ERROR.into() }; }
@@ -1091,7 +1091,7 @@ impl<S: Soc> Machine<S> {
     fn after_round_rest(&mut self) -> bool {
         let stopped = self.apply_script_events();
         #[cfg(not(target_arch = "wasm32"))]
-        self.uart_tcp_poll_input();
+        if self.uart_tcp.is_some() { self.uart_tcp_poll_input(); }
         // EX170: the cached interval filters the common not-yet-due round without the board call and
         // division; a due round re-derives it from the board before deciding, as before.
         // EX168 s4: the per-round test is two loads and a compare; the re-derivation, the push and the
