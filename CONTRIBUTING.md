@@ -86,7 +86,7 @@ use `ubuntu-24.04-arm`: the registered x64 runner cannot exercise that code.
 
 The self-hosted environment needs Git, a C linker/build toolchain, curl, tar, unzip,
 and the runtime dependencies required by GitHub's Node-based actions. CI installs
-Node 24, Python 3.12 and stable Rust with the WASM target; Pages installs Node 24
+Node 24, portable Python 3.12 through uv, and stable Rust with the WASM target; Pages installs Node 24
 and stable Rust with that target. The `docker` label selects the existing runner;
 these jobs execute directly in its environment and do not create job containers.
 If that runner is offline, its jobs queue until it returns. External PR routing
