@@ -17,9 +17,12 @@ concurrency:
   cancel-in-progress: true
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(github.repository == 'msia3dev/esp32sim' && '["self-hosted", "Linux", "X64", "docker"]' || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -47,7 +50,7 @@ jobs:
           path: web
   deploy:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(github.repository == 'msia3dev/esp32sim' && '["self-hosted", "Linux", "X64", "docker"]' || '["ubuntu-latest"]') }}
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

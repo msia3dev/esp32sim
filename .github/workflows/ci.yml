@@ -3,9 +3,13 @@ on:
   push:
     branches: ['**']
   pull_request:
+permissions:
+  contents: read
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # The fork's trusted branches use its Linux x64 runner. External PRs and upstream
+    # keep hosted runners; all labels in the self-hosted array must match.
+    runs-on: ${{ fromJSON(github.repository == 'msia3dev/esp32sim' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted", "Linux", "X64", "docker"]' || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v4
       # Node 24 LTS, not the runner image's Node 22: on 22, V8 holds the modules the WASM JIT
@@ -15,9 +19,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+      # Portable Python builds also support the Debian self-hosted environment.
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: '3.12'
+          activate-environment: true
+          enable-cache: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Evidence privacy patterns
         run: node tools/check-evidence-privacy.mjs
@@ -94,6 +105,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - uses: actions/cache@v4
         with:
