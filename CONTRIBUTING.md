@@ -77,6 +77,22 @@ The first Clippy step runs before the tests in CI, so a lint failure stops the r
 result appears. If your change touches the WebAssembly JIT, also run `tools/wasm-jit-test.sh`; the
 remaining CI steps are in the workflow file.
 
+## Fork CI runners
+
+In `msia3dev/esp32sim`, x64 CI and both Pages jobs select the self-hosted runner
+with labels `self-hosted`, `Linux`, `X64`, and `docker`. Other repositories and PRs
+from external forks keep GitHub-hosted x64 runners. Native AArch64 JIT tests still
+use `ubuntu-24.04-arm`: the registered x64 runner cannot exercise that code.
+
+The self-hosted environment needs Git, a C linker/build toolchain, curl, tar, unzip,
+and the runtime dependencies required by GitHub's Node-based actions. CI installs
+Node 24, Python 3.12 and stable Rust with the WASM target; Pages installs Node 24
+and stable Rust with that target. The `docker` label selects the existing runner;
+these jobs execute directly in its environment and do not create job containers.
+If that runner is offline, its jobs queue until it returns. External PR routing
+is a workflow policy, not host isolation; keep repository runner access restricted
+to trusted code.
+
 ## Tests
 
 [tests/README.md](tests/README.md) describes the test layers. Two rules catch most surprises:
