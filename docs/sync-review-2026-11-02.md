@@ -211,3 +211,13 @@ coprocessor reset policy. Rotation hints are optional so a missing hint preserve
 upstream manifest and built-in panel defaults. The inaccurate IndexedDB/UI claims
 were removed from both storage and WASM docs. A malformed manual-encryption
 request is bounded to the plaintext window rather than indexing past it.
+
+
+Final source qualification is recorded at `5ccdd990`: 1,546 release tests, 64
+native virtual-quantum tests, six quiet esptool/espefuse lifecycles and 13 WASM
+demos pass; Node 24 also passes 111,126 differential and 24 waveform cases. The
+EX114 follow-up retains narrow inactive-helper guards. Compared with current
+upstream, three-pair median CPU remains +2.91% S3 hello / +2.75% C3 hello /
++0.38% C6 hello, with identical guest work/output. The bounded Pocket Tank boot
+prefix is +2.00%; full inference throughput was not qualified. These are explicit
+remaining costs of the combined feature tree, not a performance-parity result.

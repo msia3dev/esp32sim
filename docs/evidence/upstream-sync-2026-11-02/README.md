@@ -107,8 +107,90 @@ public statistics counter is used as a lifetime invariant. All peripheral clocks
 and controller deadlines still run. A missing UART TCP bridge is checked at the
 hot call site before entering its polling helper.
 
-The follow-up Pocket Tank comparison explicitly limits total instructions while
-retaining the 30-second upper bound. It is a bounded prefix, not a full inference
+The follow-up Pocket Tank comparison uses `--max-insns 100000000` while
+retaining the 30-second upper bound. This flag charges scheduler work (including
+idle advancement), not only architectural retirements: the measured prefix has
+29,976,111 retired instructions across both cores and 100,000,000 cycles. It is a bounded prefix, not a full inference
 throughput measurement. The harness records its exact arguments, input hashes,
 per-core counts, cycles, console hashes, alternating order and numeric CPU samples.
 No quiet-machine load gate is imposed; no other task builds/tests run concurrently.
+
+
+### Guard result and adoption
+
+Source `5ccdd9906d60817c3890613ffddb904616bb932f`, manifest
+`source-hashes-guard.json`, baseline `9fdeb323`, three alternating pairs after one
+warmup per binary/workload. Samples and exact input/command/work/output checks are
+in `cpu-guard.json`; all four workloads match per-core counts, cycles and console
+SHA-256 in every sample.
+
+| Workload | Upstream median user CPU (s) | Guard median user CPU (s) | Delta |
+| --- | ---: | ---: | ---: |
+| S3 hello, 30 emulated s | 0.368770 | 0.379506 | +2.91% |
+| C3 hello, 30 emulated s | 4.415482 | 4.537026 | +2.75% |
+| C6 hello, 30 emulated s | 2.721562 | 2.731891 | +0.38% |
+| Pocket Tank bounded boot prefix | 0.236515 | 0.241238 | +2.00% |
+
+The guard variant remains slower in all three pairs for each workload. These
+short samples do not demonstrate performance parity. The initial and guard
+campaigns are separate comparisons against upstream, not an isolated paired
+ablation of the guards. The guard is retained as a correctness-preserving bound
+on unused helper work, with the remaining combined-feature CPU cost disclosed.
+The Pocket Tank prefix ends after about 0.417 emulated seconds; it does not
+qualify model inference speed. The stopped full-length campaign has no verdict.
+
+Host: macOS 27.0.1, arm64, Rust 1.99.1. CPU model was not recorded; global load
+averages are retained per sample, without process/application inventories.
+Reproduce the guard campaign from this source with:
+
+```sh
+python3 docs/evidence/upstream-sync-2026-11-02/compare.py \
+  --baseline "$BASELINE/target/release/esp32sim" \
+  --candidate "$CANDIDATE/target/release/esp32sim" \
+  --assets "$CANDIDATE/web/wasm/fw" --output cpu-guard.json --pairs 3 \
+  --pocket-max-insns 100000000 --candidate-revision 5ccdd9906d60817c3890613ffddb904616bb932f \
+  --source-manifest source-hashes-guard.json
+```
+
+The final quiet lifecycle run passed all six S3/C3/C6 flash/boot and eFuse-restart
+checks (49.07 s wall), followed by two additional isolated C3 flash passes
+(9.92 s and 9.18 s). The earlier concurrent-load timeout remains a limitation of
+the wall-clock-sensitive external harness, not evidence of lossless operation
+under arbitrary host load.
+
+
+## Final guarded-tree qualification
+
+The full release suite was repeated on `5ccdd990`: **1,546 passed / 0 failed**;
+the native virtual-quantum variant again passed **64** tests. Production WASM
+build/sections, all **13** demos, timing/BLE ABI checks and profiling feature
+compilation passed. Native and WASM Clippy both passed with warnings denied.
+The sequential Node **24.22.2** differential run passed **111,126** cases with
+**99,679** generated modules released; the separate waveform invocation passed
+**24** cases with **738** modules released. The final quiet flashing/eFuse lifecycle
+checks (S3, C3 and C6) passed **6/6** in 47.06 s wall.
+`validation.json` records the counts, versions, production artifact hash and limits;
+`esptool-environment.txt` pins the temporary external-test dependencies.
+
+Representative final commands (run from the candidate tree):
+
+```sh
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --release --target wasm32-unknown-unknown -p esp32sim-wasm --features jit-tests -- -D warnings
+ESP32SIM_ROM_DIR="$ROMS" cargo test --release --workspace --no-fail-fast -- --include-ignored --skip external_
+ESP32SIM_VQ_NATIVE=1 cargo test --release -p esp32s3 --test machine --test virtual_stops
+ESP32SIM_ROM_DIR="$ROMS" ESPTOOL_PYTHON="$ESPTOOL_PYTHON" cargo test --release -p esp32sim --test esptool -- --ignored --test-threads=1
+tools/wasm-build.sh
+node tools/check-wasm-sections.mjs web/wasm/esp32sim.wasm
+ESP32SIM_ROM_DIR="$ROMS" node tools/wasm-test.mjs hello c3-hello c6-hello p4-hello p4-c6-hosted p4-lcd35-synth c6-energy-scan c6-contiki c6-contiki-net c6-rpl-net panel tdisplay-prices tdisplay-schematik
+tools/wasm-jit-test.sh
+. ./tools/wasm-rustflags.sh
+cargo build --release --target wasm32-unknown-unknown -p esp32sim-wasm --features jit-profile,cpu-profile
+```
+
+The JIT differential and profiling builds are sequential because they share the
+same target artifact path. The production web module is a separate copied file.
+Some local lint/debug invocations used `--target-dir target-wasm` to avoid build
+locks; final release tests and production/test builds use the standard directory.
+The receipt omits raw console/build logs and the removed diagnostic's identifying
+headers; numeric results, hashes, source revisions and failures are preserved.

@@ -1,0 +1,53 @@
+{
+  "source_revision": "5ccdd9906d60817c3890613ffddb904616bb932f",
+  "upstream_revision": "9fdeb323837d090b038a1036d2f344566546d466",
+  "native_release": {
+    "passed": 1546,
+    "failed": 0,
+    "targets": 148
+  },
+  "native_virtual_quanta": {
+    "passed": 64,
+    "failed": 0,
+    "targets": 2
+  },
+  "esptool_espefuse_quiet": {
+    "passed": 6,
+    "failed": 0,
+    "targets": 1
+  },
+  "wasm_demo_smokes": 13,
+  "wasm_differential_cases": 111126,
+  "wasm_differential_modules_released": 99679,
+  "gpio_waveform_cases": 24,
+  "gpio_modules_released": 738,
+  "native_and_wasm_clippy_warnings_denied": "passed",
+  "profiling_features_build": "passed",
+  "timing_ble_abi": "passed",
+  "js_regressions": 28,
+  "python_harness_tests": 15,
+  "worker_tests": "passed",
+  "retained_receipts": "passed",
+  "goldens_regenerated": false,
+  "versions": {
+    "rust": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "node": "24.22.2",
+    "python": "3.14.7",
+    "esptool": "4.8.1",
+    "bitstring": "4.3.1",
+    "os": "macOS 27.0.1",
+    "arch": "arm64"
+  },
+  "production_wasm_sha256": "52addfa44dcb79e503e4f379d42e1173f54edea90965541a0f017a435d1adda8",
+  "production_wasm_sections": {
+    "dwarfAbsent": true,
+    "nameRetained": true,
+    "bytes": 4158783
+  },
+  "limitations": [
+    "Dedicated WASM ULP fixture parity remains unqualified.",
+    "Pocket Tank CPU samples cover a bounded boot prefix, not model inference.",
+    "All paired workloads remain slower than upstream; no performance parity claim.",
+    "The external flashing harness timed out under concurrent host load before quiet passes."
+  ]
+}
