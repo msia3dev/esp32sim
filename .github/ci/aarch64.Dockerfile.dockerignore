@@ -1,0 +1,7 @@
+.git
+**/target
+**/target-*
+.venv
+.idea
+node_modules
+**/node_modules

@@ -77,21 +77,30 @@ The first Clippy step runs before the tests in CI, so a lint failure stops the r
 result appears. If your change touches the WebAssembly JIT, also run `tools/wasm-jit-test.sh`; the
 remaining CI steps are in the workflow file.
 
-## Fork CI runners
+## Self-hosted CI runners
 
-In `msia3dev/esp32sim`, x64 CI and both Pages jobs select the self-hosted runner
-with labels `self-hosted`, `Linux`, `X64`, and `docker`. Other repositories and PRs
-from external forks keep GitHub-hosted x64 runners. Native AArch64 JIT tests still
-use `ubuntu-24.04-arm`: the registered x64 runner cannot exercise that code.
+Every CI and Pages job selects `[self-hosted, Linux, X64, docker]`, including
+pull requests. There is no GitHub-hosted fallback; jobs queue when no matching
+runner is online. The runner needs Git, a C linker/build toolchain, curl, tar,
+unzip, Docker access, and the runtime dependencies for GitHub's Node-based actions.
+CI installs Node 24, portable Python 3.12 through uv, and stable Rust with Clippy
+and the WASM target. Pages installs the same Node and Python versions and stable
+Rust with the WASM target.
 
-The self-hosted environment needs Git, a C linker/build toolchain, curl, tar, unzip,
-and the runtime dependencies required by GitHub's Node-based actions. CI installs
-Node 24, portable Python 3.12 through uv, and stable Rust with the WASM target; Pages installs the same
-Node and Python versions and stable Rust with that target for its asset-fetch scripts. The `docker` label selects the existing runner;
-these jobs execute directly in its environment and do not create job containers.
-If that runner is offline, its jobs queue until it returns. External PR routing
-is a workflow policy, not host isolation; keep repository runner access restricted
-to trusted code.
+The ARM64 job builds [.github/ci/aarch64.Dockerfile](.github/ci/aarch64.Dockerfile)
+on the x64 runner. Its cross compiler builds the unchanged ARM64 code and tests;
+`qemu-aarch64` executes the ARM64 binaries, including the architecture-specific
+JIT tests and firmware goldens. No privileged container or host binfmt changes
+are needed. This verifies execution under QEMU, not physical ARM hardware or
+native ARM performance. Reproduce it with:
+
+```sh
+docker build --platform linux/amd64 --progress=plain --file .github/ci/aarch64.Dockerfile .
+```
+
+All PRs run on self-hosted infrastructure under this policy. Use repository-level
+workflow approval/access controls for untrusted contributions; the container is
+an execution environment, not an isolation guarantee for arbitrary workflow code.
 
 ## Tests
 
