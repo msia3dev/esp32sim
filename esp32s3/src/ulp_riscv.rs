@@ -123,7 +123,7 @@ pub struct UlpRiscVEngine {
 }
 
 impl UlpRiscVEngine {
-    pub fn new() -> Self { Self { cpu: Cpu::new(), traps: 0, wake_requests: 0, last_trap: None, active: false, phase: 0 } }
+    pub fn new() -> Self { let mut cpu = Cpu::new(); cpu.user_counters = true; Self { cpu, traps: 0, wake_requests: 0, last_trap: None, active: false, phase: 0 } }
 
     pub(crate) fn reconcile(&mut self, bus: &mut UlpRiscVBus<'_>) {
         if bus.rtc.ulp.architecture != UlpArchitecture::RiscV || bus.rtc.ulp.state != UlpState::Running {

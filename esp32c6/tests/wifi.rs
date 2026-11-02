@@ -12,7 +12,7 @@ const STATION: [u8; 6] = [0xdc, 0x1e, 0xd5, 0x6e, 0x8c, 0xdc];
 fn run_ms(m: &mut esp32c6::Machine, ms: u32) { for _ in 0..ms { m.bus.tick(160_000); } }
 fn machine_with_ap() -> esp32c6::Machine {
     let mut m = esp32c6::machine(STATION, 4 << 20);
-    m.bus.periph.wifi_mac.ap = Some(VirtualAp::new(ApConfig::parse("").unwrap(), false));
+    m.bus.periph.wifi_mac.link.attach(Some(VirtualAp::new(ApConfig::parse("").unwrap(), false)), None);
     m
 }
 
@@ -103,8 +103,8 @@ fn a_beacon_fills_the_next_rx_descriptor() {
     run_ms(&mut m, 110);
     assert_eq!(m.bus.read32(d1).unwrap() >> 30, 3);
     run_ms(&mut m, 110);
-    assert_eq!(m.bus.periph.wifi_mac.rx_frames, 2, "both descriptors are full; nothing is overwritten");
-    assert!(m.bus.periph.wifi_mac.rx_dropped > 0);
+    assert_eq!(m.bus.periph.wifi_mac.link.rx_frames(), 2, "both descriptors are full; nothing is overwritten");
+    assert!(m.bus.periph.wifi_mac.link.rx_dropped() > 0);
 }
 
 /// A probe request leaves queue 0: the packet is an 8-byte header (the frame's length in its
@@ -128,12 +128,12 @@ fn a_probe_request_leaves_its_tx_queue_and_is_answered() {
     assert_eq!(m.bus.read32(MAC + 0xd6c).unwrap() >> 30, 0, "the start bits are the hardware's to clear");
     m.bus.write32(MAC + 0xcb4, 1).unwrap();
     assert_eq!(m.bus.read32(MAC + 0xcb8).unwrap(), 0);
-    assert_eq!(m.bus.periph.wifi_mac.ap.as_ref().unwrap().stats.1, 1, "one probe response");
+    assert_eq!(m.bus.periph.wifi_mac.link.ap().unwrap().stats.1, 1, "one probe response");
 
     // +0xCB8 and +0xC8C are 16-byte steps below queue 0 too, but past queue 10: not queues
     m.bus.write32(MAC + 0xc8c, 0xc000_0000).unwrap();
     run_ms(&mut m, 1);
-    assert_eq!(m.bus.periph.wifi_mac.tx_frames, 1);
+    assert_eq!(m.bus.periph.wifi_mac.link.tx_frames(), 1);
 }
 
 /// AES-128 ECB of the FIPS-197 vector through GDMA peripheral 6, which is how ESP-IDF's driver
@@ -164,4 +164,30 @@ fn aes_runs_through_gdma() {
     let dw0 = m.bus.read32(in_desc).unwrap();
     assert_eq!((dw0 >> 12 & 0xfff, dw0 >> 30), (16, 1), "16 bytes, SUC_EOF, owner back with the CPU");
     assert!(!m.bus.periph.gdma.gdma.inp[0].running && !m.bus.periph.gdma.gdma.out[0].running);
+}
+
+#[test]
+fn txdc_and_calibration_status_follow_start_without_a_clock() {
+    let mut bb = ModemBb::new();
+    assert_eq!(bb.clock(), None);
+    for (start, status, done) in [(0x418, 0x418, 1 << 22), (0x810, 0x814, 7 << 14)] {
+        for _ in 0..2 {
+            bb.write(start, 0);
+            assert_eq!(bb.read(status) & done, 0);
+            bb.write(status, done);
+            assert_eq!(bb.read(status) & done, 0, "software cannot set DONE");
+            bb.write(start, 1);
+            assert_eq!(bb.read(status) & done, done);
+            if status != start { assert_eq!(bb.read(status) & !done, 0, "ideal zero comparator output"); }
+        }
+    }
+}
+
+#[test]
+fn txdc_comparator_outputs_ignore_software_writes() {
+    let mut bb = ModemBb::new();
+    bb.write(0x418, u32::MAX);
+    assert_eq!(bb.read(0x418), 0x007f_ffff);
+    bb.write(0x814, u32::MAX);
+    assert_eq!(bb.read(0x814), 0);
 }

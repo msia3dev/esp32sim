@@ -96,27 +96,15 @@ eFuse state may contain security-sensitive material if firmware burns it. Keep
 state files private, never commit production keys, and avoid printing or sharing
 their contents.
 
-## Browser persistence
+## Browser storage API
 
-The WebAssembly UI stores ESP32-S3 state in IndexedDB; binary flash is not put
-in `localStorage` and nothing is uploaded.
+The S3 WebAssembly ABI exposes flash/eFuse export, import and a dirty generation
+counter for a frontend persistence backend. The current page does not implement
+IndexedDB profiles, automatic saving, or import/export controls. Browser state is
+therefore not retained across page reloads by this implementation.
 
-Open **Configure** and use:
-
-- **persist state** to enable or disable browser persistence;
-- **profile** to name an independent virtual device;
-- **Export state** to download flash and eFuse files;
-- **Import** to replace flash or eFuse state after validating its size;
-- **Clear state** to remove only the selected profile after confirmation.
-
-The profile identity includes ESP32-S3, board name, flash size and the visible
-profile name. Browser storage is scoped to the page's origin, so `localhost`,
-`127.0.0.1`, another port and a hosted site have separate IndexedDB data.
-
-Dirty state is saved after a short debounce and when the page is hidden or
-unloaded where the browser permits it. Reload after an import or clear operation
-to boot from the replacement/fresh state. Browser persistence currently applies
-to one ESP32-S3 machine, not C3/C6 or multi-node network manifests.
+The proposed frontend workflow is described in [the storage plan](storage-plan.md).
+Native `--flash-state` and `--efuse-state` are implemented on S3, C3 and C6.
 
 ## Common mistakes
 
@@ -124,8 +112,7 @@ to one ESP32-S3 machine, not C3/C6 or multi-node network manifests.
   Select a fresh state path or delete the old state intentionally.
 - **State size error:** `--flash-mb` and the flash-state file must agree; eFuse
   state must be either the native 336-byte payload or a 1 KiB QEMU backing file.
-- **NVS disappeared:** both runs must use the same `--flash-state` path or the
-  same browser profile and origin.
+- **NVS disappeared:** both runs must use the same `--flash-state` path. The page does not yet persist state across reloads.
 - **An eFuse bit will not clear:** physical eFuses are one-time programmable;
   create a fresh eFuse-state file instead.
 - **An `espefuse` burn disappeared:** use the same `--efuse-state` path on the

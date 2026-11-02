@@ -25,6 +25,8 @@ impl<'a, B> RecordingBus<'a, B> {
 }
 
 impl<B: Bus> Bus for RecordingBus<'_, B> {
+    fn reserve(&mut self, addr: u32) { self.bus.reserve(addr) }
+    fn reservation_held(&mut self, addr: u32) -> bool { self.bus.reservation_held(addr) }
     fn read8(&mut self, address: u32) -> Result<u8, Fault> {
         let result = self.bus.read8(address);
         self.accesses.push(MemoryAccess { kind: MemoryAccessKind::Read, address, width: 1, value: result.unwrap_or(0) as u32, fault: result.err() });
@@ -75,7 +77,7 @@ impl<B: Bus> Bus for RecordingBus<'_, B> {
 impl<S: Soc> Machine<S> {
     pub(super) fn run_approximate_jit_frontiers(&mut self, max_insns: u64) -> Stop {
         let (cpi, quantum) = self.approximate_jit_timing.unwrap();
-        self.stub_bloom = self.stubs.keys().fold(0, |m, &pc| m | pc_bit(pc));
+        self.stub_bloom = self.stubs.keys().chain(S::function_hooks(&self.bus)).fold(0, |m, &pc| m | pc_bit(pc));
         self.probe_bloom = self.fn_probes.keys().fold(0, |m, &pc| m | pc_bit(pc));
         for core in &mut self.cores {
             core.set_boundaries(self.stub_bloom | self.probe_bloom);
@@ -153,7 +155,7 @@ impl<S: Soc> Machine<S> {
 
     pub(super) fn run_modeled(&mut self, max_insns: u64) -> Stop {
         if let Some(stop) = &self.model_stop { return stop.clone(); }
-        self.stub_bloom = self.stubs.keys().fold(0, |mask, &pc| mask | pc_bit(pc));
+        self.stub_bloom = self.stubs.keys().chain(S::function_hooks(&self.bus)).fold(0, |mask, &pc| mask | pc_bit(pc));
         self.probe_bloom = self.fn_probes.keys().fold(0, |mask, &pc| mask | pc_bit(pc));
         for core in &mut self.cores { core.set_boundaries(self.stub_bloom | self.probe_bloom); core.flush_caches(); }
         for observer in &mut self.observers { observer.on_modeled_run(); }
@@ -215,7 +217,7 @@ impl<S: Soc> Machine<S> {
                 CoreState::Running => {
                     if self.core_held[i] {
                         self.core_held[i] = false;
-                        S::reset_core(&mut self.cores[i], i);
+                        S::reset_core_with_bus(&mut self.cores[i], &mut self.bus, i);
                         self.model_ready_at[i] = self.bus.cycles();
                         if trace { eprintln!("          ** core{} released from reset", i); }
                         let facts = LifecycleFacts { kind: LifecycleKind::CoreReset(i), chip: S::NAME, cores: S::CORES, cpu_hz: S::CPU_HZ };
@@ -289,6 +291,7 @@ impl<S: Soc> Machine<S> {
     }
 
     fn step_core_modeled(&mut self, core: usize) -> Result<u32, Stop> {
+        S::select_core(&mut self.bus, core);
         let pc = self.cores[core].pc();
         if self.probe_bloom & pc_bit(pc) != 0 && !self.cores[core].waiting() {
             if let Some(name) = self.fn_probes.get(&pc) {
@@ -297,7 +300,7 @@ impl<S: Soc> Machine<S> {
                 eprintln!("[fn] i={} t={:.4}s c{} {}({}) ret={:#x}", cpu.insn_count(), self.bus.cycles() as f64 / S::CPU_HZ as f64, core, name, args, ret);
             }
         }
-        if self.stub_bloom & pc_bit(pc) != 0 && !self.cores[core].waiting() && self.stubs.contains_key(&pc) {
+        if self.stub_bloom & pc_bit(pc) != 0 && !self.cores[core].waiting() && (self.stubs.contains_key(&pc) || S::function_hooks(&self.bus).contains(&pc)) {
             return Err(Stop::CostModel { core, pc, reason: "function stubs are unsupported by modeled execution".into() });
         }
         {

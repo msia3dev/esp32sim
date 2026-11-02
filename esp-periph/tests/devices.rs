@@ -120,9 +120,23 @@ fn systimer_one_shot_fires_on_its_tick_and_says_when() {
 }
 
 #[test]
+fn systimer_unit0_counts_from_reset() {
+    // SYSTIMER_CONF resets to 0x4600_0000, TIMER_UNIT0_WORK_EN set (esp32s3 PAC 0.36,
+    // systimer/conf.rs RESET_VALUE; the C3's and C6's are the same). esp-hal never writes it:
+    // `Instant::now` reads unit 0 from power-on.
+    let mut s = Systimer::new();
+    assert_eq!(Device::read(&mut s, 0x0), 0x4600_0000);
+    Device::tick(&mut s, 16);
+    Device::write(&mut s, 0x4, 1 << 30);                     // UNIT0_OP.UPDATE
+    assert_eq!(Device::read(&mut s, 0x44), 16, "unit 0 counts");
+    Device::write(&mut s, 0x8, 1 << 30);
+    assert_eq!(Device::read(&mut s, 0x4c), 0, "unit 1 does not");
+}
+
+#[test]
 fn systimer_periodic_repeats() {
     let mut s = Systimer::new();
-    Device::write(&mut s, 0x0, (1 << 30) | (1 << 25));      // unit 0, comparator 1
+    Device::write(&mut s, 0x0, (1 << 30) | (1 << 23));      // unit 0, comparator 1 (TARGET1_WORK_EN is bit 23)
     Device::write(&mut s, 0x38, (1 << 30) | 50);             // periodic, 50 ticks
     Device::write(&mut s, 0x54, 1);                          // COMP1_LOAD
     Device::write(&mut s, 0x64, 2);
@@ -170,6 +184,33 @@ fn timer_group_rtc_calibration_uses_the_selected_clock() {
     assert_eq!(value(&mut timer), cycles * 40_000_000 / 32_768);
 }
 
+#[test]
+fn timer_group_resets_to_divider_one_which_divides_by_two() {
+    let mut g = TimerGroup::new();
+    assert_eq!(Device::read(&mut g, 0x0), 0x6000_2000, "T0CONFIG: up, autoreload, divider 1");
+    Device::write(&mut g, 0x0, (1 << 31) | (1 << 30) | (1 << 10) | (1 << 13));   // enabled, up, alarm, divider 1
+    Device::write(&mut g, 0x10, 10);                         // alarm = 10 -> 20 APB ticks
+    Device::write(&mut g, 0x70, 1);
+    Device::tick(&mut g, 19);
+    assert_eq!(Device::irq_sources(&g), 0);
+    Device::tick(&mut g, 1);
+    assert_eq!(Device::irq_sources(&g), 1, "divider 1 divides by 2, as divider 2 does");
+}
+
+#[test]
+fn timer_group_one_shot_alarm_at_the_counter_fires_at_once() {
+    // esp-rtos arms 0 ticks, on a counter it has just reset to 0, for a wakeup already due.
+    let mut g = TimerGroup::new();
+    Device::write(&mut g, 0x70, 1);
+    Device::write(&mut g, 0x18, 0); Device::write(&mut g, 0x1c, 0); Device::write(&mut g, 0x20, 1);   // load 0
+    Device::write(&mut g, 0x10, 0); Device::write(&mut g, 0x14, 0);   // alarm 0
+    Device::write(&mut g, 0x0, (1 << 31) | (1 << 30) | (1 << 10) | (2 << 13));   // enabled, up, one-shot alarm
+    assert_eq!(Device::next_deadline(&g), Some(0), "due now");
+    Device::tick(&mut g, 1);
+    assert_eq!(Device::irq_sources(&g), 1);
+    assert_eq!(Device::read(&mut g, 0x0) & (1 << 10), 0, "a one-shot alarm disarms itself");
+}
+
 // ------------------------------------------------------------------ GPIO
 #[test]
 fn gpio_edges_and_interrupt_types() {
@@ -180,7 +221,7 @@ fn gpio_edges_and_interrupt_types() {
     assert_eq!(g.changes, vec![(5, true), (5, false)], "output edges in order, only for enabled pins");
     // pin 7: rising-edge interrupt, enabled for core 0
     Device::write(&mut g, 0x74 + 4 * 7, (1 << 7) | (1 << 13));
-    assert!(!g.set_input(7, false)); assert_eq!(Device::irq_sources(&g), 0);
+    assert!(g.set_input(7, false)); assert_eq!(Device::irq_sources(&g), 0);
     assert!(g.set_input(7, true), "a rising edge latches STATUS");
     assert_eq!(Device::irq_sources(&g), 1);
     Device::write(&mut g, 0x4c, 1 << 7);                     // STATUS_W1TC
@@ -410,4 +451,67 @@ fn rng_sequence_from_the_default_seed_plus_the_cycle_count() {
 
     assert_eq!(Device::read(&mut Rng::with_seed(0x2545_f491), 0), 0xe124_b63a, "with_seed(DEFAULT_SEED) is new()");
     assert_eq!(Device::read(&mut Rng::default(), 0), 0xe124_b63a);
+}
+
+#[derive(Default)]
+struct OptionalProbe { active: bool, stop: bool, irq: u64, polls: std::cell::Cell<u32>, ticks: u64 }
+impl Device for OptionalProbe {
+    fn read(&mut self, _off: u32) -> u32 { 0 }
+    fn write(&mut self, _off: u32, v: u32) -> WriteEffect {
+        self.active = v & 1 != 0; self.stop = v & 2 != 0; self.irq = 0; WriteEffect::NONE
+    }
+    fn clock(&self) -> Option<ClockDomain> {
+        self.polls.set(self.polls.get() + 1);
+        if self.active { Some(ClockDomain::Apb) } else { None }
+    }
+    fn irq_sources(&self) -> u64 { self.polls.set(self.polls.get() + 1); self.irq }
+    fn has_deadline(&self) -> bool { self.polls.set(self.polls.get() + 1); self.active }
+    fn next_deadline(&self) -> Option<u64> { self.polls.set(self.polls.get() + 1); self.active.then_some(7) }
+    fn tick(&mut self, ticks: u64) { self.ticks += ticks; self.irq = 1; if self.stop { self.active = false; } }
+}
+struct OptionalChip { pwm: OptionalProbe, other: Probe, misc: Misc, clock: ClockTree<1> }
+device_set! { OptionalChip; clock: (clock) 240_000_000, [(ClockDomain::Apb, 3)];
+    0x01 "PWM" optional (pwm) => [40];
+    0x02 "OTHER" (other) => [7];
+}
+impl DeviceSet for OptionalChip {
+    const BASE: u32 = BASE;
+    fn block_name(_block: u32) -> &'static str { "PWM" }
+    fn misc(&self) -> &Misc { &self.misc }
+    fn misc_mut(&mut self) -> &mut Misc { &mut self.misc }
+}
+
+#[test]
+fn optional_devices_are_not_polled_until_configured_and_keep_stopped_irqs() {
+    let mut c = OptionalChip { pwm: OptionalProbe::default(), other: Probe::default(), misc: Misc::new(), clock: OptionalChip::new_clock() };
+    for _ in 0..10 {
+        assert!(!Dispatch::tick(&mut c, 15));
+        assert_eq!(c.source_status(), [0; 4]);
+        assert_eq!(c.cycles_until_deadline(), u32::MAX);
+    }
+    mmio::write32(&mut c, BASE + 0x2000, 1);
+    c.other.irq = 1;
+    assert_eq!(c.source_status(), [1 << 7, 0, 0, 0]);
+    c.other.irq = 0;
+    assert_eq!(c.pwm.polls.get(), 0, "ordinary writes and IRQ scans do not poll optional devices");
+    assert_eq!(c.pwm.ticks, 0);
+    mmio::write32(&mut c, BASE + 0x1000, 1);
+    assert_eq!(c.misc.active_optional, [1]);
+    assert_eq!(c.cycles_until_deadline(), 18, "active optional deadline uses the APB divider");
+    c.other.domain = Some(ClockDomain::Apb);
+    assert!(Dispatch::tick(&mut c, 15));
+    assert_eq!((c.pwm.ticks, c.other.ticks), (5, 5), "both devices receive the same clock delta");
+    assert_eq!(c.source_status(), [0, 1 << 8, 0, 0]);
+    mmio::write32(&mut c, BASE + 0x1000, 3);
+    assert_eq!(c.misc.active_optional, [1], "no duplicate registration");
+    assert_eq!(c.source_status(), [0; 4], "write cleared the cached interrupt");
+    assert!(Dispatch::tick(&mut c, 15));
+    assert!(c.misc.active_optional.is_empty(), "one-shot stopped");
+    let polls = c.pwm.polls.get();
+    assert_eq!(c.cycles_until_deadline(), u32::MAX, "stopped optional device has no deadline");
+    assert!(!Dispatch::tick(&mut c, 15));
+    assert_eq!(c.source_status(), [0, 1 << 8, 0, 0], "stopping preserves an asserted interrupt");
+    assert_eq!(c.pwm.polls.get(), polls, "stopped device is not polled");
+    mmio::write32(&mut c, BASE + 0x1000, 0);
+    assert_eq!(c.source_status(), [0; 4]);
 }

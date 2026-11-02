@@ -3,12 +3,12 @@
 Status (2026-09-21): it runs. The specimen joins a real WPA2 network on the board (five of five
 gateway pings), and in the emulator the same unmodified image scans, finds the virtual access
 point, joins it through the WPA2 four-way handshake, takes a DHCP lease and gets five of five
-pings answered (`esp32sim-c6 --wifi ssid=esp32sim,psk=esp32sim-pass --stub bb_init=0`), with the
+pings answered (`esp32sim-c6 --wifi ssid=esp32sim,psk=esp32sim-pass`), with the
 same console lines and the same screen. What it took: three handshakes the library waits on
 (baseband channel switch and IQ estimate, the MAC core's ready flag), the MAC's events, RX ring
 and TX queues at the C6's offsets and with the C6's formats (below), AES through GDMA for the
 supplicant's key unwrap, and the access point, network and NAT moved out of the S3 crate into
-`esp-soc`. Not done: the PHY's baseband calibration is still the `bb_init` stub, the TSF and the
+`esp-soc`. Not done: the TSF and the
 power block are register RAM, and nothing beyond one station on one open or WPA2 network has
 been tried. The browser build runs it too, from a local manifest (the example's README).
 
@@ -186,7 +186,7 @@ polling the AP on every emulated CPU cycle. Preserve deterministic ordering when
 completion, RX frame, and 802.15.4 event become due together.
 
 Add `--wifi` parsing for the C6 only after this phase passes. Keep the option rejected on C3 and
-other unsupported targets. The C6 option should accept the same basic `ssid`, `chan`, `bssid`,
+other unsupported targets (since done: the C3 gained WiFi in #170). The C6 option should accept the same basic `ssid`, `chan`, `bssid`,
 and `psk` syntax as S3 so test scripts can switch targets without changing their network setup.
 
 ## Phase 3: reuse the virtual AP and WPA2 implementation
@@ -212,7 +212,8 @@ The C6 bus code should convert completed WiFi data frames to Ethernet payloads a
 that common network module. NAT remains unavailable in browser builds where host sockets are not
 available; the browser can still exercise association and the isolated virtual subnet.
 
-Inbound port forwarding, multicast/mDNS, roaming, and real LAN bridging are follow-up features.
+UDP inbound, multicast/mDNS, roaming, and real LAN bridging are follow-up features. TCP inbound
+uses the shared `--hostfwd` NAT option.
 
 ## Phase 5: coexistence and performance
 

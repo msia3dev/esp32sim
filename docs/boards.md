@@ -7,8 +7,14 @@ the C6's boards live in `esp32c6::board`):
 pub trait BoardModel {
     fn name(&self) -> &'static str;
     fn gpio_changes(&mut self, changes: &[(u8, bool)]) {}      // output edges, in order
-    fn rmt_frame(&mut self, ch: usize, bits: &[bool]) {}       // a decoded RMT transmission
+    fn gpio_output_at(&mut self, cycle: VirtualCycle, changes: &[(u8, bool)], enabled: u64, output: u64) {}
+    fn uses_spi_pins(&self) -> bool                          // opt in to route decoding
+    fn spi_transfer_pins(&mut self, host: u8, pins: SpiPins, tx: &[u8], rx_len: usize) -> Vec<u8>
+    fn rmt_frame(&mut self, pin: u8, bits: &[bool]) {}       // a decoded RMT transmission
     fn spi_transfer(&mut self, host: u8, tx: &[u8], rx_len: usize) -> Vec<u8>
+    fn uses_uart_pins(&self) -> bool                         // opt in to UART routes and polling
+    fn uart_tx(&mut self, cycle: VirtualCycle, route: UartRoute, byte: u8) {}
+    fn uart_rx(&mut self, cycle: VirtualCycle) -> Vec<UartInput>
     fn i2c_devices(&mut self) -> Vec<(u8, u8, Box<dyn I2cDevice>)> // (bus, address, device)
     fn display(&self) -> Option<(u32, u32, Vec<u16>, u64)>    // for the UI/PNG: w, h, RGB565, change counter
     fn leds(&self) -> Option<(&[[u8; 3]], u64)>               // LED ring/strip colours, change counter
@@ -16,6 +22,7 @@ pub trait BoardModel {
     fn touch_at(&mut self, _cycle: VirtualCycle, x: u16, y: u16, down: bool) {
         self.touch(x, y, down);                                // default for untimed boards
     }
+    fn uses_gpio_edges(&self) -> bool                         // false for boards without timed GPIO input
     fn next_deadline(&self) -> Option<VirtualCycle>           // next autonomous board transition
     fn advance_to(&mut self, cycle: VirtualCycle)                    // advance through due transitions
     fn take_edges(&mut self) -> Vec<BoardEdge>                // timestamped GPIO input edges
@@ -28,6 +35,16 @@ pub trait BoardModel {
     fn camera_preview(&self, w: u32, h: u32) -> Option<Vec<u8>>       // RGB for the UI
 }
 ```
+
+`gpio_output_at` includes output-enable changes and emulated bus cycles. Its default calls
+`gpio_changes` for level changes. `uses_spi_pins` enables `spi_transfer_pins`, whose `SpiPins`
+contains physical SCLK/MOSI/CS masks and a MISO pin. `I2cDevice::pins` optionally binds
+a device to (SDA, SCL); fixed devices keep their controller-only behavior.
+`esp_soc::pins::ChipPins` decodes GPIO matrix and IO_MUX routes.
+
+After assigning or replacing `bus.board`, call `bus.attach_board_devices()` to
+attach devices and refresh cached board capabilities. `uses_gpio_edges` defaults
+to true; `NoBoard` returns false so C3 skips its deadline and edge callbacks.
 
 The SoC model produces the events; the board interprets them. `make_board(name)` maps the
 `--board` argument to an implementation.
@@ -86,6 +103,93 @@ combination is not selected by this board name. It needs `--flash-mb 16 --psram-
 Board input edges retain their intended timestamps. The current fast scheduler applies them to
 the SoC at its next existing bus tick.
 
+### Reusing the CO5300 panel
+
+`esp_soc::devices::co5300::Co5300::new(width, height, column_offset)` takes the
+RAM window from the board. Waveshare passes 368, 448 and 16. The StopWatch
+firmware's `main/panel.hpp` and `main/panel.cpp` on
+[`device`](https://github.com/aliceisjustplaying/stopwatch/tree/device/main)
+use 468, 466 and 6: CASET 6..473, RASET 0..465. The framebuffer stride is 468,
+not the round glass's 466-pixel diameter. RAMWR starts at the window origin;
+RAMWRC and split pixel transfers continue the same row-major RGB565 stream.
+
+The model retains STE (`0x44`, two-byte big-endian row), TE on (`0x35`) and TE off
+(`0x34`). A board can opt into `with_scan(Co5300Scan { lines, period, pulse_width,
+pin })` and delegate its `advance_to`, `next_deadline`, `take_edges` and
+`input_levels` hooks to the panel (`tear_input` supplies the pin and level).
+The board must advance the panel to the current virtual cycle before delivering
+SPI commands. No new board trait or scheduler path is needed.
+
+**This scan is synthetic, not measured StopWatch timing.** Its phase is anchored
+at virtual cycle zero, including while TE is disabled. Row `r` is crossed at
+`frame_start + floor(r * period / lines)`. Programming STE selects the next
+strictly future crossing, without restarting the scan or generating an immediate
+edge at the command. A row outside `0..lines` has no crossing. Each rising edge
+is followed by a falling edge `pulse_width` cycles later. Changing STE during a
+high pulse preserves that falling deadline; crossings while already high do not
+extend the pulse. TE off immediately drives a high signal low and cancels future
+edges. Reset clears RAM and command state, disables TE and retains the board's
+geometry, scan parameters and absolute phase. Sleep, display power, analog rails,
+porches and progressive scanout are not modeled.
+
+The directed tests choose 500 lines, a 15,000-cycle period and a 120-cycle pulse.
+Treating a test cycle as one microsecond, alternating STE 0 and 320 gives gaps of
+9,600 and 5,400 microseconds. The firmware's 16-sample `measure_scan` calculation
+recovers 30,000 ns per line and 500 scan lines. A board using a 240 MHz virtual
+clock would multiply those microsecond values by 240; these are functional model
+parameters, not a hardware calibration or evidence of tear-free rendering.
+
+Waveshare does not opt into this scan. Its existing GPIO13 oscillator remains
+unchanged, including its optional measured 16,773 us period / 578 us high variant;
+STE and TE commands do not change that legacy waveform.
+
+## `stopwatch` — M5Stack StopWatch (ESP32-S3)
+
+Selected with `--board stopwatch` (alias `m5stack-stopwatch`). The native CLI
+defaults to 16 MB flash and 8 MB PSRAM for this board; `--flash-mb` and
+`--psram-mb` override them. `BoardModel` has no memory-size defaults.
+The browser Configure selector includes `stopwatch`; memory sizes remain
+explicit browser configuration values.
+
+| Device | Bus | Model |
+| --- | --- | --- |
+| CO5300 | SPI2 QSPI | 468×466 RGB565 RAM, column offset 6; CASET 6..473, RASET 0..465; split RAMWR/RAMWRC transfers |
+| TE | GPIO38 | STE-aware synthetic scan: 500 lines, 15,000 µs period, 120 µs high pulse; 3,600,000 / 28,800 cycles at 240 MHz |
+| M5PM1 at `0x6e` | I2C0, SDA47/SCL48 | ID `0x2050`, retained power configuration, battery input and latched shutdown request |
+| M5IOE1 at `0x4f` | I2C0 | OLED rail, OLED reset and touch reset through shared state; synthetic UID `0x0000` |
+| CST820 at `0x15` | I2C0 | Identity and latched touch coordinates, clamped to 467/465; reset clears pending touch |
+| Buttons A / B | GPIO2 / GPIO1, active low | Released-high initial inputs; script names `a` / `b` or `btn_a` / `btn_b`; browser buttons |
+
+Power/reset wiring follows M5Stack's public hardware documentation and
+power-management guide, linked in [the M5 device sources](m5-i2c.md#stopwatch-address-and-wiring-sources):
+M5IOE1 IO8 enables the OLED rail, IO5 releases OLED reset and IO4 releases touch
+reset. The board accepts SPI2 panel writes only while the rail and OLED reset
+are high and the PMIC shutdown latch is clear. Every M5 write updates the wiring,
+including reset pulses between board callbacks. Reset assertion, rail loss or
+PMIC shutdown clears panel RAM and command state, drives TE low and cancels
+future TE edges. Restoring power does not reenable TE without a panel command.
+The display change counter remains monotonic across resets.
+
+PMIC `SYS_CMD=0xa1` blanks the panel and is reported as
+`power_off_requested=true`; it does not halt the CPU. Battery input defaults to
+3900 mV, not charging. These values and the expander UID are synthetic.
+Touch input is ignored while touch reset is asserted or after shutdown.
+
+The directed `esp32s3 --test stopwatch` tests cover factory selection, bus-0
+attachments, firmware register initialization, reset/rail/shutdown gating,
+framebuffer stride, CST820 reports and GPIO38 interrupt routing. The scan
+parameters are not hardware measurements. Physical scanout, touch IRQs,
+BMI270 and RX8130 are not modeled. These tests do not establish firmware boot,
+relay connectivity or tear-free rendering. Native `--web` keeps native
+networking; browser-only WASM has no NAT for external relay connections.
+
+The original PR's native boot report used private StopWatch firmware revision
+`9e0d4dc`. Its `relay_connected` log and rendered status face were a manual
+observation, not a checked-in test or a public firmware fixture. That run cannot
+be reproduced from this repository alone; no public build or private relay
+configuration is included. CI covers the directed board and UI tests above,
+not that firmware's boot or relay connection.
+
 ## `waveshare-c6-lcd147` — Waveshare ESP32-C6-LCD-1.47 (ESP32-C6)
 
 | Device | Bus | Model |
@@ -98,6 +202,72 @@ the SoC at its next existing bus tick.
 | 802.15.4 radio | the C6's MAC (`esp32c6::periph::Ieee802154`) | energy detect answered with synthetic per-channel levels |
 
 The energy-scan firmware and the run recipe: `examples/waveshare-c6-lcd147/`, [esp32c6.md](esp32c6.md).
+
+## `waveshare-p4-lcd35` — Waveshare ESP32-P4-WIFI6-Touch-LCD-3.5 (ESP32-P4 rev ≥ 3)
+
+The wiring is Waveshare's BSP `waveshare/esp32_p4_wifi6_touch_lcd_3_5` 2.0.2
+(`include/bsp/esp32_p4_wifi6_touch_lcd_3_5.h`); the BSP and LVGL 9 run on the model unmodified.
+
+| Device | Bus | Model |
+| --- | --- | --- |
+| ST7796 320×480 panel | GPSPI2 (MOSI 20, CLK 21, CS 23, D/C 26, RST 27) through the AXI-GDMA | `DcsPanel::new(320, 480)`; the glass shows the RAM with its columns reversed (the BSP sets MADCTL.MX) and R/B exchanged unless MADCTL.BGR is set; pixels high byte first; INVON, which the BSP sets for the IPS glass, not applied |
+| FT5x06-family touch | I2C1 (SCL 8, SDA 7) at 0x38, INT on GPIO 50, RST 29 | `Ft5x06`: TD_STATUS and five point records; INT pulses low every 12 ms while touched (the driver's ID_G_PERIODACTIVE) and once on release; a touch shorter than two report periods (24 ms) is held that long, so the driver, woken by INT, reads it |
+| ES8311 codec | I2C1 at 0x18 (registers), I2S1 through the AHB-GDMA (DOUT 9, LRCK 10, DIN 11, SCLK 12, MCLK 13) | a register file; the audio is I2S1's first slot (`--wav`, the page's audio); its volume register is not applied |
+| Speaker amplifier | enable on GPIO 53 | the level, reported |
+| Backlight | LEDC on GPIO 28 | `Ledc` (P4 layout); the panel is drawn whatever the duty |
+| ESP32-C6 | SDIO slot 1 (ESP-Hosted) | `--coproc` ([esp32p4.md](esp32p4.md), "The co-processor"); without it ESP-Hosted's probe fails |
+| TF card | SDMMC slot 0 | `--sd` |
+
+Firmware for it: the Scintilla synth (`p4-scintilla-lcd35*`, fetched by `tools/fetch-p4-firmware.sh`;
+source joakimeriksson/esp32 at commit `eed6180`, directory `scintilla-p4-lcd35`, GPL-3.0, licences in
+`web/wasm/fw/public/p4-scintilla-NOTICE.txt`), pinned by the golden `scintilla_p4_lcd35`, and the
+page demo `p4-lcd35-synth`. It wants PSRAM: `--psram-mb 32`, as the board has (the CLI's default
+is none; the page's manifest sets 32).
+
+## `ttgo-tdisplay` — LilyGO TTGO T-Display (classic ESP32)
+
+| Device | Bus | Model |
+| --- | --- | --- |
+| ST7789V 135×240 panel | VSPI/SPI3 through the GPIO matrix (SCLK 18, MOSI 19, no MISO), CS 5, D/C 16, RST 23 | `DcsPanel::st7789()`: 240×320 GRAM; bytes of transactions routed to GPIO 18/19 while CS is low; the glass shows RAM columns 52..186 and rows 40..279 as a portrait frame, red/blue exchanged unless MADCTL BGR |
+| Backlight | GPIO 4, active high | level tracked, in the report |
+| Buttons | GPIO 35 (right, input only) and GPIO 0 (left, BOOT), active low | `press right 150`, `press boot 150` |
+| Battery divider | GPIO 34 (ADC1 channel 6), enable on GPIO 14 | the classic ADC's script inputs; the enable level is in the report |
+| I2C header | SDA 21 / SCL 22 | nothing attached |
+
+Selected with `--chip esp32 --board ttgo-tdisplay` (alias `tdisplay`); [esp32.md](esp32.md#the-board---board-ttgo-tdisplay).
+
+## `ulanzi-tc001` — Ulanzi TC001 pixel clock (classic ESP32)
+
+| Device | Bus | Model |
+| --- | --- | --- |
+| 256 WS2812, 32×8 | GPIO 32 via RMT | one `Ws2812Chain` with `MATRIX_PHYSICAL`: the chain runs in rows from the top left, every second row right to left (AWTRIX layout 0), so `leds()` and the 32×8 `display()` are in reading order |
+| Buttons | GPIO 26 (left), 27 (select), 14 (right), active low | `press left 150`, `press select 150`, `press right 150` |
+| Light sensor, battery divider | GPIO 35, GPIO 34 (ADC1) | not modelled |
+| Buzzer | GPIO 15 | not modelled |
+| I2C | SDA 21 / SCL 22 | temperature/humidity sensor and RTC not modelled |
+| AWTRIX `RESET_PIN` | GPIO 13 (held low for 5 s, AWTRIX erases its settings) | not modelled, reads high |
+
+Selected with `--chip esp32 --board ulanzi-tc001` (alias `tc001`). Pins from the AWTRIX 3 firmware
+(Blueforcer/awtrix3 at `a69571703a88`, `src/DisplayManager.cpp`, `src/PeripheryManager.cpp`; the
+pin block moves between versions). A 256-LED frame is 6144 RMT symbols sent
+through the refilled 64-word block; the classic RMT hands transmissions up to 4096 pixels to the
+board. Stock AWTRIX 3 runs on it: [examples/ulanzi-tc001](../examples/ulanzi-tc001/README.md).
+The web page offers it too: pick `ulanzi-tc001` in the firmware panel; the matrix is drawn 16× and the
+three buttons are under it.
+
+## `ai-thinker-cam` — AI-Thinker ESP32-CAM (classic ESP32)
+
+Select `--chip esp32 --board ai-thinker-cam` (alias `esp32cam`). The OV2640 is
+on SCCB at 0x30 (SDA 26, SCL 27; either I2C controller), with PWDN 32, XCLK 0,
+no reset wire, D0–D7 5/18/19/21/36/39/34/35, PCLK 22, HREF 23 and VSYNC 25. The
+guest must configure the physical routes and a live PWM clock.
+`--cam-image image.bmp|ppm` supplies a still image; absent input is black. Raw
+RGB565/YUV422 captures use I2S0 RX DMA with a fixed approximate 10 FPS cadence.
+`--cam-image photo.jpg` supplies baseline JPEG for `PIXFORMAT_JPEG`, delivered
+byte for byte when its size equals the configured frame size; frame buffers may
+be in DRAM or, with `--psram-mb 4`, PSRAM.
+JPEG encoding, adjustable FPS and silicon/PCLK timing are unsupported.
+See [the fixture and scope](esp32.md#the-camera---board-ai-thinker-cam).
 
 ## `none` — bare module
 

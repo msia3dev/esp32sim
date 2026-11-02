@@ -11,9 +11,15 @@ pub mod board;
 pub mod bus;
 pub mod net;
 pub mod periph;
+mod parlio;
 pub mod radio;
+pub mod sdio;
 pub mod soc;
 pub mod wifi;
 
 pub use esp_soc::Stop;
 pub use soc::{machine, Machine, C6};
+
+mod ble;
+
+mod ecc;

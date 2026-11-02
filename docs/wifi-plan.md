@@ -26,11 +26,17 @@ wifi station: got ip:10.0.2.15
 What is modelled:
 - PHY calibration loops satisfied with faked done-bits; scan, open-system auth, association.
 - The 802.11 MAC (TX queue registers, RX descriptor ring, interrupt events) — see below.
+- **Receive lists handed over one at a time**, as Arduino-ESP32 writes them: the DMA follows the
+  `next` pointers, stops when the next descriptor is not software-armed, and restarts at
+  `BASE_RX_DSCR` (0x088) when software hands it the next short list. The IDF station example writes
+  the base once and keeps a long ring; an Arduino-ESP32 application (IDF 5.1) arms four descriptors at a
+  time, and without the hand-over its station never authenticated — 314 of 315 frames were dropped
+  ([decisions](decisions.md), [receipt](evidence/wifi-rx-handover/README.md)).
 - A **virtual AP** (`esp-soc/src/wifi.rs`): beacons, probe responses, auth/assoc, and the WPA2
   four-way handshake (PMK from the passphrase, PTK derivation, MIC, GTK delivered AES-key-wrapped).
-- The **AES accelerator** (`Aes` in `periph.rs`, DMA and block mode) — the supplicant unwraps the
+- The **AES accelerator** (`Aes` in `esp-periph/src/aes.rs`, DMA and block mode) — the supplicant unwraps the
   group key with it, so without this peripheral WPA2 stops dead at message 3.
-- Crypto primitives (`esp32s3/src/crypto.rs`): SHA-1, HMAC-SHA1, PBKDF2, the 802.11 PRF, AES for
+- Crypto primitives (`esp-periph/src/crypto.rs`): SHA-1, HMAC-SHA1, PBKDF2, the 802.11 PRF, AES for
   every key length in both directions, AES key wrap — all checked against RFC/FIPS/802.11i vectors.
 - A **virtual network** (`esp-soc/src/net.rs`): DHCP, ARP, ICMP echo, a DNS responder and an SNTP
   server that hands out the host clock, so `esp_netif` reaches `IP_EVENT_STA_GOT_IP` and firmware
@@ -38,7 +44,7 @@ What is modelled:
 - A **user-mode NAT** (`esp-soc/src/nat.rs`, `--net nat`, on by default): TCP and UDP flows are
   terminated in the emulator and relayed over ordinary host sockets, the way Contiki-NG's NAT64
   does it — no libslirp, no root, no tun device. Guest name lookups go to the host's own resolver.
-- The **RSA/MPI accelerator** (`Rsa` in `periph.rs`) and **SHA over GDMA including SHA-384/512**.
+- The **RSA/MPI accelerator** (`Rsa` in `esp-periph/src/rsa.rs`) and **SHA over GDMA including SHA-384/512**.
   mbedTLS routes every public-key operation and every certificate digest through them, so without
   both, TLS hangs in the driver's polling loop or fails certificate verification.
 
@@ -71,8 +77,8 @@ Bugs found on the way to a TLS session, each one a place where the model was pla
   answered with a fatal alert rather than an error we could read.
 
 Not yet working:
-- Inbound connections (no port forwarding yet), multicast and mDNS, so `esp-web.local` and Home
-  Assistant discovery do not cross; use IP addresses.
+- UDP inbound, multicast and mDNS, so `esp-web.local` and Home Assistant discovery do not cross;
+  use IP addresses. TCP servers in the guest are reachable with `--hostfwd`.
 - Hardware AES-GCM (block mode 6) and the DS/HMAC peripherals; mbedTLS has not asked for them yet.
 - Roaming, power save, 802.11n rates, multiple stations, WPA3/SAE, PMF.
 
