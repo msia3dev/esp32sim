@@ -2,7 +2,7 @@
 # but no privileged container or host binfmt registration.
 FROM rust:1-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc-aarch64-linux-gnu qemu-user ca-certificates curl \
+    gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 RUN rustup toolchain install stable --profile minimal --component clippy \
     --target aarch64-unknown-linux-gnu
