@@ -33,7 +33,7 @@ fn single_and_network_loads_accept_the_same_input_kinds() {
         let cases: &[(u32, &[u8], u32)] = &[
             (6, b"0.1 gpio 2 1\n", 0),
             (6, &[0xff], 1),
-            (7, b"P6\n1 1\n255\n\xff\x00\x00", 0),
+            (7, b"P6\n1 1\n255\n\xff\x00\x00", 1),
             (7, b"bad picture", 1),
             (8, b"", 1),
         ];
@@ -104,5 +104,44 @@ fn complete_stub_specs_and_wifi_report_invalid_configuration() {
         let spec = b"0x40000000=typo";
         assert_eq!(esp32sim_net_stub_spec(net, 0, spec.as_ptr(), spec.len()), 1);
         esp32sim_net_delete(net);
+    }
+}
+
+#[test]
+fn ethernet_relay_validates_frames_on_every_chip() {
+    for board in ["none", "esp32c3", "esp32c6"] {
+        // SAFETY: uniquely owned emulator and buffers live for each call.
+        unsafe {
+            let e = esp32sim_new(board.as_ptr(), board.len(), 1, 0);
+            assert!(!e.is_null());
+            assert_eq!(esp32sim_ethernet_take(e), 0);
+            assert!(esp32sim_ethernet_ptr(e, 0).is_null());
+            assert_eq!(esp32sim_ethernet_len(e, usize::MAX), 0);
+            assert_eq!(esp32sim_ethernet_relay(e, 1), 0);
+            assert_eq!(esp32sim_ethernet_receive(e, [0; 14].as_ptr(), 14), 1);
+            assert_eq!(esp32sim_wifi(e, std::ptr::null(), 0), 0);
+            for len in [0, 13, 1519, usize::MAX] {
+                assert_eq!(esp32sim_ethernet_receive(e, std::ptr::null(), len), 1);
+            }
+            assert_eq!(esp32sim_ethernet_receive(e, std::ptr::null(), 14), 1);
+            for _ in 0..64 { assert_eq!(esp32sim_ethernet_receive(e, [0; 14].as_ptr(), 14), 0); }
+            assert_eq!(esp32sim_ethernet_receive(e, [0; 14].as_ptr(), 14), 1);
+            assert_eq!(esp32sim_ethernet_relay(e, 0), 0);
+            assert_eq!(esp32sim_ethernet_receive(e, [0; 14].as_ptr(), 14), 1);
+            esp32sim_delete(e);
+        }
+    }
+}
+
+#[test]
+fn full_ble_rejects_other_chips() {
+    // SAFETY: each readable name and handle is exclusively owned until deletion.
+    unsafe {
+        for chip in ["none", "esp32c6", "esp32c3"] {
+            let e = esp32sim_new(chip.as_ptr(), chip.len(), 4, 0);
+            assert!(!e.is_null());
+            assert_eq!(esp32sim_ble_full(e), u32::from(chip != "esp32c3"));
+            esp32sim_delete(e);
+        }
     }
 }

@@ -65,8 +65,10 @@ cargo test --workspace
 tools/wasm-jit-test.sh
 ```
 
-The checked-in ULP RISC-V fixture is the unchanged ESP-IDF v5.2.1 public test binary. Native and
-WebAssembly tests run its wake path and its 100,000-iteration shared-lock command. ULP-FSM ALU
+The checked-in ULP RISC-V fixture is the unchanged ESP-IDF v5.2.1 public test binary. Native tests run its wake path and its 100,000-iteration shared-lock command.
+The engines compile into the WebAssembly runtime; the current WASM smoke/JIT
+suites do not run this ULP fixture, so dedicated browser fixture parity remains
+unqualified. ULP-FSM ALU
 flags were additionally compared with an ESP32-S3-WROOM board; the recorded hardware result is
 under `ulp-fsm/tests/hardware/`.
 

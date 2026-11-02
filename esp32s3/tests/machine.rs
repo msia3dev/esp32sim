@@ -738,7 +738,7 @@ fn core1_runs_when_released() {
 }
 
 #[test]
-fn browser_external_blocks_are_single_core_scheduler_transactions() {
+fn browser_offchip_blocks_are_single_core_scheduler_transactions() {
     let mut m = machine64();
     park(&mut m, 0, IRAM, &SPIN);
     assert_eq!(m.browser_external_block_budget(0), None);
@@ -754,7 +754,7 @@ fn browser_external_blocks_are_single_core_scheduler_transactions() {
 }
 
 #[test]
-fn browser_external_finish_honors_halt_and_drains_console() {
+fn browser_offchip_finish_honors_halt_and_drains_console() {
     for halt in [false, true] {
         let mut m = machine64();
         park(&mut m, 0, IRAM, &SPIN);
@@ -785,6 +785,7 @@ fn reboot_keeps_what_silicon_keeps() {
     m.bus.periph.spi0.jedec[2] = 0x18; m.bus.periph.spi1.jedec[2] = 0x18;   // a 16 MB flash chip
     m.cores[0].pc = IRAM;
     m.bus.periph.rtc.reset_cause = esp_periph::RST_SW_CPU;
+    m.bus.periph.usb.connected = false;
     let cause = m.reboot();
     assert_eq!(cause, esp_periph::RST_SW_CPU);
     let p = &m.bus.periph;
@@ -792,11 +793,52 @@ fn reboot_keeps_what_silicon_keeps() {
     assert_eq!(p.rtc.ram.read(0x120), 0x1234); assert_eq!(p.rtc.slow_ticks, 999);
     assert_eq!(p.rtc.ulp.state, esp_periph::UlpState::Halted); assert_eq!(p.rtc.ulp.starts, 7);
     assert_eq!(p.rtc.ram.read(0x38), cause | (cause << 6));
+    assert_eq!(p.rtc.reset_cause, cause, "reset_cause() reports the cause, not POWERON");
+    assert!(!p.usb.connected, "an unplugged USB cable stays unplugged");
     assert_eq!(p.i2s0.pcm, vec![1, 2, 3]);
     assert_eq!((p.spi0.jedec[2], p.spi1.jedec[2]), (0x18, 0x18), "the flash chip keeps its capacity, or IDF finds it smaller than the image header");
-    assert!(p.uart[0].tx_out.is_empty() && p.systimer.conf == 0, "digital peripherals are fresh");
+    assert!(p.uart[0].tx_out.is_empty() && p.systimer.conf == 0x4600_0000, "digital peripherals are fresh");
     assert_eq!(m.cores[0].pc(), RESET); assert_eq!(m.reboots, 1);
     assert!(!m.dump_regs().contains("core1:"), "core 1 is back in reset");
+}
+
+/// The PSRAM array size sets MR2's density (ESP-IDF sizes the octal PSRAM from
+/// it alone), in the bus constructor and in `set_psram_size`; 2 MB (quad PSRAM) has no octal code
+/// and keeps the reset value.
+#[test]
+fn psram_size_sets_the_mr2_density() {
+    let mut m = machine();
+    assert_eq!(m.bus.periph.spi1.psram_mr[2], 0x8b, "the default 2 MB array: MR2 unchanged");
+    esp_soc::SocBus::set_psram_size(&mut m.bus, 16 << 20).unwrap();
+    assert_eq!((m.bus.psram.len(), m.bus.periph.spi0.psram_mr[2], m.bus.periph.spi1.psram_mr[2]), (16 << 20, 0x8d, 0x8d));
+    esp_soc::SocBus::set_psram_size(&mut m.bus, 8 << 20).unwrap();
+    assert_eq!(m.bus.periph.spi1.psram_mr[2], 0x8b, "64 Mbit again");
+    let bus = esp32s3::bus::SocBus::new(8 << 20, 32 << 20, [0; 6]);
+    assert_eq!(bus.periph.spi1.psram_mr[2], 0x8f, "the constructor's size: 256 Mbit");
+}
+
+/// An octal flash module. The JEDEC ID is Macronix octal with the capacity
+/// plus 0x20 (also when the size changes afterwards), efuse FLASH_TYPE says octal, and a chip reset
+/// keeps the flash's protocol (the ROM resets it) and the PSRAM's MR2 (read-only).
+#[test]
+fn octal_flash_module_survives_a_reboot() {
+    let mut m = machine();
+    m.bus.set_flash_octal(true);
+    esp_soc::SocBus::set_flash_size(&mut m.bus, 32 << 20);
+    esp_soc::SocBus::set_psram_size(&mut m.bus, 16 << 20).unwrap();
+    assert_eq!((m.bus.periph.spi0.jedec, m.bus.periph.spi1.jedec), ([0xc2, 0x80, 0x39], [0xc2, 0x80, 0x39]));
+    assert_eq!(m.bus.periph.efuse.ram.read(0x3c) & (1 << 9), 1 << 9, "EFUSE_FLASH_TYPE: octal");
+    m.bus.periph.spi1.flash_cr2 = 2;
+    m.bus.periph.rtc.reset_cause = esp_periph::RST_SW_CPU;
+    m.reboot();
+    let p = &m.bus.periph;
+    assert!(p.spi0.octal_flash && p.spi1.octal_flash);
+    assert_eq!(p.spi1.flash_cr2, 2, "still in DTR OPI: the flash is not reset with the chip");
+    assert_eq!(p.spi1.jedec, [0xc2, 0x80, 0x39]);
+    assert_eq!((p.spi0.psram_mr[2], p.spi1.psram_mr[2]), (0x8d, 0x8d), "the PSRAM keeps its density, or ESP-IDF maps half of it after a restart");
+    assert_eq!(p.efuse.ram.read(0x3c) & (1 << 9), 1 << 9);
+    m.bus.set_flash_octal(false);
+    assert_eq!((m.bus.periph.spi1.jedec, m.bus.periph.efuse.ram.read(0x3c) & (1 << 9)), ([0x20, 0x40, 0x19], 0), "back to quad");
 }
 
 /// Host touch keeps its intended board-edge timestamp and is applied at the fast scheduler's next
@@ -807,7 +849,7 @@ fn host_touch_is_delivered_on_the_next_fast_path_bus_tick() {
     park(&mut m, 0, IRAM, &SPIN);
     m.bus.board = Box::new(esp32s3::board::WaveshareAmoled18V2::new());
     m.bus.attach_board_devices();
-    m.bus.periph.gpio.pin[esp32s3::board::PIN_AMOLED_TOUCH_INT as usize] = (2 << 7) | (1 << 13);
+    m.bus.periph.gpio.write(0x74 + 4 * u32::from(esp32s3::board::PIN_AMOLED_TOUCH_INT), (2 << 7) | (1 << 13));
     m.max_cycles = 64;
     assert!(matches!(m.run(u64::MAX), Stop::Halted));
     let horizon = m.bus.cycles;
@@ -1150,4 +1192,108 @@ fn zero_display_rate_is_safe() {
     park(&mut m, 0, IRAM, &SPIN);
     assert!(matches!(m.run(8192), Stop::MaxInsns));
     assert!(calls.load(Ordering::Relaxed) > 0);
+}
+
+/// A waveform after `waituart0` plays from when it is applied: the wait moves its event, and the
+/// first sample has to move with it instead of starting at the cycle the script was parsed for.
+#[test]
+fn waveform_after_waituart0_starts_at_the_shifted_time() {
+    let mut m = machine();
+    park(&mut m, 0, IRAM, &SPIN);
+    m.script.log = false;
+    let ramp: Vec<f32> = (0..1000).map(|i| i as f32 / 1000.0).collect();
+    let wave = esp_periph::AnalogSource::Wave { samples: std::sync::Arc::new(ramp), rate_hz: 100_000.0, start_cycles: 0 };
+    m.script.events = vec![(0, ScriptAction::WaitUart0("never printed".into(), 1000, 0)), (0, ScriptAction::Analog(1, wave))];
+    m.max_cycles = 2_000_000;   // past the 1 ms recheck that ends the timed-out wait
+    m.run(u64::MAX);
+    assert_eq!(m.script.pos, 2, "the wait timed out and the waveform was applied");
+    let applied = m.script.events[1].0;
+    assert!(applied > 0, "the wait moved the waveform's event");
+    assert_eq!(m.bus.periph.rtc.analog.volts(1, applied), 0.0, "the first sample plays at the moved start");
+    assert_eq!(m.bus.periph.rtc.analog.volts(1, applied + 2400), 0.001, "and advances one sample per 10 µs (2400 cycles) from there");
+}
+
+#[test]
+fn reboot_preserves_camera_host_settings_and_stream_but_resets_capture() {
+    use std::sync::{Arc, Mutex};
+    use esp_soc::picture::Picture;
+    let mut m = machine();
+    m.bus.board = make_board("waveshare-cam").unwrap();
+    m.bus.attach_board_devices();
+    m.bus.board.set_camera_picture(Picture { w: 2, h: 1, rgb: vec![1, 2, 3, 4, 5, 6] }).unwrap();
+    let input = Arc::new(Mutex::new(None));
+    m.camera_input = Some(input.clone());
+    let period = esp32s3::periph::CPU_HZ / 25;
+    let mut debug = esp_soc::DebugFlags::default();
+    debug.parse("lcd_cam,wifi,spi,mmio");
+    m.set_debug(&debug);
+    m.bus.periph.misc.log_unknown = true;
+    let cam = &mut m.bus.periph.lcd_cam;
+    cam.frame_cycles = period;
+    cam.acc = 17;
+    cam.frames = 9;
+    cam.dropped = 3;
+    cam.int_raw = 7;
+    cam.set_cam_frame(Some(Arc::new(vec![10, 11])));
+    let preview = m.bus.board.camera_preview(2, 1).unwrap();
+    m.reboot();
+    let cam = &mut m.bus.periph.lcd_cam;
+    assert_eq!(cam.frame_cycles, period);
+    assert!(cam.lcd_log);
+    assert_eq!((cam.acc, cam.frames, cam.dropped, cam.int_raw), (0, 0, 0, 0));
+    assert!(cam.cam_frame().is_none());
+    assert!(!cam.running());
+    assert!(!cam.cam_clock_active());
+    assert!(!cam.frame_due(period - 1));
+    assert!(cam.frame_due(1));
+    assert_eq!(m.bus.board.camera_preview(2, 1).unwrap(), preview);
+    assert!(Arc::ptr_eq(m.camera_input.as_ref().unwrap(), &input));
+    *input.lock().unwrap() = Some(Picture { w: 2, h: 1, rgb: vec![7, 8, 9, 10, 11, 12] });
+    assert!(matches!(m.run(0), Stop::MaxInsns));
+    assert_eq!(m.bus.board.camera_preview(2, 1).unwrap(), [7, 8, 9, 10, 11, 12]);
+    assert!(input.lock().unwrap().is_none());
+    assert!(m.bus.periph.wifi.log);
+    assert!(m.bus.periph.spi1.log);
+    assert!(m.bus.periph.spi2.log);
+    assert!(m.bus.periph.misc.log_all);
+    assert!(m.bus.periph.misc.log_unknown);
+}
+
+#[test]
+fn busy_runs_honor_cycle_ceiling_with_virtual_and_batched_rounds() {
+    for peer in [false, true] {
+        for batching in [false, true] {
+            let mut m = machine();
+            m.quantum = 256;
+            for core in &mut m.cores { core.set_jit(false); }
+            m.vq_max = if batching { 16 } else { 1 };
+            m.bb_max = if batching { 16 } else { 1 };
+            park(&mut m, 0, IRAM, &SPIN);
+            if peer {
+                esp_soc::SocBus::load_bytes(&mut m.bus, RESET, &SPIN).unwrap();
+                // IDF v5.5.5 components/soc/esp32s3/register/soc/system_reg.h:15-33:
+                // CORE_1_CONTROL_0 enables its clock and clears reset/stall.
+                m.bus.write32(0x600c_0000, 0b010).unwrap();
+            }
+            for cycles in [1, 255, 256, 257, 1025, 1] {
+                m.max_cycles = m.bus.cycles + cycles;
+                assert!(matches!(m.run(u64::MAX), Stop::Halted));
+                assert_eq!(m.bus.cycles, m.max_cycles);
+            }
+            if batching && esp_soc::SocBus::can_defer(&m.bus) {
+                assert!(if peer { m.bb_stats[0] } else { m.vq_stats[0] } > 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn octal_flash_identity_survives_physical_efuse_export_and_reset() {
+    let mut m = machine();
+    m.bus.set_flash_octal(true);
+    let state = m.bus.export_storage(1).unwrap();
+    let mut restored = machine();
+    restored.bus.import_storage(1, &state).unwrap();
+    restored.reboot();
+    assert_ne!(restored.bus.periph.efuse.read(0x3c) & (1 << 9), 0);
 }

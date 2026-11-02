@@ -10,7 +10,13 @@ use esp_soc::web::{json_escape, WebServer};
 use esp_soc::{Machine, Soc, SocBus};
 
 mod machine;
+#[cfg(any(test, feature = "psram-tests"))]
+pub mod psram_tests;
 mod network;
+mod ethernet;
+mod ble;
+pub use ble::*;
+pub use ethernet::*;
 mod s3;
 #[cfg(target_arch = "wasm32")]
 mod browser_jit;
@@ -41,8 +47,12 @@ pub struct Emu {
     m: MachineKind,
     /// the last drained outbox: (1 text | 2 binary, payload), addressed by index from JS
     out: Vec<(u8, Vec<u8>)>,
+    ethernet_out: Vec<Vec<u8>>,
+    ble_out: String,
     booted: bool,
     state_out: Vec<u8>,
+    /// a mask ROM ELF was loaded: a ROM boot without one would run from empty memory and print nothing
+    rom_loaded: bool,
     #[cfg(target_arch = "wasm32")]
     jit: BrowserJit,
 }
@@ -85,9 +95,14 @@ unsafe fn text<'a>(ptr: *const u8, len: usize) -> &'a str {
 }
 
 /// `board` is a CLI board name (atech14, waveshare-cam, waveshare-lcd4b,
-/// waveshare-amoled18-v2, none) for the ESP32-S3,
-/// or `esp32c3` for the RISC-V chip, which is console-only and takes no board. Null on failure.
+/// waveshare-amoled18-v2, none) for the ESP32-S3, `esp32` (the bare esp32dev module) or a classic
+/// board such as `ttgo-tdisplay` for the classic ESP32, `esp32c6` or `waveshare-c6-lcd147` for the
+/// C6, `esp32c3` for the C3, or `esp32p4` (rev < 3) or `esp32p4-rev3` for the P4, with `+c6` for its C6
+/// co-processor, which are console-only and take no board, or `waveshare-p4-lcd35` for that P4
+/// rev >= 3 board (its panel, touch and codec). Null on failure.
 /// Flash and PSRAM are each limited to 32 MiB, matching the browser configuration form.
+/// Classic ESP32 enables PSRAM only at 4 MiB; other sizes within the cap start without
+/// PSRAM (0 is the default), preserving existing callers' configurations.
 ///
 /// # Safety
 /// For nonzero `board_len`, `board` must be non-null and readable for `board_len` bytes throughout
@@ -108,15 +123,65 @@ pub unsafe extern "C" fn esp32sim_new(board: *const u8, board_len: usize, flash_
     } else {
         esp32c6::board::make_board(&board)
     };
-    let m = if board == "esp32c3" || board == "c3" {
+    // The classic ESP32: `esp32` is the bare module (esp32dev); its boards are named like the CLI's
+    // `--board` (ttgo-tdisplay). `none`/`bare` stay the S3's, so the classic factory is not asked.
+    // `esp32p4` is rev < 3, `esp32p4-rev3` rev >= 3; `+c6` adds the ESP32-C6 co-processor on SDIO
+    // (`esp32p4::coproc`), whose images load with `COPROC_KIND` / `COPROC_FLASH`.
+    let (p4_name, coproc) = board.strip_suffix("+c6").map_or((board.as_str(), false), |b| (b, true));
+    let p4_board = esp32p4::board::make_board(p4_name).filter(|_| !matches!(p4_name, "none" | "bare"));
+    let p4_rev3 = p4_board.is_some() || matches!(p4_name, "esp32p4-rev3" | "p4-rev3");   // the board has a v3.2 chip
+    let p4 = p4_rev3 || matches!(p4_name, "esp32p4" | "p4");
+    let classic_board = if board == "esp32" {
+        esp32::board::make_board("esp32dev")
+    } else if p4 || c6_board.is_some() || matches!(board.as_str(), "none" | "bare") {
+        None
+    } else {
+        esp32::board::make_board(&board)
+    };
+    let m = if let Some(b) = classic_board {
+        let mut m = esp32::machine([0x24, 0x6f, 0x28, 0, 0x11, 0x22], flash_bytes);
+        m.bus.board = b;
+        m.bus.attach_board_devices();
+        m.bus.set_flash_size(flash_bytes);
+        let classic_psram_bytes = if matches!(psram_mb, 0 | 4) {
+            psram_bytes
+        } else {
+            log("[emu] classic ESP32 PSRAM is 0 or 4 MiB; starting without PSRAM");
+            0
+        };
+        if let Err(reason) = m.bus.set_psram_size(classic_psram_bytes) {
+            log(&format!("[emu] {}", reason));
+            return std::ptr::null_mut();
+        }
+        m.console.mask = 2;
+        prepare(&mut m);
+        MachineKind::Esp32(Box::new(m))
+    } else if board == "esp32c3" || board == "c3" {
         let mut m = esp32c3::machine([0x3c, 0x84, 0x27, 0xb6, 0xa7, 0x1c], flash_bytes);
         m.bus.set_flash_size(flash_bytes);
         m.console.mask = 2;                                  // the ROM mirrors its console to UART0 and USB-Serial/JTAG
         prepare(&mut m);
         MachineKind::C3(Box::new(m))
+    } else if p4 {
+        fn p4_machine<R: esp32p4::Revision>(flash_bytes: usize, psram_bytes: usize, board: Option<esp_soc::Board>) -> Machine<esp32p4::Esp32p4<R>> {
+            let mut m = esp32p4::machine_rev::<R>([0x30, 0xed, 0xa0, 0x00, 0x11, 0x22], flash_bytes);
+            if let Some(b) = board { m.bus.board = b; m.bus.attach_board_devices(); }
+            m.bus.set_flash_size(flash_bytes);
+            let _ = m.bus.set_psram_size(psram_bytes);
+            m.console.mask = 2;
+            prepare(&mut m);
+            m
+        }
+        match (p4_rev3, coproc) {
+            (false, false) => MachineKind::P4(Box::new(p4_machine::<esp32p4::RevLt3>(flash_bytes, psram_bytes, p4_board))),
+            (true, false) => MachineKind::P4Rev3(Box::new(p4_machine::<esp32p4::RevGe3>(flash_bytes, psram_bytes, p4_board))),
+            (false, true) => MachineKind::P4C6(Box::new(esp32p4::coproc::CoSim::new(p4_machine(flash_bytes, psram_bytes, p4_board), coproc_c6(), coproc_config()))),
+            (true, true) => MachineKind::P4Rev3C6(Box::new(esp32p4::coproc::CoSim::new(p4_machine(flash_bytes, psram_bytes, p4_board), coproc_c6(), coproc_config()))),
+        }
     } else if let Some(b) = c6_board {
         let mut m = esp32c6::machine([0xdc, 0x1e, 0xd5, 0x6e, 0x8c, 0xdc], flash_bytes);
         m.bus.board = b;
+        m.bus.attach_board_devices();
         m.bus.set_flash_size(flash_bytes);
         m.console.mask = 2;
         prepare(&mut m);
@@ -144,8 +209,8 @@ pub unsafe extern "C" fn esp32sim_new(board: *const u8, board_len: usize, flash_
     }
     Box::into_raw(Box::new(Emu {
         m,
-        out: Vec::new(),
-        booted: false,
+        out: Vec::new(), ethernet_out: Vec::new(), ble_out: String::new(),
+        booted: false, rom_loaded: false,
         state_out: Vec::new(),
         #[cfg(target_arch = "wasm32")]
         jit: BrowserJit::default(),
@@ -168,6 +233,17 @@ pub unsafe extern "C" fn esp32sim_state_ptr(e: *const Emu) -> *const u8 { unsafe
 /// # Safety
 /// `e` must be live and exclusively accessible; `ptr` must be readable for `len` bytes.
 pub unsafe extern "C" fn esp32sim_state_import(e: *mut Emu, kind: u32, ptr: *const u8, len: usize) -> u32 { let e = unsafe { &mut *e }; match e.m.import_storage(kind, unsafe { bytes(ptr, len) }) { Ok(()) => 0, Err(message) => { log(&format!("[emu] state import: {message}")); 1 } } }
+/// The co-processor as the CLI's `--coproc` makes it: a bare 4 MB ESP32-C6 with an Espressif-OUI MAC
+/// of its own; the page loads its images and boots it with the P4.
+fn coproc_c6() -> esp32c6::Machine {
+    let mut m = esp32c6::machine([0x40, 0x4c, 0xca, 0x00, 0x11, 0x22], 4 << 20);
+    m.bus.set_flash_size(4 << 20);
+    m.rt.enabled = false;                                    // std::time does not exist here
+    m
+}
+
+/// The CLI's defaults: 10 µs slices, EN on GPIO 54, both chips rebooting, both on UART0.
+fn coproc_config() -> esp32p4::coproc::Config { esp32p4::coproc::Config::default() }
 
 /// The page is the one client: messages queue in a `WebServer` sink; the worker paces the run.
 fn prepare<S: Soc>(m: &mut Machine<S>) {
@@ -189,8 +265,10 @@ pub unsafe extern "C" fn esp32sim_delete(e: *mut Emu) {
     }
 }
 
-/// kind: 0 mask-ROM ELF, 1 bootloader (flash 0x0), 2 partition table (0x8000), 3 app (0x10000),
-/// 4 ELF for symbols, 5 whole flash image (0x0), 6 script text, 7 camera picture (BMP/PPM).
+/// kind: 0 mask-ROM ELF, 1 bootloader (chip-specific offset), 2 partition table (0x8000), 3 app (0x10000),
+/// 4 ELF for symbols, 5 whole flash image (0x0), 6 script text, 7 camera picture (BMP/PPM, or baseline JPEG
+/// delivered verbatim by cameras that accept it),
+/// 8 SD card image for the board's socket (P4; held in memory, at least 512 KiB).
 /// Returns 0, or 1 with the reason logged.
 ///
 /// # Safety
@@ -202,7 +280,7 @@ pub unsafe extern "C" fn esp32sim_load(e: *mut Emu, kind: u32, ptr: *const u8, l
     let e = unsafe { &mut *e };
     // SAFETY: The caller provides a readable input buffer for this call.
     let data = unsafe { bytes(ptr, len) };
-    match e.m.load(kind, data) { Ok(()) => 0, Err(msg) => { log(&format!("[emu] load kind {}: {}", kind, msg)); 1 } }
+    match e.m.load(kind, data) { Ok(()) => { if kind == 0 { e.rom_loaded = true; } 0 } Err(msg) => { log(&format!("[emu] load kind {}: {}", kind, msg)); 1 } }
 }
 
 /// Write bytes into flash at an arbitrary offset (a data partition's contents).
@@ -281,12 +359,16 @@ pub unsafe extern "C" fn esp32sim_reports(e: *mut Emu) {
 pub unsafe extern "C" fn esp32sim_boot(e: *mut Emu, app_direct: u32) -> u32 {
     // SAFETY: The caller provides exclusive access to a live emulator.
     let e = unsafe { &mut *e };
+    // a ROM boot without a ROM runs from empty memory and prints nothing: say so (the page refuses it
+    // earlier; the ABI stays permissive for callers that drive the machine another way)
+    if app_direct == 0 && !e.rom_loaded { log("[emu] boot: no mask ROM loaded: the run will print nothing (pick the chip's ROM ELF, or boot the app directly)"); }
     if let Err(msg) = e.m.boot(app_direct != 0) { log(&format!("[emu] boot: {}", msg)); return 1; }
     // the WebSocket server announces the board in its per-client hello; here there is one client
     let name = e.m.board_name();
-    let rotation = e.m.board_rotation();
+    let chip = e.m.chip();
+    let rotation = e.m.board_rotation().map_or("null".into(), |r| r.to_string());
     let controls = e.m.panel_controls().iter().map(|control| format!("{{\"name\":\"{}\",\"label\":\"{}\",\"x\":{},\"y\":{}}}", json_escape(control.name), json_escape(control.label), control.x, control.y)).collect::<Vec<_>>().join(",");
-    if let Some(w) = e.m.web() { w.send_text(&format!("{{\"t\":\"board\",\"name\":\"{}\",\"rotate\":{},\"controls\":[{}]}}", name, rotation, controls)); }
+    if let Some(w) = e.m.web() { w.send_text(&format!("{{\"t\":\"board\",\"name\":\"{}\",\"chip\":\"{}\",\"rotate\":{},\"controls\":[{}]}}", name, chip, rotation, controls)); }
     e.booted = true; 0
 }
 
@@ -396,7 +478,10 @@ pub unsafe extern "C" fn esp32sim_in_bin(e: *mut Emu, ptr: *const u8, len: usize
     let e = unsafe { &mut *e };
     // SAFETY: The caller provides a readable input buffer for this call.
     let input = unsafe { bytes(ptr, len) };
-    if let Some(w) = e.m.web() { w.push_incoming_bin(input.to_vec()); }
+    if let Some(w) = e.m.web() {
+        if input.len() > 8 << 20 { w.send_text(r#"{"t":"camera-error","message":"input exceeds 8 MiB"}"#); }
+        else { w.push_incoming_bin(input.to_vec()); }
+    }
 }
 
 /// Enable or disable the scheduler-integrated block JIT. The interpreter remains available.
@@ -440,4 +525,16 @@ pub extern "C" fn esp32sim_test_fma_sweep(seed: f64, n: u32) -> u32 {
 pub extern "C" fn esp32sim_test_block_jit() -> u32 {
     std::panic::set_hook(Box::new(|info| log(&format!("[jit test] {info}"))));
     xtensa_lx7::jit::tests::run_tests() + jit_tests::run() + jit_memory_tests::run()
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "jit-tests"))]
+#[path = "../../tests/gpio_waveform.rs"]
+mod gpio_waveform_tests;
+
+#[cfg(all(target_arch = "wasm32", feature = "jit-tests"))]
+#[no_mangle]
+pub extern "C" fn esp32sim_test_gpio_waveform() -> u32 {
+    std::panic::set_hook(Box::new(|info| log(&format!("[waveform test] {info}"))));
+    gpio_waveform_tests::run();
+    24
 }

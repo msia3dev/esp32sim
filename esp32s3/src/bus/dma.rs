@@ -3,32 +3,20 @@ use super::*;
 use std::collections::HashSet;
 
 pub(super) const SPI2_DMA_DESCRIPTOR_STEP_BUDGET: usize = 1024;
-/// Maximum descriptor reads in one pump call. This bounds zero-progress rings and crypto
-/// allocation (each descriptor carries at most 4095 bytes).
-const GDMA_DESCRIPTOR_STEP_BUDGET: usize = 4096;
+use esp_periph::gdma::GDMA_DESCRIPTOR_STEP_BUDGET;
+// 4096 RGB pixels plus the RMT end marker.
+const RMT_DMA_SYMBOL_LIMIT: usize = 24 * 4096 + 1;
 
 /// Which end of a memory-to-memory copy faulted.
 pub(super) enum M2mFault { Source, Destination }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DmaDescriptorWord {
-    Control,
-    Buffer,
-    Next,
-}
+pub use esp_periph::gdma::{DmaDescriptorFault, DmaDescriptorWord};
+use esp_periph::gdma::DescriptorWalk;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DmaDescriptorFault {
-    Read { descriptor: u32, word: DmaDescriptorWord, fault: Fault },
-    BufferRead { descriptor: u32, address: u32, fault: Fault },
-    Writeback { descriptor: u32, fault: Fault },
-    NotOwned { descriptor: u32 },
-    Cycle { descriptor: u32 },
-    StepBudgetExceeded { budget: usize },
-    PayloadTooShort { expected: usize, actual: usize },
-}
-
+/// One GP-SPI data phase collected from GDMA (SPI2 or SPI3).
 pub(super) struct Spi2DmaCompletion {
+    /// The GP-SPI host, 2 or 3.
+    host: u8,
     pub(super) channel: usize,
     desc: u32,
     buf_pos: u32,
@@ -40,19 +28,70 @@ pub(super) struct Spi2DmaCompletion {
 }
 
 
-/// Bound work even when guest descriptors make no progress. Streaming rings are valid: the
-/// bound applies to one pump call, not the lifetime of an I2S or LCD channel.
-struct DescriptorWalk { remaining: usize, budget: usize }
-impl DescriptorWalk {
-    fn new(budget: usize) -> Self { Self { remaining: budget, budget } }
-    fn read(&mut self, bus: &mut SocBus, addr: u32) -> Result<(u32, crate::periph::DmaDesc), DmaDescriptorFault> {
-        if self.remaining == 0 { return Err(DmaDescriptorFault::StepBudgetExceeded { budget: self.budget }); }
-        self.remaining -= 1;
-        bus.try_dma_desc(addr)
-    }
-}
-
 impl SocBus {
+    /// IDF v5.5.4 components/soc/esp32s3/include/soc/gdma_channel.h:21: trigger 9.
+    /// Error bit: register/soc/rmt_reg.h:1650-1656. GDMA writeback/owner:
+    /// register/soc/gdma_reg.h:585-618; OUT interrupts:649-678.
+    /// Descriptor fields: components/hal/include/hal/dma_types.h:23-32.
+    /// Stage a finite RMT DMA transaction on register writes. No idle tick pump.
+    /// Descriptor reads reuse the existing bounded walker and unpriced bus access.
+    /// With CH3 DMA_ACCESS_EN set, CH3 CONF0 and writes to a running trigger-9 GDMA OUT
+    /// channel stage the transaction.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn rmt_dma_write(&mut self, a: u32, v: u32) {
+        let stage = match a >> 12 {
+            0x60016 => a & 0xfff == 0x2c,
+            0x6003f => {
+                let channel = ((a & 0xfff) / crate::periph::GDMA_CH_STRIDE) as usize;
+                let Some(c) = self.periph.gdma.out.get(channel) else { return; };
+                let off = (a & 0xfff) % crate::periph::GDMA_CH_STRIDE;
+                // IDF v5.5.4 soc/esp32s3/register/soc/gdma_reg.h:
+                // OUT_RST (OUT_CONF0 bit 0), OUTLINK_START bit 21, RESTART bit 22.
+                // Reset self-clears in GDMA, so inspect the written value. A fresh
+                // START owns its new link; only continuation keeps the saved node.
+                if c.peri_sel == 9 && ((off == 0x60 && v & 1 != 0) || (off == 0x80 && v & (1 << 21) != 0)) {
+                    self.periph.rmt.clear_dma_resume();
+                }
+                c.running && c.peri_sel == 9
+            }
+            _ => false,
+        };
+        if stage { self.stage_rmt_dma(); }
+    }
+    /// Stage TX3 symbols through the shared OUT gather, one SUC_EOF node at a time.
+    /// IDF v5.5.5 components/esp_driver_rmt/src/rmt_tx.c:79-95,693-701 and 1105-1132 feed long
+    /// frames through a two-node ring (SUC_EOF on both nodes) refilled from the OUT_EOF callback
+    /// and continued with gdma_append (OUT_LINK RESTART). Staging is instantaneous, so it reaches
+    /// a node the callback has not refilled yet, where real hardware is still held back by the
+    /// RMT FIFO: such a CPU-owned node waits for the next append instead of faulting, and
+    /// RESTART resumes after the last staged node.
+    fn stage_rmt_dma(&mut self) {
+        let Some(ch) = self.periph.gdma.out_channel_for(9) else { return; };
+        let resume = self.periph.rmt.dma_resume();
+        if resume != 0 { self.periph.gdma.out[ch].desc = resume; }
+        let limit = RMT_DMA_SYMBOL_LIMIT.saturating_sub(self.periph.rmt.dma_fifo_len()) * 4;
+        // Ask for one byte more than fits: `RmtDmaOut` accepts whole symbols only, so a chain
+        // longer than the queue's room fails as a misaligned length instead of being cut.
+        let mut bytes = Vec::new();
+        match esp_periph::gdma::gather_out(&mut RmtDmaOut { bus: self, channel: ch }, limit + 1, &mut bytes) {
+            Ok(next) => {
+                self.periph.rmt.dma_fifo().extend(bytes.as_chunks::<4>().0.iter().map(|&word| u32::from_le_bytes(word)));
+                self.periph.rmt.set_dma_resume(next);
+                let c = &mut self.periph.gdma.out[ch];
+                c.desc = next;
+                if next == 0 { c.running = false; c.int_raw |= 1 << 3; }   // OUT_TOTAL_EOF
+            }
+            Err(DmaDescriptorFault::NotOwned { descriptor }) if resume != 0 && descriptor == resume && bytes.is_empty() => {}
+            _ => {
+                self.fail_dma_out(ch);
+                self.periph.rmt.int_raw |= 1 << 28;
+                self.periph.rmt.clear_dma_fifo();
+            }
+        }
+        self.irq_dirty = true;
+    }
+
     pub(super) fn complete_spi2_dma(&mut self) {
         if let Some((deadline, _)) = &self.spi2_scheduled {
             if self.cycles < *deadline { return; }
@@ -60,21 +99,33 @@ impl SocBus {
             self.commit_spi2_dma(completion);
             return;
         }
-        if self.periph.spi2.dma_tx_pending.is_none() {
+        if self.periph.spi2.dma_tx_pending.is_some() { self.complete_gpspi_dma(2); }
+    }
+
+    /// SPI3's DMA data phase, through the GDMA OUT channel of trigger 1
+    /// (SOC_GDMA_TRIG_PERIPH_SPI3). Always committed at once: the experimental wire timing
+    /// (`spi2_timing`) is SPI2's only.
+    #[inline(always)]
+    pub(super) fn complete_spi3_dma(&mut self) { if self.periph.spi3.dma_tx_pending.is_some() { self.complete_gpspi_dma(3); } }
+
+    #[inline(never)]
+    fn complete_gpspi_dma(&mut self, host: u8) {
+        if self.periph.gpspi(host).dma_tx_pending.is_none() {
             return;
         }
-        let channel = self.periph.gdma.out_channel_for(0);
-        if channel.is_none() && !self.periph.gdma.out.iter().any(|c| c.peri_sel == 0 && c.desc != 0) {
+        let peri = u32::from(host - 2);                                 // GDMA trigger: SPI2 0, SPI3 1
+        let channel = self.periph.gdma.out_channel_for(peri);
+        if channel.is_none() && !self.periph.gdma.out.iter().any(|c| c.peri_sel == peri && c.desc != 0) {
             // A DMA command without a bound channel cannot progress. Abort it just
             // like a descriptor failure so firmware can issue a later CPU command.
             // A stopped channel with a descriptor remains bound and can be restarted.
-            self.periph.spi2.fail_dma_tx();
+            self.periph.gpspi_mut(host).fail_dma_tx();
             self.irq_dirty = true;
             return;
         }
-        match self.spi2_dma_completion() {
+        match self.spi2_dma_completion(host) {
             Ok(Some(completion)) => {
-                if self.spi2_timing {
+                if host == 2 && self.spi2_timing {
                     // Rough wire-time floor, assuming the normal 80 MHz SPI source.
                     // Payload is snapshotted at submission; no progressive SRAM reads yet.
                     let cycles = self.periph.spi2.wire_source_cycles() * (crate::periph::CPU_HZ / 80_000_000);
@@ -89,7 +140,7 @@ impl SocBus {
             Ok(None) => {}
             Err(fault) => {
                 if let Some(channel) = channel {
-                    self.fail_spi2_dma(channel, fault);
+                    self.fail_spi2_dma(host, channel, fault);
                 }
             }
         }
@@ -98,7 +149,7 @@ impl SocBus {
     fn commit_spi2_dma(&mut self, completion: Spi2DmaCompletion) {
         for (descriptor, control) in completion.descriptor_writebacks {
             if let Err(fault) = self.write32_unpriced(descriptor, control) {
-                self.fail_spi2_dma(completion.channel, DmaDescriptorFault::Writeback { descriptor, fault });
+                self.fail_spi2_dma(completion.host, completion.channel, DmaDescriptorFault::Writeback { descriptor, fault });
                 return;
             }
         }
@@ -112,45 +163,60 @@ impl SocBus {
         channel.running = channel.running && completion.running;
         if let Some(descriptor) = completion.eof_desc { channel.eof_desc = descriptor; }
         channel.int_raw |= completion.raised_interrupts;
-        self.periph.spi2.complete_dma_tx(&completion.payload);
+        self.periph.gpspi_mut(completion.host).complete_dma_tx(&completion.payload);
         self.irq_dirty = true;
     }
 
-    fn fail_spi2_dma(&mut self, channel: usize, fault: DmaDescriptorFault) {
-        if self.periph.spi2.log { eprintln!("[spi2] DMA descriptor fault: {fault:?}"); }
-        self.spi2_dma_fault = Some(fault);
+    fn fail_spi2_dma(&mut self, host: u8, channel: usize, fault: DmaDescriptorFault) {
+        if self.periph.gpspi(host).log { eprintln!("[spi{host}] DMA descriptor fault: {fault:?}"); }
+        if host == 2 { self.spi2_dma_fault = Some(fault); } else { self.spi3_dma_fault = Some(fault); }
         let gdma = &mut self.periph.gdma.out[channel];
         gdma.running = false;
         gdma.int_raw |= 1 << 2;                                         // OUT_DSCR_ERR
-        self.periph.spi2.fail_dma_tx();
+        self.periph.gpspi_mut(host).fail_dma_tx();
         self.irq_dirty = true;
     }
 
-    pub(super) fn deliver_spi2_transfer(&mut self) {
-        if self.periph.spi2.dma_tx_pending.is_some() {
+    // EX255: every device flush and register write services both GP-SPI hosts, almost always
+    // with nothing queued. Test that inline; the out-of-line body keeps its own checks.
+    #[inline(always)]
+    pub(super) fn deliver_spi2_transfer(&mut self) { if self.periph.spi2.has_pending_transfer() { self.deliver_gpspi_transfer(2); } }
+    /// The same for SPI3 (the board's `host` 3).
+    #[inline(always)]
+    pub(super) fn deliver_spi3_transfer(&mut self) { if self.periph.spi3.has_pending_transfer() { self.deliver_gpspi_transfer(3); } }
+
+    #[inline(never)]
+    fn deliver_gpspi_transfer(&mut self, host: u8) {
+        if self.periph.gpspi(host).dma_tx_pending.is_some() {
             return;
         }
-        let Some(transfer) = self.periph.spi2.take_transfer() else { return };
+        let Some(transfer) = self.periph.gpspi_mut(host).take_transfer() else { return };
         // Chip select and command/data lines are GPIOs. The board must see their preceding edges
         // before it receives the transaction.
         if !self.periph.gpio.changes.is_empty() {
-            let changes = std::mem::take(&mut self.periph.gpio.changes);
+            let changes = &self.periph.gpio.changes;
             if let Some(events) = &mut self.gpio_events {
-                for &(pin, level) in &changes {
+                for &(pin, level) in changes {
                     events.push((self.cycles, pin, level));
                 }
             }
-            self.board.gpio_changes(&changes);
+            self.board.gpio_output_at(self.cycles, changes, self.periph.gpio.enable, self.periph.gpio.out);
+            self.periph.gpio.changes.clear();
         }
-        let rx = self.board.spi_transfer(2, &transfer.tx, transfer.rx_len);
-        self.periph.spi2.finish_transfer(transfer, &rx);
+        let pins = if host == 2 { self.spi2_pins.take() } else { self.spi3_pins.take() };
+        let rx = if let Some(pins) = pins {
+            self.board.spi_transfer_pins(host, pins, &transfer.tx, transfer.rx_len)
+        } else {
+            self.board.spi_transfer(host, &transfer.tx, transfer.rx_len)
+        };
+        self.periph.gpspi_mut(host).finish_transfer(transfer, &rx);
     }
 
-    /// Collect one GP-SPI2 data phase and its GDMA completion without partially committing a
-    /// malformed descriptor chain.
-    fn spi2_dma_completion(&mut self) -> Result<Option<Spi2DmaCompletion>, DmaDescriptorFault> {
-        let Some(bits) = self.periph.spi2.dma_tx_pending else { return Ok(None) };
-        let Some(channel_index) = self.periph.gdma.out_channel_for(0) else { return Ok(None) };
+    /// Collect one GP-SPI data phase (`host` 2 or 3) and its GDMA
+    /// completion without partially committing a malformed descriptor chain.
+    fn spi2_dma_completion(&mut self, host: u8) -> Result<Option<Spi2DmaCompletion>, DmaDescriptorFault> {
+        let Some(bits) = self.periph.gpspi(host).dma_tx_pending else { return Ok(None) };
+        let Some(channel_index) = self.periph.gdma.out_channel_for(u32::from(host - 2)) else { return Ok(None) };
         let wanted = (bits as usize).div_ceil(8);
         let mut payload = Vec::with_capacity(wanted);
         let mut visited = HashSet::new();
@@ -216,7 +282,7 @@ impl SocBus {
             return Err(DmaDescriptorFault::PayloadTooShort { expected: wanted, actual: payload.len() });
         }
         Ok(Some(Spi2DmaCompletion {
-            channel: channel_index, desc: channel.desc, buf_pos: channel.buf_pos,
+            host, channel: channel_index, desc: channel.desc, buf_pos: channel.buf_pos,
             running: channel.running,
             eof_desc: (channel.int_raw & (1 << 1) != 0).then_some(channel.eof_desc),
             raised_interrupts: channel.int_raw, descriptor_writebacks, payload,
@@ -251,10 +317,31 @@ impl SocBus {
         Ok(())
     }
 
-    /// Move I2S TX data out of DMA descriptors at the sample rate.
+    fn dma_i2s_rx(&mut self, cycles: u64, port: u32) {
+        let Some(ch) = self.periph.gdma.in_channel_for(3 + port) else { return };
+        let signals = esp_periph::i2s::RxSignals { data: if port == 0 { 25 } else { 30 }, clock: if port == 0 { [26, 27] } else { [31, 32] }, input_select_bit: 7, output_mask: 0x3ff };
+        let mut bank = self.periph.i2s0.take_pcm_bank();
+        let i2s = if port == 0 { &mut self.periph.i2s0 } else { &mut self.periph.i2s1 };
+        let bytes = i2s.receive(cycles, self.cycles, port == 0, &self.periph.gpio, signals, bank.as_deref_mut());
+        let eof = i2s.read(0x64);
+        self.periph.i2s0.restore_pcm_bank(bank);
+        let _ = self.scatter_dma_in(ch, &bytes, Some(eof), false);
+        let i2s = if port == 0 { &mut self.periph.i2s0 } else { &mut self.periph.i2s1 };
+        i2s.recycle_rx_buffer(bytes);
+    }
+
+    /// Move I2S TX data out of, and RX data into, DMA descriptors at the sample rate. One cached
+    /// flag per controller gates both directions, so an idle controller costs what TX alone did.
     pub(super) fn dma_i2s_step(&mut self, cycles: u64) {
-        self.dma_i2s_one(cycles, 0);
-        self.dma_i2s_one(cycles, 1);
+        if self.periph.i2s0.poll_active() { self.dma_i2s_port(cycles, 0); }
+        if self.periph.i2s1.poll_active() { self.dma_i2s_port(cycles, 1); }
+    }
+
+    #[inline(never)]
+    fn dma_i2s_port(&mut self, cycles: u64, which: usize) {
+        self.dma_i2s_one(cycles, which);
+        let i2s = if which == 0 { &self.periph.i2s0 } else { &self.periph.i2s1 };
+        if i2s.rx_running() { self.dma_i2s_rx(cycles, which as u32); }
     }
 
     /// Move I2S TX data for controller `which` (0 = I2S0 on GDMA trigger 3, 1 = I2S1 on trigger 4).
@@ -303,24 +390,9 @@ impl SocBus {
         if !samples.is_empty() { let i2s = if which == 0 { &mut self.periph.i2s0 } else { &mut self.periph.i2s1 }; i2s.frames_out += samples.len() as u64; i2s.pcm.extend_from_slice(&samples); }
     }
 
-    /// One DMA descriptor as the engines see it, with its first word, or the fault reading it.
-    fn try_dma_desc(&mut self, addr: u32) -> Result<(u32, crate::periph::DmaDesc), DmaDescriptorFault> {
-        let mut word = |offset, word| self.read32_unpriced(addr.wrapping_add(offset))
-            .map_err(|fault| DmaDescriptorFault::Read { descriptor: addr, word, fault });
-        let dw0 = word(0, DmaDescriptorWord::Control)?;
-        let (buf, next) = (word(4, DmaDescriptorWord::Buffer)?, word(8, DmaDescriptorWord::Next)?);
-        Ok((dw0, crate::periph::DmaDesc { addr, size: dw0 & 0xfff, length: (dw0 >> 12) & 0xfff, eof: dw0 & (1 << 30) != 0, owner_dma: dw0 & (1 << 31) != 0, buf, next }))
-    }
-
     fn fail_dma_out(&mut self, ch: usize) {
         self.periph.gdma.out[ch].running = false;
         self.periph.gdma.out[ch].int_raw |= 1 << 2; // OUT_DSCR_ERR
-        self.irq_dirty = true;
-    }
-
-    fn fail_dma_in(&mut self, ch: usize) {
-        self.periph.gdma.inp[ch].running = false;
-        self.periph.gdma.inp[ch].int_raw |= 1 << 3; // IN_DSCR_ERR
         self.irq_dirty = true;
     }
 
@@ -421,17 +493,6 @@ impl SocBus {
         }
     }
 
-    /// Hand a filled or EOF-ended IN descriptor back to the CPU (its length, owner, SUC_EOF) and
-    /// move the channel to the next one. False when the write-back faults.
-    fn dma_close_in(&mut self, r: &mut crate::periph::GdmaInCh, dw0: u32, next: u32, eof: bool) -> bool {
-        let v = (dw0 & !(0xfff << 12) & !(3 << 30)) | (r.buf_pos << 12) | if eof { 1 << 30 } else { 0 };
-        if self.write32_unpriced(r.desc, v).is_err() { return false; }
-        r.int_raw |= 1 << 0;                                                  // IN_DONE
-        if eof { r.int_raw |= 1 << 1; r.eof_desc = r.desc; }                  // IN_SUC_EOF
-        r.desc = next; r.buf_pos = 0;
-        true
-    }
-
     /// Memory-to-memory GDMA: a channel pair whose IN side has MEM_TRANS_EN set copies its OUT
     /// descriptor chain into its IN chain — the transaction-based `esp_async_memcpy` of IDF v5.4,
     /// which starts both channels for each copy. The copy lands in one scheduling round, no
@@ -488,7 +549,7 @@ impl SocBus {
                         r.buf_pos += n;
                     }
                     let eof_now = o.buf_pos == od.length && od.eof;
-                    if (r.buf_pos == id.size || eof_now) && !self.dma_close_in(&mut r, in_dw0, id.next, eof_now) {
+                    if (r.buf_pos == id.size || eof_now) && !r.close(self, in_dw0, id.next, eof_now) {
                         r.int_raw |= IN_DSCR_ERR; r.running = false; break;
                     }
                     if o.buf_pos < od.length { continue; }                                 // the IN buffer filled first
@@ -510,18 +571,63 @@ impl SocBus {
         }
     }
 
-    /// Camera engine: when a sensor frame is due, push it through the GDMA IN channel bound to CAM (trigger 5).
+    /// Sensor VSYNC precedes capture, allowing the driver to arm GDMA during blanking.
+    /// CAM_VSYNC_INT bit 2, CAM_START bit 29 and CAM_VS_EOF_EN bit 8:
+    /// ESP-IDF v5.5.4 components/soc/esp32s3/register/soc/lcd_cam_reg.h,
+    /// unchanged in v4.4.8 components/soc/esp32s3/include/soc/lcd_cam_reg.h.
     pub(super) fn dma_cam_step(&mut self, cycles: u64) {
-        if !self.periph.lcd_cam.frame_due(cycles) { return; }
-        let Some(ch) = self.periph.gdma.in_channel_for(5) else { self.periph.lcd_cam.dropped += 1; return };
-        let Some((_w, _h, frame)) = self.board.camera_frame() else { self.periph.lcd_cam.dropped += 1; return };
-        if self.scatter_dma_in(ch, &frame).is_err() {
-            self.fail_dma_in(ch);
-            self.periph.lcd_cam.dropped += 1;
+        if !self.periph.lcd_cam.cam_clock_active() { return; }
+        let before = self.periph.lcd_cam.acc;
+        if self.periph.lcd_cam.frame_due(cycles) {
+            if self.periph.lcd_cam.cam_ctrl() & (1 << 8) != 0 {
+                if let Some(ch) = self.periph.gdma.in_channel_for(5) {
+                    self.camera_dma_in(ch, &[], None, true);
+                }
+            }
+            let frame = if self.periph.lcd_cam.cam_active() { self.board.camera_frame().map(|(_, _, frame)| frame) } else { None };
+            let cam = &mut self.periph.lcd_cam;
+            cam.set_cam_frame(frame);
+            cam.frame_dropped = false;
+            if cam.cam_frame().is_some() {
+                cam.int_raw |= 1 << 2;
+                cam.frames += 1;
+                self.irq_dirty = true;
+            }
             return;
         }
-        self.periph.lcd_cam.int_raw |= 1 << 2;                                                  // CAM_VSYNC_INT
-        self.periph.lcd_cam.frames += 1;
+        let cam = &mut self.periph.lcd_cam;
+        if !cam.running() { return; }
+        let Some(frame) = cam.cam_frame().cloned() else { return };
+        // Approximate DVP: 5% blanking, then half a period of active pixels.
+        let position = |phase: u64| ((phase.saturating_sub(cam.frame_start.saturating_add(cam.frame_cycles / 20)) as u128 * frame.len() as u128 * 2) / cam.frame_cycles.max(1) as u128).min(frame.len() as u128) as usize;
+        let end = position(cam.acc);
+        // Belt-and-braces: u128 progress is monotonic, so start already cannot exceed end.
+        let start = position(before).min(end);
+        if start == end { return; }
+        // IDF v5.5.4 soc/lcd_cam_reg.h: BIT_ORDER bit 6, 2BYTE_EN bit 24,
+        // VH_DE_MODE_EN bit 28, REC_DATA_BYTELEN bits 0..15 (encoded length - 1).
+        // These bits also match IDF v4.4.8 soc/lcd_cam_reg.h.
+        let ch = self.periph.gdma.in_channel_for(5);
+        if cam.cam_ctrl1 & ((1 << 24) | (1 << 28)) != 0 || ch.is_none() {
+            if !cam.frame_dropped { cam.dropped += 1; cam.frame_dropped = true; }
+            return;
+        }
+        let eof = (cam.cam_ctrl() & (1 << 8) == 0).then_some((cam.cam_ctrl1 & 0xffff) + 1);
+        let reversed;
+        let bytes = if cam.cam_ctrl() & (1 << 6) != 0 {
+            reversed = frame[start..end].iter().map(|b| b.reverse_bits()).collect::<Vec<_>>();
+            &reversed[..]
+        } else { &frame[start..end] };
+        self.camera_dma_in(ch.unwrap(), bytes, eof, false);
+    }
+
+    fn camera_dma_in(&mut self, ch: usize, bytes: &[u8], eof: Option<u32>, finish: bool) {
+        let mut channel = self.periph.gdma.inp[ch];
+        if !channel.scatter(self, bytes, eof, finish, Self::is_periph) {
+            if channel.desc != 0 { channel.fail_receive(&mut self.irq_dirty); }
+            channel.running = false;
+        }
+        self.periph.gdma.inp[ch] = channel;
         self.irq_dirty = true;
     }
 
@@ -584,67 +690,17 @@ impl SocBus {
         }
     }
 
-    /// Gather a finite crypto transaction. Descriptor visits bound both runtime and allocation
-    /// (4096 * 4095 bytes maximum); a visited set rejects cycles independently of owner checking.
-    fn gather_dma_out(&mut self, ch: usize, limit: usize) -> Result<Vec<u8>, DmaDescriptorFault> {
-        let mut input = Vec::new();
-        let mut desc = self.periph.gdma.out[ch].desc;
-        let mut visited = HashSet::new();
-        let mut walk = DescriptorWalk::new(GDMA_DESCRIPTOR_STEP_BUDGET);
-        while desc != 0 && input.len() < limit {
-            if !visited.insert(desc) { return Err(DmaDescriptorFault::Cycle { descriptor: desc }); }
-            let (control, d) = walk.read(self, desc)?;
-            if self.periph.gdma.out[ch].conf1 & (1 << 12) != 0 && !d.owner_dma { return Err(DmaDescriptorFault::NotOwned { descriptor: desc }); }
-            let take = (d.length as usize).min(limit - input.len());
-            self.append_mapped_bytes(d.buf, take, &mut input).map_err(|(address, fault)|
-                DmaDescriptorFault::BufferRead { descriptor: desc, address, fault })?;
-            self.write32_unpriced(desc, control & !(1 << 31)).map_err(|fault|
-                DmaDescriptorFault::Writeback { descriptor: desc, fault })?;
-            self.periph.gdma.out[ch].int_raw |= 1 << 0;
-            if d.eof {
-                self.periph.gdma.out[ch].int_raw |= 1 << 1;
-                self.periph.gdma.out[ch].eof_desc = desc;
-                break;
-            }
-            desc = d.next;
-        }
-        Ok(input)
+    fn scatter_dma_in(&mut self, ch: usize, data: &[u8], eof_bytes: Option<u32>, finish: bool) -> Result<(), ()> {
+        let mut channel = self.periph.gdma.inp[ch];
+        let mut irq_changed = false;
+        let result = channel.receive(self, data, eof_bytes, finish, Self::is_periph, &mut irq_changed);
+        self.irq_dirty |= irq_changed;
+        self.periph.gdma.inp[ch] = channel;
+        result.then_some(()).ok_or(())
     }
 
-    /// Shared camera/crypto receive path. A malformed destination never reports successful EOF.
-    fn scatter_dma_in(&mut self, ch: usize, data: &[u8]) -> Result<(), ()> {
-        let mut pos = 0usize;
-        let mut walk = DescriptorWalk::new(GDMA_DESCRIPTOR_STEP_BUDGET);
-        while pos < data.len() {
-            let mut r = self.periph.gdma.inp[ch];
-            if r.desc == 0 { return Err(()); }
-            let (control, d) = walk.read(self, r.desc).map_err(|_| ())?;
-            if (r.conf1 & (1 << 12) != 0 && !d.owner_dma) || d.size == 0 { return Err(()); }
-            let n = (d.size as usize).min(data.len() - pos);
-            let end = d.buf.checked_add(n as u32).ok_or(())?;
-            // DMA buffers are memory, never MMIO. The word-copy fast path must preserve the
-            // byte bus's rejection of peripheral destinations instead of triggering devices.
-            if Self::is_periph(d.buf) || Self::is_periph(end - 1) { return Err(()); }
-            let mut i = 0;
-            while i + 4 <= n {
-                let word = u32::from_le_bytes(data[pos + i..pos + i + 4].try_into().unwrap());
-                self.write32_unpriced(d.buf.wrapping_add(i as u32), word).map_err(|_| ())?;
-                i += 4;
-            }
-            while i < n {
-                self.write8_unpriced(d.buf.wrapping_add(i as u32), data[pos + i]).map_err(|_| ())?;
-                i += 1;
-            }
-            pos += n;
-            r.buf_pos = n as u32;
-            if !self.dma_close_in(&mut r, control, d.next, pos == data.len()) { return Err(()); }
-            if r.desc == 0 { r.running = false; }
-            self.periph.gdma.inp[ch] = r;
-        }
-        Ok(())
-    }
-
-    /// Feed SHA from its GDMA out channel (peripheral 7).
+    /// Feed SHA from its GDMA out channel (peripheral 7). Main's shape, so the step stays
+    /// inlined in `tick_impl` without growing its frame; only the gather is shared.
     pub(super) fn sha_dma_step(&mut self) {
         self.periph.sha.dma_pending = false;
         let want = (self.periph.sha.block_num as usize).saturating_mul(self.periph.sha.block_bytes());
@@ -653,18 +709,11 @@ impl SocBus {
         if want > GDMA_DESCRIPTOR_STEP_BUDGET * 4095 {
             self.fail_dma_out(ch); self.periph.sha.busy = false; return;
         }
-        let Ok(input) = self.gather_dma_out(ch, want) else {
-            self.fail_dma_out(ch); self.periph.sha.busy = false; return;
-        };
-        if input.len() != want {
+        let mut input = Vec::new();
+        if esp_periph::gdma::gather_out(&mut CryptoDmaOut { bus: self, channel: ch }, want, &mut input).is_err() || input.len() != want {
             self.fail_dma_out(ch); self.periph.sha.busy = false; return;
         }
-        let bs = self.periph.sha.block_bytes();
-        let mut first = self.periph.sha.dma_first;
-        for block in input.chunks(bs) {
-            self.periph.sha.hash_block(block, first);
-            first = false;
-        }
+        self.periph.sha.hash_dma_input(&input);
         self.periph.sha.busy = false;
         self.irq_dirty = true;
     }
@@ -674,19 +723,46 @@ impl SocBus {
         let (Some(out_ch), Some(in_ch)) = (self.periph.gdma.out_channel_for(6), self.periph.gdma.in_channel_for(6)) else {
             self.periph.aes.state = 2; self.periph.aes.int_raw |= 1; self.irq_dirty = true; return;
         };
-        let Ok(input) = self.gather_dma_out(out_ch, usize::MAX) else {
+        let mut input = Vec::new();
+        if esp_periph::gdma::gather_out(&mut CryptoDmaOut { bus: self, channel: out_ch }, usize::MAX, &mut input).is_err() {
             self.fail_dma_out(out_ch); self.periph.aes.state = 0; return;
-        };
+        }
         if self.debug.has("aes") {
             eprintln!("[aes] dma block_mode={} num_blocks={} mode={} bytes={}", self.periph.aes.block_mode, self.periph.aes.num_blocks, self.periph.aes.mode, input.len());
         }
         let output = self.periph.aes.transform_blocks(&input);
-        if self.scatter_dma_in(in_ch, &output).is_err() {
-            self.fail_dma_in(in_ch); self.periph.aes.state = 0; return;
+        if self.scatter_dma_in(in_ch, &output, Some(output.len() as u32), false).is_err() {
+            self.periph.aes.state = 0; return;
         }
         self.periph.aes.state = 2;                                              // DONE
         self.periph.aes.int_raw |= 1;
         self.irq_dirty = true;
     }
 
+}
+
+/// The S3 bus as crypto DMA memory: main's unpriced bus accesses, so descriptors and write-backs
+/// that land on registers keep their side effects. Descriptor words feed `DescriptorWalk::read_with`.
+struct CryptoDmaOut<'a> { bus: &'a mut SocBus, channel: usize }
+impl esp_periph::gdma::OutMemory for CryptoDmaOut<'_> {
+    fn out_channel(&mut self) -> &mut esp_periph::GdmaOutCh { &mut self.bus.periph.gdma.out[self.channel] }
+    fn word(&mut self, address: u32) -> Result<u32, Fault> { self.bus.read32_unpriced(address) }
+    fn append(&mut self, address: u32, count: usize, out: &mut Vec<u8>) -> Result<(), (u32, Fault)> { self.bus.append_mapped_bytes(address, count, out) }
+    fn writeback(&mut self, address: u32, value: u32) -> Result<(), Fault> { self.bus.write32_unpriced(address, value) }
+}
+
+/// RMT DMA memory: symbol buffers are word arrays in RAM. Descriptors in MMIO and misaligned
+/// buffers or lengths are rejected; everything else is the crypto adapter's bus access.
+struct RmtDmaOut<'a> { bus: &'a mut SocBus, channel: usize }
+impl esp_periph::gdma::OutMemory for RmtDmaOut<'_> {
+    fn out_channel(&mut self) -> &mut esp_periph::GdmaOutCh { &mut self.bus.periph.gdma.out[self.channel] }
+    fn word(&mut self, address: u32) -> Result<u32, Fault> {
+        if SocBus::is_periph(address) { return Err(Fault::Prohibited); }
+        self.bus.read32_unpriced(address)
+    }
+    fn append(&mut self, address: u32, count: usize, out: &mut Vec<u8>) -> Result<(), (u32, Fault)> {
+        if address & 3 != 0 || count & 3 != 0 { return Err((address, Fault::Misaligned)); }
+        self.bus.append_mapped_bytes(address, count, out)
+    }
+    fn writeback(&mut self, address: u32, value: u32) -> Result<(), Fault> { self.bus.write32_unpriced(address, value) }
 }

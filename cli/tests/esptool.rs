@@ -108,7 +108,7 @@ fn start_download(chip: &str, state_flag: &str, state: &std::path::Path) -> (Chi
             "--boot",
             "download",
             "--flash-mb",
-            "4",
+            if chip == "esp32s3" { "8" } else { "4" },
             state_flag,
         ])
         .arg(state)
@@ -133,9 +133,10 @@ fn lifecycle(chip: &str, rom_name: &str, prefix: &str) {
     let _ = std::fs::remove_file(&state);
     let (mut emulator, socket) = start_download(chip, "--flash-state", &state);
 
-    let bootloader = root().join(format!("{FW}/{prefix}-hello-bootloader.bin"));
-    let ptable = root().join(format!("{FW}/{prefix}-hello-ptable.bin"));
-    let app = root().join(format!("{FW}/{prefix}-hello_world.bin"));
+    let stem = if prefix.is_empty() { String::new() } else { format!("{prefix}-") };
+    let bootloader = root().join(format!("{FW}/{stem}hello-bootloader.bin"));
+    let ptable = root().join(format!("{FW}/{stem}hello-ptable.bin"));
+    let app = root().join(format!("{FW}/{stem}hello_world.bin"));
     let flash = esptool(&[
         "--chip",
         chip,
@@ -157,18 +158,20 @@ fn lifecycle(chip: &str, rom_name: &str, prefix: &str) {
         .matches("Hash of data verified.")
         .count();
     if !flash.status.success() || verified != 3 {
+        let premature_exit = emulator.try_wait().unwrap();
         let _ = emulator.kill();
         let emulator_output = emulator.wait_with_output().unwrap();
         panic!(
-            "esptool flash failed or verified {verified}/3 images:\n{}\n{}\nemulator:\n{}",
+            "esptool flash failed or verified {verified}/3 images (premature exit {premature_exit:?}):\n{}\n{}\nemulator:\n{}",
             tail(&flash.stdout),
             tail(&flash.stderr),
             tail(&emulator_output.stderr)
         );
     }
-    let download = wait_for_exit(emulator);
+    // The S3 stub remains in its command loop with --after no_reset; stop the host after verification.
+    let download = if chip == "esp32s3" { stop_download(emulator) } else { wait_for_exit(emulator) };
     assert!(
-        download.status.success(),
+        chip == "esp32s3" || download.status.success(),
         "download emulator failed:\n{}",
         tail(&download.stderr)
     );
@@ -177,7 +180,7 @@ fn lifecycle(chip: &str, rom_name: &str, prefix: &str) {
     let boot = Command::new(BIN)
         .args(["--chip", chip, "--board", "none", "--boot", "rom", "--rom"])
         .arg(rom)
-        .args(["--flash-mb", "4", "--flash-state"])
+        .args(["--flash-mb", if chip == "esp32s3" { "8" } else { "4" }, "--flash-state"])
         .arg(&state)
         .args(["--console", "uart0", "--max-seconds", "2", "--no-dump"])
         .current_dir(root())
@@ -282,4 +285,16 @@ fn external_espefuse_c3_persistence() {
 #[ignore = "needs espefuse 4.8.1 (ESPTOOL_PYTHON) and the ESP32-C6 mask ROM ELF"]
 fn external_espefuse_c6_persistence() {
     efuse_lifecycle("esp32c6", "dc:1e:d5:ff:fe:6e:8c:dc");
+}
+
+#[test]
+#[ignore = "needs esptool 4.8.1 (ESPTOOL_PYTHON) and the ESP32-S3 mask ROM ELF"]
+fn external_esptool_s3_v2_lifecycle() {
+    lifecycle("esp32s3", "esp32s3_rev0", "");
+}
+
+#[test]
+#[ignore = "needs espefuse 4.8.1 (ESPTOOL_PYTHON) and the ESP32-S3 mask ROM ELF"]
+fn external_espefuse_s3_persistence() {
+    efuse_lifecycle("esp32s3", "44:1b:f6:75:dc:e0");
 }

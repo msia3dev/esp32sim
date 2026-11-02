@@ -1,0 +1,400 @@
+{
+  "baseline_revision": "9fdeb323837d090b038a1036d2f344566546d466",
+  "candidate": "integration tree; see source-hashes.json",
+  "environment": {
+    "os": "Darwin",
+    "arch": "arm64",
+    "rust": "rustc 1.99.1 (58cf8f9c3 2026-10-13)"
+  },
+  "conditions": "serial alternating pairs, no imposed load gate; short CPU samples, no isolated speed claim",
+  "clock": "delta RUSAGE_CHILDREN.ru_utime with one subprocess at a time",
+  "binary_sha256": {
+    "baseline": "f7e17693db99b1b7c57eaad56006617491804d1b97455833b11f094e9c88bb6c",
+    "candidate": "baae3c7cf3d590aa5b1435d799c6e4bf1cd160cbe39620b816ef0dc96154cad8"
+  },
+  "workloads": [
+    {
+      "name": "hello",
+      "inputs": {
+        "esp32s3_rev0_rom.elf": "c0ce0f338d1de1bdc6efbef1591779a2a42c1ab7d759d3c6ae8ae63a7dd34cfd",
+        "public/hello-bootloader.bin": "7efecb4df4463ece11ab286068a505ecd174f66fd4aacc53d887fcb9c18f0579",
+        "public/hello-ptable.bin": "7f00b6c042a89b15b0cac534f82ed988caf29278ff5700b0c511eb1b5bb7c820",
+        "public/hello_world.bin": "d9142e72453e8b71f6903f4dd869a4ee09c34d94cfafcb4f4309f8d2bf9040c9"
+      },
+      "arguments": [
+        "--chip",
+        "s3",
+        "--board",
+        "none",
+        "--boot",
+        "rom",
+        "--console",
+        "uart0",
+        "--no-dump",
+        "--max-seconds",
+        "30",
+        "--flash-mb",
+        "8",
+        "--psram-mb",
+        "2",
+        "--rom",
+        "${ASSETS}/esp32s3_rev0_rom.elf",
+        "--bootloader",
+        "${ASSETS}/public/hello-bootloader.bin",
+        "--ptable",
+        "${ASSETS}/public/hello-ptable.bin",
+        "--app",
+        "${ASSETS}/public/hello_world.bin"
+      ],
+      "samples": [
+        {
+          "pair": 1,
+          "order": [
+            "baseline",
+            "candidate"
+          ],
+          "baseline": {
+            "user_s": 0.368537,
+            "insns": "core0 11990305 + core1 6798164",
+            "cycles": 7200000000,
+            "console_sha256": "c74f198e19e94c47772b3403433b5532057180aa63df46ff90ffe9a51710966f",
+            "load": [
+              8.67138671875,
+              30.8310546875,
+              89.3828125
+            ]
+          },
+          "candidate": {
+            "user_s": 0.39459699999999986,
+            "insns": "core0 11990305 + core1 6798164",
+            "cycles": 7200000000,
+            "console_sha256": "c74f198e19e94c47772b3403433b5532057180aa63df46ff90ffe9a51710966f",
+            "load": [
+              8.67138671875,
+              30.8310546875,
+              89.3828125
+            ]
+          }
+        },
+        {
+          "pair": 2,
+          "order": [
+            "candidate",
+            "baseline"
+          ],
+          "candidate": {
+            "user_s": 0.3925130000000001,
+            "insns": "core0 11990305 + core1 6798164",
+            "cycles": 7200000000,
+            "console_sha256": "c74f198e19e94c47772b3403433b5532057180aa63df46ff90ffe9a51710966f",
+            "load": [
+              8.67138671875,
+              30.8310546875,
+              89.3828125
+            ]
+          },
+          "baseline": {
+            "user_s": 0.36847299999999983,
+            "insns": "core0 11990305 + core1 6798164",
+            "cycles": 7200000000,
+            "console_sha256": "c74f198e19e94c47772b3403433b5532057180aa63df46ff90ffe9a51710966f",
+            "load": [
+              8.67138671875,
+              30.8310546875,
+              89.3828125
+            ]
+          }
+        },
+        {
+          "pair": 3,
+          "order": [
+            "baseline",
+            "candidate"
+          ],
+          "baseline": {
+            "user_s": 0.36839600000000017,
+            "insns": "core0 11990305 + core1 6798164",
+            "cycles": 7200000000,
+            "console_sha256": "c74f198e19e94c47772b3403433b5532057180aa63df46ff90ffe9a51710966f",
+            "load": [
+              8.67138671875,
+              30.8310546875,
+              89.3828125
+            ]
+          },
+          "candidate": {
+            "user_s": 0.4184779999999999,
+            "insns": "core0 11990305 + core1 6798164",
+            "cycles": 7200000000,
+            "console_sha256": "c74f198e19e94c47772b3403433b5532057180aa63df46ff90ffe9a51710966f",
+            "load": [
+              8.67138671875,
+              30.8310546875,
+              89.3828125
+            ]
+          }
+        }
+      ],
+      "equal_work_and_console": true,
+      "median_user_s": {
+        "baseline": 0.36847299999999983,
+        "candidate": 0.39459699999999986
+      },
+      "delta_percent": 7.089800338152341
+    },
+    {
+      "name": "c3-hello",
+      "inputs": {
+        "esp32c3_rev3_rom.elf": "19ac22e08707df926fb0cf4c54795d4067b983fae8635f396ded173a6d78fc3c",
+        "public/c3-hello-bootloader.bin": "3eaeaa5fb91d462a6ce6dbd8f8d488c8dc059216bc5841e50b784aea8348eb7b",
+        "public/c3-hello-ptable.bin": "7f00b6c042a89b15b0cac534f82ed988caf29278ff5700b0c511eb1b5bb7c820",
+        "public/c3-hello_world.bin": "3fd8606fd2fb10d2387ed4d238e16e7f80cd4832f380da02f0128f7bf4e0e8be"
+      },
+      "arguments": [
+        "--chip",
+        "c3",
+        "--board",
+        "none",
+        "--boot",
+        "rom",
+        "--console",
+        "uart0",
+        "--no-dump",
+        "--max-seconds",
+        "30",
+        "--flash-mb",
+        "4",
+        "--rom",
+        "${ASSETS}/esp32c3_rev3_rom.elf",
+        "--bootloader",
+        "${ASSETS}/public/c3-hello-bootloader.bin",
+        "--ptable",
+        "${ASSETS}/public/c3-hello-ptable.bin",
+        "--app",
+        "${ASSETS}/public/c3-hello_world.bin"
+      ],
+      "samples": [
+        {
+          "pair": 1,
+          "order": [
+            "baseline",
+            "candidate"
+          ],
+          "baseline": {
+            "user_s": 4.411234999999998,
+            "insns": "4800000000",
+            "cycles": 4800000000,
+            "console_sha256": "3b9d8d3eb053a97670f11896674e70ffc968fd7a803cb2cdc5c051414af94efd",
+            "load": [
+              8.326171875,
+              29.6767578125,
+              87.94775390625
+            ]
+          },
+          "candidate": {
+            "user_s": 4.577173000000002,
+            "insns": "4800000000",
+            "cycles": 4800000000,
+            "console_sha256": "3b9d8d3eb053a97670f11896674e70ffc968fd7a803cb2cdc5c051414af94efd",
+            "load": [
+              7.9794921875,
+              29.25,
+              87.45556640625
+            ]
+          }
+        },
+        {
+          "pair": 2,
+          "order": [
+            "candidate",
+            "baseline"
+          ],
+          "candidate": {
+            "user_s": 4.597078,
+            "insns": "4800000000",
+            "cycles": 4800000000,
+            "console_sha256": "3b9d8d3eb053a97670f11896674e70ffc968fd7a803cb2cdc5c051414af94efd",
+            "load": [
+              7.74072265625,
+              28.84716796875,
+              86.97216796875
+            ]
+          },
+          "baseline": {
+            "user_s": 4.411648,
+            "insns": "4800000000",
+            "cycles": 4800000000,
+            "console_sha256": "3b9d8d3eb053a97670f11896674e70ffc968fd7a803cb2cdc5c051414af94efd",
+            "load": [
+              7.60107421875,
+              28.4677734375,
+              86.49755859375
+            ]
+          }
+        },
+        {
+          "pair": 3,
+          "order": [
+            "baseline",
+            "candidate"
+          ],
+          "baseline": {
+            "user_s": 4.408792999999999,
+            "insns": "4800000000",
+            "cycles": 4800000000,
+            "console_sha256": "3b9d8d3eb053a97670f11896674e70ffc968fd7a803cb2cdc5c051414af94efd",
+            "load": [
+              7.392578125,
+              28.078125,
+              86.02001953125
+            ]
+          },
+          "candidate": {
+            "user_s": 4.615220999999998,
+            "insns": "4800000000",
+            "cycles": 4800000000,
+            "console_sha256": "3b9d8d3eb053a97670f11896674e70ffc968fd7a803cb2cdc5c051414af94efd",
+            "load": [
+              7.12060546875,
+              27.67822265625,
+              85.5390625
+            ]
+          }
+        }
+      ],
+      "equal_work_and_console": true,
+      "median_user_s": {
+        "baseline": 4.411234999999998,
+        "candidate": 4.597078
+      },
+      "delta_percent": 4.212947167856673
+    },
+    {
+      "name": "c6-hello",
+      "inputs": {
+        "esp32c6_rev0_rom.elf": "788e1d38724aeb8fd974fa10c4a7b089c02627d35342ce84b9e0b12b239f3551",
+        "public/c6-hello-bootloader.bin": "88fd358b406ebc874cda1f4d14c1fd50d37cd064a1826192ee275ce67741ff75",
+        "public/c6-hello-ptable.bin": "7f00b6c042a89b15b0cac534f82ed988caf29278ff5700b0c511eb1b5bb7c820",
+        "public/c6-hello_world.bin": "e302a3769d3122759ea85ed6caff857da36f558f83f9bf0eb652276657de0131"
+      },
+      "arguments": [
+        "--chip",
+        "c6",
+        "--board",
+        "none",
+        "--boot",
+        "rom",
+        "--console",
+        "uart0",
+        "--no-dump",
+        "--max-seconds",
+        "30",
+        "--flash-mb",
+        "4",
+        "--rom",
+        "${ASSETS}/esp32c6_rev0_rom.elf",
+        "--bootloader",
+        "${ASSETS}/public/c6-hello-bootloader.bin",
+        "--ptable",
+        "${ASSETS}/public/c6-hello-ptable.bin",
+        "--app",
+        "${ASSETS}/public/c6-hello_world.bin"
+      ],
+      "samples": [
+        {
+          "pair": 1,
+          "order": [
+            "baseline",
+            "candidate"
+          ],
+          "baseline": {
+            "user_s": 2.7317060000000026,
+            "insns": "4800000000",
+            "cycles": 4800000000,
+            "console_sha256": "bd69fbb9ac5c677337a293c1ec0ff7941306eec82c499290917a7c42360f86ad",
+            "load": [
+              7.35107421875,
+              27.38427734375,
+              85.09619140625
+            ]
+          },
+          "candidate": {
+            "user_s": 2.7744280000000003,
+            "insns": "4800000000",
+            "cycles": 4800000000,
+            "console_sha256": "bd69fbb9ac5c677337a293c1ec0ff7941306eec82c499290917a7c42360f86ad",
+            "load": [
+              7.32275390625,
+              27.04541015625,
+              84.63818359375
+            ]
+          }
+        },
+        {
+          "pair": 2,
+          "order": [
+            "candidate",
+            "baseline"
+          ],
+          "candidate": {
+            "user_s": 2.770609999999998,
+            "insns": "4800000000",
+            "cycles": 4800000000,
+            "console_sha256": "bd69fbb9ac5c677337a293c1ec0ff7941306eec82c499290917a7c42360f86ad",
+            "load": [
+              7.32275390625,
+              27.04541015625,
+              84.63818359375
+            ]
+          },
+          "baseline": {
+            "user_s": 2.726817000000004,
+            "insns": "4800000000",
+            "cycles": 4800000000,
+            "console_sha256": "bd69fbb9ac5c677337a293c1ec0ff7941306eec82c499290917a7c42360f86ad",
+            "load": [
+              7.056640625,
+              26.66259765625,
+              84.16552734375
+            ]
+          }
+        },
+        {
+          "pair": 3,
+          "order": [
+            "baseline",
+            "candidate"
+          ],
+          "baseline": {
+            "user_s": 2.727633999999995,
+            "insns": "4800000000",
+            "cycles": 4800000000,
+            "console_sha256": "bd69fbb9ac5c677337a293c1ec0ff7941306eec82c499290917a7c42360f86ad",
+            "load": [
+              6.8115234375,
+              26.2861328125,
+              83.69580078125
+            ]
+          },
+          "candidate": {
+            "user_s": 2.9030410000000018,
+            "insns": "4800000000",
+            "cycles": 4800000000,
+            "console_sha256": "bd69fbb9ac5c677337a293c1ec0ff7941306eec82c499290917a7c42360f86ad",
+            "load": [
+              6.8115234375,
+              26.2861328125,
+              83.69580078125
+            ]
+          }
+        }
+      ],
+      "equal_work_and_console": true,
+      "median_user_s": {
+        "baseline": 2.727633999999995,
+        "candidate": 2.7744280000000003
+      },
+      "delta_percent": 1.7155527464463916
+    }
+  ]
+}

@@ -9,7 +9,13 @@ use crate::regram::RegRam;
 const RX_FIFO_SIZE: usize = 128;
 const INT_RXFIFO_FULL: u32 = 1 << 0;
 const INT_TXFIFO_EMPTY: u32 = 1 << 1;
+pub const INT_FRM_ERR: u32 = 1 << 3;
 const INT_RXFIFO_OVF: u32 = 1 << 4;
+/// RXFIFO_TOUT (bit 8 on the S3/C3/C6 maps): silicon raises it once the line has been idle for
+/// rx_tout_thrhd symbols with bytes still in the FIFO. The IDF / Arduino drivers rely on it to
+/// pick up short messages below rxfifo_full_thrhd (a one-character command). Modelled as a level
+/// with no idle delay: raised while the FIFO holds bytes, so the driver's ISR drains them.
+const INT_RXFIFO_TOUT: u32 = 1 << 8;
 const INT_TX_DONE: u32 = 1 << 14;
 const AUTOBAUD_PULSE_115200: u32 = 80_000_000 / 115_200;
 /// TXFIFO_EMPTY and TX_DONE: always true here, so INT_CLR cannot take them down.
@@ -24,6 +30,8 @@ pub struct UartLayout {
     pub rxfifo_rst: u32,
     /// STATUS rxfifo_cnt: mask of the field at bit 0
     pub rxfifo_cnt_mask: u32,
+    /// The raw TCP download adapter opts into a level; ordinary UARTs keep sticky status.
+    pub rx_full_level: bool,
     /// Register and self-clearing bit used to synchronize configuration into the UART clock domain.
     pub reg_update_off: u32,
     pub reg_update_mask: u32,
@@ -33,9 +41,9 @@ pub struct UartLayout {
     pub rxd_count_off: u32,
 }
 impl UartLayout {
-    pub const S3: UartLayout = UartLayout { thrhd_mask: 0x3ff, rxfifo_rst: 1 << 17, rxfifo_cnt_mask: 0x3ff, reg_update_off: 0x80, reg_update_mask: 1 << 31, autobaud_mask: 1 << 27, lowpulse_off: 0x28, highpulse_off: 0x2c, rxd_count_off: 0x30 };
-    pub const C3: UartLayout = UartLayout { thrhd_mask: 0x1ff, rxfifo_rst: 1 << 17, rxfifo_cnt_mask: 0x3ff, reg_update_off: 0x80, reg_update_mask: 1 << 31, autobaud_mask: 1 << 27, lowpulse_off: 0x28, highpulse_off: 0x2c, rxd_count_off: 0x30 };
-    pub const C6: UartLayout = UartLayout { thrhd_mask: 0xff, rxfifo_rst: 1 << 22, rxfifo_cnt_mask: 0xff, reg_update_off: 0x98, reg_update_mask: 1, autobaud_mask: 1 << 19, lowpulse_off: 0x7c, highpulse_off: 0x80, rxd_count_off: 0x84 };
+    pub const S3: UartLayout = UartLayout { thrhd_mask: 0x3ff, rxfifo_rst: 1 << 17, rxfifo_cnt_mask: 0x3ff, rx_full_level: false, reg_update_off: 0x80, reg_update_mask: 1 << 31, autobaud_mask: 1 << 27, lowpulse_off: 0x28, highpulse_off: 0x2c, rxd_count_off: 0x30 };
+    pub const C3: UartLayout = UartLayout { thrhd_mask: 0x1ff, rxfifo_rst: 1 << 17, rxfifo_cnt_mask: 0x3ff, rx_full_level: false, reg_update_off: 0x80, reg_update_mask: 1 << 31, autobaud_mask: 1 << 27, lowpulse_off: 0x28, highpulse_off: 0x2c, rxd_count_off: 0x30 };
+    pub const C6: UartLayout = UartLayout { thrhd_mask: 0xff, rxfifo_rst: 1 << 22, rxfifo_cnt_mask: 0xff, rx_full_level: false, reg_update_off: 0x98, reg_update_mask: 1, autobaud_mask: 1 << 19, lowpulse_off: 0x7c, highpulse_off: 0x80, rxd_count_off: 0x84 };
 }
 
 // ------------------------------------------------------------------ UART
@@ -62,6 +70,8 @@ impl Uart {
         }
         self.refresh_rx_full();
     }
+    /// Compatibility policy for the raw TCP download adapter; pin-routed UARTs keep sticky status.
+    pub fn set_rx_full_level(&mut self, enabled: bool) { self.layout.rx_full_level = enabled; }
     /// Bytes that can enter RX without setting the hardware overflow condition.
     pub fn rx_capacity(&self) -> usize { RX_FIFO_SIZE - self.rx.len() }
     /// CONF1 rxfifo_full_thrhd (the layout says how wide); the silicon reset value is 0x60, a
@@ -70,9 +80,36 @@ impl Uart {
     fn rx_full_threshold(&self) -> usize { ((self.ram.read(0x24) & self.layout.thrhd_mask) as usize).max(1) }
     fn refresh_rx_full(&mut self) {
         if self.rx.len() >= self.rx_full_threshold() { self.int_raw |= INT_RXFIFO_FULL; }
-        else { self.int_raw &= !INT_RXFIFO_FULL; }
+        else if self.layout.rx_full_level { self.int_raw &= !INT_RXFIFO_FULL; }
+        if !self.rx.is_empty() { self.int_raw |= INT_RXFIFO_TOUT; }
     }
+    /// Configured baud, including the fractional UART and source-clock dividers.
+    /// `clock` is CLK_CONF on S3/C3 or PCR_UARTn_SCLK_CONF on C6.
+    pub fn baud(&self, clock: u32, rc_hz: u32) -> Option<u32> {
+        let source = match (clock >> 20) & 3 { 1 => 80_000_000u64, 2 => rc_hz as u64, 3 => 40_000_000, _ => return None };
+        let div = self.ram.read(0x14);
+        let uart_div = (div & 0xfff) as u64 * 16 + ((div >> 20) & 15) as u64;
+        if uart_div == 0 { return None; }
+        let denominator = (clock & 63) as u64;
+        let numerator = ((clock >> 6) & 63) as u64;
+        let integer = ((clock >> 12) & 255) as u64 + 1;
+        let (n, d) = if denominator == 0 { (integer, 1) } else { (integer * denominator + numerator, denominator) };
+        Some((source * 16 * d / (n * uart_div)) as u32)
+    }
+    pub fn clock_config(&self) -> u32 { self.ram.read(0x78) }
     pub fn rx_pending(&self) -> usize { self.rx.len() }
+    /// Classic ESP32 has a 20-bit divider and selects APB or the 1 MHz reference tick.
+    /// ESP-IDF v5.5.4: components/soc/esp32/register/soc/uart_reg.h
+    /// (UART_CLKDIV, UART_CLKDIV_FRAG, UART_TICK_REF_ALWAYS_ON) and
+    /// components/soc/esp32/include/soc/soc.h (APB_CLK_FREQ, REF_CLK_FREQ).
+    /// These fields match v4.4.8, where uart_reg.h is under include/soc/.
+    /// Uses the nominal 80 MHz APB clock.
+    pub fn classic_baud(&self) -> Option<u32> {
+        let div = self.ram.read(0x14);
+        let divisor = u64::from(div & 0xfffff) * 16 + u64::from((div >> 20) & 15);
+        let source = if self.ram.read(0x20) & (1 << 27) != 0 { 80_000_000u64 } else { 1_000_000 };
+        (divisor != 0).then(|| (source * 16 / divisor) as u32)
+    }
     pub fn read(&mut self, off: u32) -> u32 {
         match off {
             0x0 => { let value = self.rx.pop_front().map(|b| b as u32).unwrap_or(0); self.refresh_rx_full(); value }
@@ -114,6 +151,22 @@ impl Device for Uart {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn classic_baud_uses_its_divider_and_clock_source() {
+        let mut u = Uart::new(UartLayout::S3);
+        u.write(0x14, 0);
+        assert_eq!(u.classic_baud(), None);
+        u.write(0x20, 1 << 27);
+        u.write(0x14, 694);
+        assert_eq!(u.classic_baud(), Some(115273));
+        u.write(0x20, 0);
+        u.write(0x14, (2 << 20) | 104);
+        assert_eq!(u.classic_baud(), Some(9603));
+        u.write(0x20, 1 << 27);
+        u.write(0x14, 1 << 16);
+        assert_eq!(u.classic_baud(), Some(1220));
+    }
+
     /// The Linux esp32_uart driver's receive path: threshold 1, RXFIFO_FULL enabled, count from
     /// STATUS, pop the FIFO, then INT_CLR — and the line must drop only once the FIFO is empty.
     #[test]
@@ -132,7 +185,7 @@ mod tests {
     }
     #[test]
     fn clear_before_drain_deasserts_once_fifo_falls_below_threshold() {
-        let mut u = Uart::new(UartLayout::C3);
+        let mut u = Uart::new(UartLayout::C3); u.set_rx_full_level(true);
         u.write(0x24, 2); u.write(0xc, INT_RXFIFO_FULL);
         u.host_input(b"abc");
         assert!(u.irq());
@@ -190,5 +243,18 @@ mod tests {
             assert_eq!(u.read(layout.reg_update_off) & layout.reg_update_mask, 0);
             assert_eq!(u.read(layout.reg_update_off) & 0x1234, 0x1234 & !layout.reg_update_mask);
         }
+    }
+
+    /// A one-character command (below rxfifo_full_thrhd) still wakes the IDF / Arduino driver:
+    /// RXFIFO_TOUT is up while bytes wait, and drops once the FIFO is drained and cleared.
+    #[test]
+    fn short_message_raises_rx_timeout() {
+        let mut u = Uart::new(UartLayout::S3);
+        u.write(0x24, 120); u.write(0xc, INT_RXFIFO_TOUT);
+        u.host_input(b"?");
+        assert!(u.irq() && u.read(0x4) & INT_RXFIFO_FULL == 0);
+        let _ = u.read(0x0);                      // the driver drains the byte
+        u.write(0x10, INT_RXFIFO_TOUT);
+        assert!(!u.irq());
     }
 }

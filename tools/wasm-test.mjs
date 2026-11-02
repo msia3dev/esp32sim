@@ -11,7 +11,8 @@
 //
 // A manifest (web/wasm/fw/<name>.json) names the board, sizes, stubs and files exactly as the
 // page reads them. Each run boots and executes `seconds` (3) of emulated time in 2 M-cycle
-// slices, then expects a `board` message, the expected console line, and a clean run.
+// slices, then expects a `board` message, the expected console line, at least `min_frames` panel
+// frames when the manifest says so, and a clean run.
 import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -158,6 +159,12 @@ async function runManifest(name) {
     }
   }
   for (const [off, rel] of Object.entries(m.flash_at || {})) withBytes(new Uint8Array(file(rel)), (p, n) => w.esp32sim_load_at(emu, Number(off) >>> 0, p, n));
+  // a co-processor (`"coproc"`, board `esp32p4…+c6`): its images go to the C6, as the page loads them
+  for (const [k, v] of Object.entries((m.coproc || {}).files || {})) {
+    const rc = withBytes(new Uint8Array(file(v)), (p, n) => w.esp32sim_load(emu, (k === 'elf' ? 4 : kinds[k]) | 0x100, p, n));
+    if (rc !== 0) throw new Error(`load co-processor ${k} ${v} failed: ${logs.join(' | ')}`);
+  }
+  for (const [off, rel] of Object.entries((m.coproc || {}).flash_at || {})) withBytes(new Uint8Array(file(rel)), (p, n) => w.esp32sim_load_at(emu, (Number(off) | 0x80000000) >>> 0, p, n));
   for (const s of m.stubs || []) { const [sym, ...values] = s.split('='); const val = values.length ? values.join('=') : undefined; const name = (m.symbols || {})[sym] || sym;   // as the page: a symbols map resolves a stub without the ELF
     if (withBytes(enc.encode(name + (val === undefined ? '' : '=' + val)), (p, n) => w.esp32sim_stub_spec(emu, p, n)) !== 0) throw new Error('invalid stub: ' + s); }
   if (m.wifi && withBytes(enc.encode(m.wifi), (p, n) => w.esp32sim_wifi(emu, p, n)) !== 0) throw new Error('invalid WiFi configuration');
@@ -189,6 +196,7 @@ async function runManifest(name) {
   if (panics.length) problems.push(`panicked: ${panics[0]}`);
   if (!board) problems.push('no board message');
   if (!text.includes(m.expect || EXPECT.console)) problems.push(`console never showed ${JSON.stringify(m.expect || EXPECT.console)}; got ${text.length} bytes`);
+  if (m.min_frames !== undefined && frames < m.min_frames) problems.push(`${frames} binary frames, wanted ${m.min_frames}: the firmware never drew its panel`);
   const insns = w.esp32sim_insns(emu);
   if (w.esp32sim_profile_report && (process.env.CENSUS_OUT || process.env.CENSUS_STDOUT)) {
     const at = logs.length;

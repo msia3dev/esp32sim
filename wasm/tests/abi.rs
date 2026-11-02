@@ -114,3 +114,28 @@ fn c6_speaks_the_web_protocol() {
     // SAFETY: `e.0` stays live and the query does not overlap mutable access.
     assert_eq!(unsafe { esp32sim_cpu_hz(e.0) }, 160e6);
 }
+
+#[test]
+fn camera_binary_input_reports_boards_without_a_camera() {
+    for board in ["none", "atech14", "waveshare-cam", "c3", "c6"] {
+        let mut e = Emu::new(board, 4, 0);
+        e.boot();
+        let red = [3, 1, 0, 1, 0, 255, 0, 0, 255];
+        // SAFETY: the emulator is live and red is readable for its length.
+        unsafe { esp32sim_in_bin(e.0, red.as_ptr(), red.len()); }
+        e.run(0);
+        let messages = texts(&e.out());
+        assert_eq!(has(&messages, "no camera on this board"), board != "waveshare-cam", "{board}");
+    }
+}
+
+#[test]
+fn sd_card_images_load_into_the_p4_socket_only() {
+    // SAFETY: each emulator is live and used by this thread alone; `d` is readable for the call.
+    let load = |e: &Emu, d: &[u8]| unsafe { esp32sim_load(e.0, 8, d.as_ptr(), d.len()) };
+    let p4 = Emu::new("esp32p4", 2, 0);
+    assert_eq!(load(&p4, &vec![0; 1 << 20]), 0, "a 1 MiB card on the P4");
+    assert_eq!(load(&p4, &[0; 512]), 1, "smaller than the card's 512 KiB capacity unit");
+    let s3 = Emu::new("none", 4, 0);
+    assert_eq!(load(&s3, &vec![0; 1 << 20]), 1, "no SD host on the S3 model");
+}

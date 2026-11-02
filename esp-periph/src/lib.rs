@@ -1,8 +1,9 @@
 //! The peripheral IP that Espressif reuses across chips (UART, USB-Serial/JTAG, systimer, timer
-//! groups, GPIO, RTC_CNTL, efuse, SYSTEM, SPI_MEM, GDMA, SHA/AES/RSA, I2S, RMT, I2C, the RISC-V
-//! chips' RNG), one file each, plus the plumbing that mounts them: the `Device` trait every model
-//! implements and the `DeviceSet` table a chip fills in once — dispatch, interrupt sources, clock
-//! ticks and timer deadlines all come from that one table.
+//! groups, GPIO, LEDC, MCPWM, RTC_CNTL, SAR ADC, efuse, SYSTEM, SPI_MEM, GDMA, SHA/AES/RSA, I2S,
+//! RMT, GP-SPI, I2C, SDMMC, USB-OTG, the RISC-V chips' RNG), one file each, plus the plumbing
+//! that mounts them: the `Device` trait every model implements and the `DeviceSet` table a chip
+//! fills in once — dispatch, interrupt sources, clock ticks and timer deadlines all come from
+//! that one table.
 pub mod device;
 pub mod mmio;
 pub mod regram;
@@ -13,8 +14,12 @@ pub mod usb_serial_jtag;
 pub mod systimer;
 pub mod timg;
 pub mod gpio;
+pub mod ledc;
+pub mod mcpwm;
 pub mod rtc_cntl;
 pub mod ulp;
+pub mod analog;
+pub mod sar_adc;
 pub mod efuse;
 pub mod system;
 pub mod spi_mem;
@@ -24,9 +29,12 @@ pub mod rsa;
 pub mod gdma;
 pub mod i2s;
 pub mod rmt;
+pub mod rmt_compact;
 pub mod gpspi;
 pub mod rng;
 pub mod intmtx;
+pub mod sdmmc;
+pub mod usb_otg;
 
 pub use device::{Device, WriteEffect};
 pub use mmio::{DeviceSet, Dispatch, Misc, NO_SOURCE};
@@ -39,8 +47,11 @@ pub use gpio::Gpio;
 pub use rtc_cntl::{reset_cause_name, RtcCntl, INT_COCPU, INT_COCPU_TRAP, INT_ULP_CP, RST_POWERON, RST_RTCWDT_CPU, RST_RTCWDT_RTC, RST_RTCWDT_SYS, RST_SW_CPU, RST_SW_SYS};
 pub use ulp::{UlpArchitecture, UlpController, UlpState};
 pub use efuse::{Efuse, EFUSE_STATE_BYTES, EFUSE_STATE_WORDS};
+pub use analog::{AdcObservation, AnalogInputs, AnalogSource};
+pub use ledc::{Ledc, LedcLayout};
+pub use mcpwm::Mcpwm;
 pub use system::SystemRegs;
-pub use spi_mem::{DirtyMem, SpiMem};
+pub use spi_mem::{flash_jedec, opi_psram_density, DirtyMem, SpiMem};
 pub use sha::Sha;
 pub use aes::Aes;
 pub use rsa::Rsa;
@@ -56,3 +67,7 @@ pub const XTAL_HZ: u64 = 40_000_000;
 pub const SYSTIMER_HZ: u64 = 16_000_000;
 pub const RTC_SLOW_HZ: u64 = 150_000;
 #[doc(hidden)] pub use mmio::{__divider, __ClockDomain, __ClockTree, __Dividers};
+
+mod clocked_queue;
+pub mod regi2c;
+pub use regi2c::Regi2c;

@@ -86,6 +86,27 @@ Things that cost real time to find out, recorded so they do not have to be found
   `BASE_RX_DSCR` every time it recycles descriptors; treating that as "restart here" made every
   second frame land in a descriptor the stack had moved past, so it was batch-recycled instead of
   indicated (`wDev_ProcessRxSucData` `a3=0xa` rather than `0x1`).
+- **`BASE_RX_DSCR` (0x60033088) restarts the receive DMA, but only once it has stopped.** *Inferred, not
+  documented hardware:* no public header names the register, so the rule comes from the register sequence
+  of the IDF 5.1 blob under emulation (a base write immediately before the frame that follows an exhausted
+  list) and from the behaviour it explains (below). A driver may hand the hardware one short list at a
+  time instead of one long ring: Arduino-ESP32 arms four descriptors with the last one's `next` null, and
+  writes the base of the next four. The frame that arrives after such a list finds no descriptor
+  (`dw0 == 0`), which is the DMA's stopped state; the base write is the hand-over, so the DMA takes it as
+  the new head and retries that frame. Rewinding a *running* DMA is still wrong, for the reason above. An
+  IDF 5.1 application needs this: before it, 314 of 315 frames were dropped and the station never
+  authenticated; after it, association, DHCP and MQTT run (receipt:
+  [evidence/wifi-rx-handover](evidence/wifi-rx-handover/README.md)). The S3 and the C3 share the MAC
+  model (`esp-soc/src/wifi/mac.rs`), so both follow this rule; the C6 and classic MACs restart only
+  from `rx_next == 0`.
+  **Assumption of the latch:** `WifiMac::rx_handover` is cleared by the next frame that goes in, so the
+  model assumes a driver publishes the next list's base *after* the current list is exhausted (the
+  Arduino-ESP32 3.x blob does: 1 drop in 570 frames). A driver that published the base while the current
+  list still had two armed descriptors would lose the hand-over and stall at `next = 0`; holding the latch
+  until it is consumed is the change that would cover it, and the bench for it does not exist yet.
+  **Order against the unarmed counter (#276):** the hand-over is tried before the "no ring armed" check, so
+  a frame that finds `rx_next == 0` with a latched base takes that base; only a frame that still has neither
+  a head nor a latched base counts as `unarmed`, which keeps the two counters disjoint.
 - **`rx_ctrl` word 0 must set filter-match bit 28**, plus bit 29 for unicast. With bit 29 alone the
   frame is dropped inside `wDev_ProcessRxSucData` before it is ever indicated — silicon shows
   `0x111b20ad` for a broadcast beacon.
@@ -158,7 +179,8 @@ Things that cost real time to find out, recorded so they do not have to be found
   block interpreter it measured 1.23× (panel), 1.30× (detector), 1.37× (Atech), 1.46× (SID);
   the SID player now runs 193 Minsn/s, 2.1× real time. Decisions that mattered:
   a hand-written encoder for the ~90 instructions used, checked word-for-word against clang
-  (`cargo test encodings_match_clang`) rather than a dependency; anything not inlined calls
+  (`encodings_match_fixture`, against a fixture `external_encodings_match_clang` regenerates)
+  rather than a dependency; anything not inlined calls
   `exec_insn` for that one instruction and carries on natively, so coverage grew op by op
   with the oracle green at every step; the register window base is cached per block and
   reloaded after any helper that could rotate it; the window-overflow test is emitted once
@@ -263,7 +285,11 @@ Things that cost real time to find out, recorded so they do not have to be found
   recipe stubs that one function (`--stub bb_init=0`), keeps every other PHY step, and the MAC
   model is written not to depend on the PHY at all. The S3 panel's `esp_wifi_start=0` is the same
   policy. What the blob *polls over regi2c* is modelled (the RF block's SDM status reads 0x5b),
-  because that is a documented bus with an observable value.
+  because that is a documented bus with an observable value. Superseded for `bb_init` by #203
+  ([EX220](experiments.md#ex220)): two fields of that block could be inferred from the blob's own
+  code (TX-DC done, the tone readback), and with them modelled the calibration completes in 23.8 ms
+  of device time, so the C6 recipes run it and the stub is gone (#248). The policy stands where no
+  register behaviour can be inferred.
 - **The RISC-V core stops at stub and probe addresses.** `Core::set_boundaries` existed for the
   Xtensa block interpreter; the RISC-V `run` now checks the same bloom per instruction. Before,
   `--stub` on the C3/C6 only worked when a periph write happened to end a run at the right pc.
@@ -355,3 +381,22 @@ removes false register-window exceptions (hello and reboot counts, four reboot t
 the Atech counts and the remainder of the panel count. Existing audio hashes are unchanged.
 The native performance follow-up changes no goldens; exact-PC observers are now separately
 opted into so ordinary trap analysis need not pay their fragmentation cost.
+
+
+## BLE controller substitution
+
+BLE currently substitutes the guest controller API behind opt-in `--ble`. The
+S3/C3 VHCI adapters and the C6 native NimBLE adapter exchange H4 packets with
+`esp_soc::ble::HciController`. The boxed controller has reset and cycle-based
+advance/deadline methods. A separate peer owns scripts, ATT and the Battery
+Service and exchanges packets over `ble::Link`; a replacement controller must
+bridge that link, leaving scripts unchanged.
+
+WiFi follows "emulate the MAC, do not shim" because its modeled registers and
+DMA descriptors let the unchanged guest driver run. BLE has no equivalent
+baseband model here. Substitution exercises the unchanged host stack and Arduino
+sketches now, with guest tasks and allocators retaining their calling conventions.
+It does not claim RF or connection-event timing, pairing, encryption sessions or
+controller register fidelity. A fuller HCI controller can replace this one; a
+future baseband model can remove the substitution. C6's native mbuf/NPL ABI is
+restricted to IDF 5.5.x at enable time. The disabled path installs no hooks.

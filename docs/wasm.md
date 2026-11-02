@@ -20,27 +20,20 @@ fetch the page stops at `esp32s3_rev0_rom.elf: 404`. xterm.js is only for the Te
 `?wasm` switches `web/run.html` from its WebSocket transport to the worker; the page gains a
 firmware panel: board, flash/PSRAM size, an optional WiFi spec, function stubs, and file inputs
 for the mask-ROM ELF, `bootloader.bin`, `partition-table.bin`, the app image, its ELF (symbols
-— needed for stubs) and a script. **Boot** starts it; the rest of the page — console tabs,
+— needed for stubs) and a script. The ROM input may stay empty: the page then fetches
+`wasm/fw/<chip>_rom.elf` for the chip the board implies, and refuses to boot without one (a ROM boot
+from empty memory would run silently). Picking a board sets the flash and PSRAM sizes the demos use.
+**Boot** starts it, and pressing it again replaces the machine without reloading the page, so the
+chosen files stay; the rest of the page — console tabs,
 display, touch, buttons, knob, audio, camera — is the same UI the native emulator serves.
 
-### Persistent browser state
+### Browser state API
 
-For a single ESP32-S3 machine, the firmware panel can preserve logical flash
-(including ESP-IDF NVS) and physical eFuses in IndexedDB. Enable **persist
-state** and choose a **profile** name. On later visits using the same browser
-origin, board, flash size and profile, the saved device state replaces the
-manifest or uploaded flash seeds.
-
-**Export state** downloads flash and eFuse files separately. **Import** checks
-the selected type and exact length before replacing it; reload afterward to
-boot from the imported state. **Clear state** confirms and removes only the
-selected profile. IndexedDB is origin-scoped, so `localhost`, `127.0.0.1`,
-different ports and GitHub Pages do not share profiles. Persistence is not yet
-available for C3/C6 or multi-node network manifests.
-
-The browser uses the same formats as native esp32sim: flash is logical,
-CPU-visible data, while ESP32-S3 eFuse state is exactly 336 bytes. See
-[storage.md](storage.md) for lifecycle, precedence and security details.
+The S3 WASM ABI exposes storage generation, flash/eFuse export and import for a
+future frontend persistence backend. The current firmware panel has no IndexedDB
+profiles, automatic persistence or import/export controls. Reloading the page does
+not retain guest writes. Native S3/C3/C6 persistence is available through
+`--flash-state` and `--efuse-state`; see [storage.md](storage.md).
 
 For your own demos, `?wasm&fw=<name>` loads `web/wasm/fw/<name>.json` and boots it without
 clicking (format in `web/wasm/fw/README.md`). Everything in that directory except the manifests
@@ -52,7 +45,7 @@ is whoever built it; host them only where you may.
 `.github/workflows/pages.yml` builds the module on every push to `main`, runs
 `tools/fetch-demo-assets.sh` (the mask-ROM ELFs from the Apache-2.0 `espressif/esp-rom-elfs` release,
 xterm.js, the Linux image), and publishes `web/` — so the page at
-**https://joakimeriksson.github.io/esp32sim/** is the emulator, with the demos in
+**https://mikroverk.github.io/esp32sim/** is the emulator, with the demos in
 `web/wasm/fw/demos.json` — hello_world, the Touch-LCD-4B energy panel with its SID player, the Atech
 Pocket Synth, and the C3 and C6 demos — one click away and the file inputs for anyone's own firmware. It
 also runs `tools/fetch-pocket-tank.sh` for the **pocket-tank** demo ([mediacutlet/pocket-tank](https://github.com/mediacutlet/pocket-tank),
@@ -79,7 +72,8 @@ JSON file; real boards have the partition erased and behave as before. Natively:
 uses and fails on a panic or a missing console line; CI runs it after the goldens.
 
 Every chip is in the one module: `esp32sim_new` takes a board name, and `esp32c3` or `esp32c6`
-builds the RISC-V machine instead of the Xtensa one. The C3 has no `WebServer` of its own — it is
+builds the RISC-V machine instead of the Xtensa one; `esp32` or a classic board name such as
+`ttgo-tdisplay` builds the classic ESP32. The C3 has no `WebServer` of its own — it is
 console-only — so the wasm layer turns its console into the same `{"t":"serial"}` messages the
 S3 sends, and `esp32sim_cpu_hz` tells the worker which clock to pace against (240 MHz vs 160).
 
@@ -87,7 +81,7 @@ S3 sends, and `esp32sim_cpu_hz` tells the worker which clock to pace against (24
 web/run.html     the UI, unchanged; `link` is either a WebSocket or the worker
 web/emu.js       page side: firmware panel, manifest loading, window.EmuLink
 web/wasm/worker.js   owns the wasm instance, paces it to wall time, relays the UI protocol
-wasm/            the crate: a C ABI over esp32s3::Machine (esp32sim_new / load / wifi / stub /
+wasm/            the crate: a C ABI over the S3, C3 and C6 machines (esp32sim_new / load / wifi / stub /
                  boot / run / out_* / in_*); no bindgen, no dependencies
 ```
 
@@ -108,7 +102,9 @@ the tab falls half a second behind. `Date.now()` is passed in for the emulated S
 | Atech 14-port synth | real time | ST7735 and WS2812 decoded, buttons/knob, scripted scenario |
 | ESP32-C3 hello_world | real time | the other chip: one RV32IMC core, console only — pick board `esp32c3` |
 | ESP32-C6 hello_world | real time | the newest chip: one RV32IMAC core, console only — pick board `esp32c6` |
+| LilyGO TTGO T-Display spot prices (MicroPython) | real time, ~3× under Node | the classic ESP32: stock MicroPython v1.29.0 booted by the ROM from the combined image, the app from a LittleFS image in the vfs partition, the ST7789 135×240 over VSPI; demo data, no Wi-Fi — board `ttgo-tdisplay` |
 | ESP32-C6 802.15.4 energy scanner | real time | the Waveshare ESP32-C6-LCD-1.47: LVGL spectrum on the ST7789 over SPI2+GDMA, WS2812, energy detect from the MAC model's moving 2.4 GHz picture; BOOT on the page — board `waveshare-c6-lcd147` |
+| ESP32-P4 Scintilla synth (`p4-lcd35-synth`) | about a quarter of real time (one uncontrolled measurement: Chrome on an M-series Mac, 180–190 Minsn/s counted, 24–26 %) | the Waveshare ESP32-P4-WIFI6-Touch-LCD-3.5: LVGL on the ST7796 over SPI2 and the AXI-GDMA, FT5x06 touch, the ES8311's audio from I2S1; no C6, so BLE MIDI is off — board `waveshare-p4-lcd35` |
 | ESP32-C6 Contiki-NG | real time | Contiki-NG as an unmodified IDF app: its own scheduler and 802.15.4 stack over the emulated MAC |
 | …two of them on one medium | real time | a manifest with a `nodes` array boots a network through `esp32sim_net_*` instead of `esp32sim_new`: several motes, one medium, no simulator behind them |
 | …an RPL/IPv6 network | real time | rpl-udp server (the DAG root) and client: the client joins, then UDP request and reply every 10 s over 6LoWPAN, RPL Lite, CSMA and hardware ACKs |
@@ -200,11 +196,9 @@ Normal builds contain neither the sampling code nor the clock import.
 
 - **No NAT.** The browser has no sockets. With a `wifi=` spec the firmware still associates,
   gets a DHCP lease, resolves names and syncs time against the emulated subnet, but connections
-  past the gateway are refused (the `--net none` behaviour). A WebSocket relay to a small host
-  helper is the planned way out (`wasm-plan.md`).
-- **No emulator capture files**: `--wav`, `--tft-png` and register traces are
-  unavailable because the page is the output. Persistent-state Export is the
-  exception: it deliberately downloads flash and eFuse state files.
+  past the gateway are refused (the `--net none` behaviour). The [host Ethernet relay](#host-ethernet-relay)
+  below lets a page carry the guest's frames to a host helper instead.
+- **No file outputs**: `--wav`, `--tft-png`, register traces — the page is the output.
 - **Emulator log lines** (`[emu] …`) that the native build prints to stderr do not exist here,
   except the ones the wasm glue forwards (stubs, resets, load errors) to the console tab and the
   browser console.
@@ -231,7 +225,7 @@ preamble byte, so the exactness is already there and a native test can hold it t
 (`esp32c6/tests/net.rs`). The worker only paces network time to the wall clock and relays.
 
 A node may carry its own `files` and `symbols`: an entry of a kind the node names replaces the
-shared one, so a root and a client — two images with two `bb_init` addresses — share one
+shared one, so a root and a client — two images — share one
 bootloader and partition table and differ only in `app`.
 
 `start_ms` is not cosmetic. Two identical images booted at the same instant are deterministic to
@@ -246,3 +240,63 @@ The script leaves the Rust-produced WASM unchanged unless `WASM_OPT=1` is set,
 which requests Binaryen `wasm-opt -O3` and requires that tool to be installed.
 The measured configuration used no Binaryen postprocessing. `CARGO_ENCODED_RUSTFLAGS`,
 when set, takes precedence over `RUSTFLAGS` under Cargo's usual rules.
+
+## Host Ethernet relay
+
+S3, C3 and C6 provide an optional Ethernet transport behind their virtual AP.
+Configure the AP with `esp32sim_wifi`, then call `esp32sim_ethernet_relay(e, 1)`
+before boot. Association and WPA2 still run in the emulator; the host supplies
+the network behind the AP, including DHCP. This mode bypasses the built-in
+`VirtualNet`. With relay disabled, the existing virtual subnet remains the default.
+Native Rust hosts use `SocBus::set_ethernet_relay`, `take_ethernet_frames` and
+`receive_ethernet_frame` for the same operations.
+
+| Export | Contract |
+| --- | --- |
+| `esp32sim_ethernet_relay(e, enabled)` | Nonzero selects relay, zero restores the built-in network; returns 0 on success, 1 on error. |
+| `esp32sim_ethernet_take(e)` | Drain TX in FIFO order; returns the number of frames in the new batch. |
+| `esp32sim_ethernet_ptr(e, index)` | Pointer to a drained frame; null for an invalid index. |
+| `esp32sim_ethernet_len(e, index)` | Frame length; zero for an invalid index. |
+| `esp32sim_ethernet_receive(e, ptr, len)` | Copy an inbound frame; returns 0 if queued, 1 if rejected. Requires an AP and relay mode. |
+
+Frames contain Ethernet headers and payloads without FCS, from 14 through 1518
+bytes. Each direction holds at most 64 queued frames in relay mode. Excess TX
+frames are dropped and counted in the WiFi link's `tx_dropped` (`StationLink`); a full RX queue rejects injection. Delivery can drop frames
+when the guest has no free receive descriptor. Drain after each run slice and
+copy bytes before the next `ethernet_take`, which replaces the entire batch.
+Recreate JavaScript memory views after calls that may grow WASM memory.
+
+Changing modes clears pending Ethernet queues; selecting the same mode leaves
+them intact. Configure transport before starting guest connections. Switching
+modes does not migrate DHCP leases or TCP connections. Chip reset clears pending
+frames but preserves the AP, network object and relay selection. A drained WASM
+batch remains readable until the next `ethernet_take` or emulator deletion.
+
+The [Arduino relay check](evidence/ethernet-c3-2026-10-02/relay.mjs) shows the ABI
+with a host DHCP responder.
+
+Camera frames use `esp32sim_in_bin` type 3: `[3, width u16le, height u16le, RGBA...]`.
+The entire message must fit 8 MiB, with nonzero dimensions and exact pixel length.
+The receiver copies the message before returning and applies it at the next run
+boundary. Sensor SCCB settings select output format and geometry. A board without
+a camera emits `{"t":"camera-error","message":"no camera on this board"}`.
+
+### C3 full BLE observation
+
+Call `esp32sim_ble_full(emu)` before boot (0 = enabled, 1 = wrong chip or already
+booted). This runs the guest link controller without HCI substitution. After each
+run slice, call `esp32sim_ble_take(emu)` until it returns zero. Each nonzero return
+is the UTF-8 byte length at `esp32sim_ble_ptr(emu)`, valid until the next take or
+emulator deletion. `[ble-air]` contains modeled half-microsecond time, channel,
+PDU type, AdvA, decoded name/service AD fields and the raw PDU. `[ble-config]`
+contains configured scan-response data, not a transmitted packet. The bounded
+1024-entry queue reports lost observations as `[ble-observer] dropped=N`.
+Queued observations and the dropped count survive guest reboot. Invalid enable
+calls log a reason through `host_log`. Use `esp32sim_ble_scan(emu, enabled)` for active scanning,
+`esp32sim_ble_command(emu, ptr, len)` for UTF-8 `connect`, `disconnect`,
+`central-stop` or `read-uuid SERVICE CHARACTERISTIC`. `central-stop` silences
+a connected central. These exports return 0 on
+success or 1 for invalid commands/state/chip. Reads use the guest ATT server.
+The central models one unencrypted 1M CSA#1 connection with a 30 ms interval,
+2 s supervision timeout and ATT MTU 23. See [EX213](evidence/ble-c3-connection/README.md)
+for model limits and the production-module reconnect test.

@@ -1,5 +1,11 @@
 use crate::device::{Device, WriteEffect};
 use crate::regram::RegRam;
+mod receive;
+pub use receive::{DescriptorWalk, DmaDescriptorFault, DmaDescriptorWord, GDMA_DESCRIPTOR_STEP_BUDGET};
+mod transmit;
+pub use transmit::{gather_out, OutMemory, SramOut};
+mod ahb;
+pub use ahb::{AhbLayout, GdmaAhb};
 
 // ------------------------------------------------------------------ GDMA (out/TX channels only for now) + I2S0 TX
 pub const GDMA_CHANNELS: usize = 5;
@@ -23,7 +29,8 @@ impl GdmaOutCh {
 pub struct GdmaInCh {
     pub conf0: u32, pub conf1: u32, pub int_raw: u32, pub int_ena: u32, pub link: u32, pub peri_sel: u32, pub pri: u32,
     pub desc: u32, pub eof_desc: u32, pub running: bool,
-    pub buf_pos: u32,         // bytes filled in the current descriptor (memory-to-memory copies)
+    pub buf_pos: u32,         // bytes filled in the current descriptor
+    pub rx_eof_pos: u32,      // peripheral bytes since the last receive EOF
 }
 impl GdmaInCh { pub fn irq(&self) -> bool { self.int_raw & self.int_ena != 0 } }
 
@@ -42,7 +49,11 @@ impl Gdma {
                 0x24 => if r.running { (r.desc & 0x3ffff) | (1 << 20) } else { 0 },
                 0x28 => r.eof_desc, 0x2c => r.eof_desc, 0x30 => r.desc, 0x44 => r.pri, 0x48 => r.peri_sel,
                 0x60 => c.conf0, 0x64 => c.conf1, 0x68 => c.int_raw, 0x6c => c.int_raw & c.int_ena, 0x70 => c.int_ena,
-                0x78 => 0x1f | (1 << 1),   // OUTFIFO_STATUS: fifo empty
+                // OUTFIFO_STATUS (components/soc/esp32c3/register/soc/gdma_reg.h, IDF v5.5.4: FULL bit 0, EMPTY
+                // bit 1, CNT bits 7:2): a channel holding a descriptor has its data in the FIFO, so it is not
+                // empty (a C3 rev 0.4 read 0x14 for 5 bytes, idle 0x07800002; the count is not modelled).
+                // esp-hal's `start_transfer` waits for EMPTY to clear before starting the peripheral.
+                0x78 => if c.running && c.desc != 0 { 0 } else { 0x1f | (1 << 1) },
                 0x80 => c.link & 0xF_FFFF,
                 0x84 => if c.running { (c.desc & 0x3ffff) | (1 << 20) } else { 0 },   // OUT_STATE: dscr addr + state
                 0x88 => c.eof_desc, 0x8c => c.eof_desc, 0x90 => c.desc, 0xa4 => c.pri, 0xa8 => c.peri_sel,
@@ -57,11 +68,11 @@ impl Gdma {
             if o < 0x60 {
                 let r = &mut self.inp[ch];
                 match o {
-                    0x00 => { r.conf0 = v & !1; if v & 1 != 0 { r.running = false; r.desc = 0; r.buf_pos = 0; } }   // IN_RST self-clears
+                    0x00 => { r.conf0 = v & !1; if v & 1 != 0 { r.running = false; r.desc = 0; r.buf_pos = 0; r.rx_eof_pos = 0; } }   // IN_RST self-clears
                     0x04 => r.conf1 = v, 0x10 => r.int_ena = v, 0x14 => r.int_raw &= !v,
                     0x20 => {
                         r.link = v & 0xF_FFFF;
-                        if v & (1 << 22) != 0 || v & (1 << 23) != 0 { r.desc = self.addr_base | (v & 0xF_FFFF); r.buf_pos = 0; r.running = true; }   // START / RESTART
+                        if v & (1 << 22) != 0 || v & (1 << 23) != 0 { r.desc = self.addr_base | (v & 0xF_FFFF); r.buf_pos = 0; r.rx_eof_pos = 0; r.running = true; }   // START / RESTART
                         if v & (1 << 21) != 0 { r.running = false; }                                                                 // STOP
                     }
                     0x44 => r.pri = v, 0x48 => r.peri_sel = v & 0x3f,
@@ -98,7 +109,12 @@ impl Default for Gdma { fn default() -> Self { Self::new() } }
 pub struct DmaDesc { pub addr: u32, pub size: u32, pub length: u32, pub eof: bool, pub owner_dma: bool, pub buf: u32, pub next: u32 }
 pub fn read_desc(mem: &dyn Fn(u32) -> u32, addr: u32) -> DmaDesc {
     let dw0 = mem(addr);
-    DmaDesc { addr, size: dw0 & 0xfff, length: (dw0 >> 12) & 0xfff, eof: dw0 & (1 << 30) != 0, owner_dma: dw0 & (1 << 31) != 0, buf: mem(addr + 4), next: mem(addr + 8) }
+    DmaDesc::decode(addr, dw0, mem(addr + 4), mem(addr + 8))
+}
+impl DmaDesc {
+    fn decode(addr: u32, dw0: u32, buf: u32, next: u32) -> Self {
+    Self { addr, size: dw0 & 0xfff, length: (dw0 >> 12) & 0xfff, eof: dw0 & (1 << 30) != 0, owner_dma: dw0 & (1 << 31) != 0, buf, next }
+    }
 }
 impl Device for Gdma {
     fn read(&mut self, off: u32) -> u32 { Gdma::read(self, off) }
@@ -106,4 +122,20 @@ impl Device for Gdma {
     /// bits 0..5 = out channels, bits 5..10 = in channels
     fn debug(&mut self, on: bool) { self.dbg = on; }
     fn irq_sources(&self) -> u64 { (0..GDMA_CHANNELS).fold(0, |m, i| m | ((self.out[i].irq() as u64) << i) | ((self.inp[i].irq() as u64) << (GDMA_CHANNELS + i))) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// OUTFIFO_STATUS reads empty while idle and not empty once OUTLINK_START runs a descriptor.
+    #[test]
+    fn out_fifo_is_not_empty_while_a_channel_runs() {
+        let mut g = Gdma::new();
+        assert_ne!(g.read(0x78) & (1 << 1), 0, "idle: empty");
+        g.write(0x80, (1 << 21) | 0x1000);                              // OUT_LINK: START
+        assert_eq!(g.read(0x78) & (1 << 1), 0, "running: prefetched");
+        g.write(0x80, 1 << 20);                                         // OUT_LINK: STOP
+        assert_ne!(g.read(0x78) & (1 << 1), 0, "stopped: empty");
+    }
 }

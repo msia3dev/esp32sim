@@ -16,7 +16,11 @@ mod modeled;
 mod web;
 
 #[derive(Clone, Debug)]
-pub enum ScriptAction { Gpio(u8, bool), Serial(String), Uart(usize, String), Stop, Touch(u16, u16, bool), Poke(u32, u32) }
+pub enum ScriptAction { Gpio(u8, bool), Serial(String), Uart(usize, String), Stop, Touch(u16, u16, bool), Poke(u32, u32), TouchPad(u8, bool), Ble(String), Analog(u8, esp_periph::AnalogSource),
+    /// `waituart0 <timeout_s> <text>`: hold the rest of the script until UART0 prints `text` (or the
+    /// timeout passes), then shift every later action by the time actually waited. Fields: text,
+    /// timeout in cycles, the cycle the script placed it at.
+    WaitUart0(String, u64, u64) }
 
 /// The stop conditions that are not observers.
 pub struct Debug { pub stop_on_unimplemented: bool, pub stop_after_exceptions: u64 }
@@ -35,7 +39,9 @@ pub struct Console {
 }
 
 /// Host actions scheduled at emulated times (`--script`, and the UI's encoder detents).
-pub struct Script { pub events: Vec<(u64, ScriptAction)>, pub pos: usize, pub log: bool, knob_next: u64 }
+pub struct Script { pub events: Vec<(u64, ScriptAction)>, pub pos: usize, pub log: bool, knob_next: u64,
+                   /// UART0 text seen so far (capped) and where the pending wait started looking
+                   uart0_seen: Vec<u8>, wait_mark: Option<usize> }
 
 pub struct Realtime {
     pub enabled: bool,
@@ -93,6 +99,7 @@ pub struct Machine<S: Soc> {
     uart_tcp_pending: VecDeque<u8>,
     #[cfg(not(target_arch = "wasm32"))]
     uart_tcp_next_rx: u64,
+    pub camera_input: Option<std::sync::Arc<std::sync::Mutex<Option<crate::picture::Picture>>>>,
     /// The page's Restart (`reset` on the WebSocket) is honoured: the front-end sets this when it
     /// can bring the machine back up after the reset. Otherwise the message is ignored, so a run
     /// that stops at a chip reset is not ended from the page.
@@ -133,6 +140,7 @@ pub struct Machine<S: Soc> {
 const QUANTUM: u64 = if cfg!(target_arch = "wasm32") { 256 } else { 64 };
 #[cfg(not(target_arch = "wasm32"))]
 fn uart_tcp_pacing_baud(chip: &str) -> u64 { if chip == "esp32s3" { 115_200 } else { 230_400 } }
+const GPIO_WAVEFORM_TIMING_ERROR: &str = "GPIO waveform decoding cannot be combined with a timing model";
 /// EX133 default for `Machine::vq_max`; a build can pin another with `ESP32SIM_VQ_BUILD=<n>`.
 const VQ_DEFAULT: u64 = match option_env!("ESP32SIM_VQ_BUILD") {
     Some(s) => { let b = s.as_bytes(); let (mut i, mut v) = (0, 0u64); while i < b.len() { v = v * 10 + (b[i] - b'0') as u64; i += 1; } v }
@@ -155,8 +163,9 @@ impl<S: Soc> Machine<S> {
             dbg: Debug { stop_on_unimplemented: true, stop_after_exceptions: u64::MAX },
             observers: Vec::new(), probes: Wants::NONE, prev_irq: vec![0; S::CORES],
             exceptions: 0, interrupts: 0, irq_hist: vec![[0; 32]; S::CORES],
-            script: Script { events: Vec::new(), pos: 0, log: true, knob_next: 0 }, max_cycles: u64::MAX,
+            script: Script { events: Vec::new(), pos: 0, log: true, knob_next: 0, uart0_seen: Vec::new(), wait_mark: None }, max_cycles: u64::MAX,
             console: Console { all: Vec::new(), usb: Vec::new(), uart0: Vec::new(), mask: 3, prefix: false, capture: false },
+            camera_input: None,
             web: None, ws: WebState { last_push_cycles: 0, push_interval: 0, audio_sent: 0, ring_updates: 0, grid_updates: Vec::new(), px_pending: 0, px_sent: 0, px_deferred: false, cam_pushed: u64::MAX, cam_sent: false },
             #[cfg(not(target_arch = "wasm32"))]
             uart_tcp: None,
@@ -189,6 +198,7 @@ impl<S: Soc> Machine<S> {
     }
     /// Attach a timing model before the machine has executed or reset.
     pub fn set_cost_model(&mut self, mut model: Box<dyn CostModel>) -> Result<(), String> {
+        if self.bus.board_ref().uses_gpio_waveform() { return Err(GPIO_WAVEFORM_TIMING_ERROR.into()); }
         if self.cost.is_some() || self.approximate_jit_timing.is_some() { return Err("a timing model is already attached".into()); }
         if let Some(reason) = self.model_attach_error { return Err(reason.into()); }
         if self.bus.cycles() != 0 || self.reboots != 0 || self.cores.iter().any(|core| core.insn_count() != 0) {
@@ -214,6 +224,7 @@ impl<S: Soc> Machine<S> {
     /// Uniform CPI and deadline-bounded instruction batches for an explicitly rough JIT experiment.
     /// Within-batch memory ordering and memory latency are not modeled by this setting.
     pub fn set_approximate_jit_timing(&mut self, cpi: u32, quantum: u32) -> Result<(), String> {
+        if self.bus.board_ref().uses_gpio_waveform() { return Err(GPIO_WAVEFORM_TIMING_ERROR.into()); }
         if self.cost.is_some() || self.insns() != 0 { return Err("configure approximate JIT timing before execution, without CostModel".into()); }
         if !(1..=256).contains(&cpi) || !(1..=4096).contains(&quantum) { return Err("CPI must be 1..256 and quantum 1..4096".into()); }
         self.approximate_jit_timing = Some((cpi, quantum));
@@ -274,6 +285,15 @@ impl<S: Soc> Machine<S> {
             }
             if dbg { eprintln!("[emu] rom: back-filled {} initialiser blocks into ROM from table {:#x}..{:#x}", n, ds, de); }
         }
+        // C3 rev3 btdm_controller_rom_data_init (0x40002d20) copies this
+        // initializer through a ROM pointer, outside the reset-handler table.
+        // The ELF contains .data_btdm at its RAM address but omits that ROM copy.
+        if S::NAME == "esp32c3" {
+            if let (Some(pointer), Some(section)) = (find("_data_start_btdm_rom"), e.sections.iter().find(|s| s.name == ".data_btdm")) {
+                let source = self.bus.read32_unpriced(pointer).map_err(|e| format!("BT initializer pointer: {e:?}"))?;
+                self.bus.load_bytes(source, &section.data)?;
+            }
+        }
         self.symbols.extend(e.symbols);
         Ok(())
     }
@@ -295,7 +315,7 @@ impl<S: Soc> Machine<S> {
     }
 
     /// Cold boot from the mask ROM reset vector (needs ROM + flash image with bootloader).
-    pub fn boot_rom(&mut self) { self.cores[0].reset(); }
+    pub fn boot_rom(&mut self) { S::reset_core(&mut self.cores[0], 0); }
 
     /// Chip reset (software / watchdog): cores back to the reset vector, digital peripherals
     /// re-initialised; SRAM, RTC memories, efuses and the RTC-domain registers survive, as on
@@ -304,8 +324,10 @@ impl<S: Soc> Machine<S> {
         // where core 0 was when the reset took effect (the C6 ROM prints it as `Saved PC`)
         let pc = self.cores[0].pc();
         self.bus.note_pc(pc);
+        let pcs: Vec<u32> = self.cores.iter().map(|c| c.pc()).collect();
+        self.bus.note_core_pcs(&pcs);
         let cause = self.bus.reboot(self.mac);
-        for (i, c) in self.cores.iter_mut().enumerate() { S::reset_core(c, i); if i > 0 { self.core_held[i] = true; } }
+        for (i, c) in self.cores.iter_mut().enumerate() { S::reset_core_with_bus(c, &mut self.bus, i); if i > 0 { self.core_held[i] = true; } }
         self.reboots += 1;
         #[cfg(not(target_arch = "wasm32"))]
         { self.uart_tcp_next_rx = 0; }
@@ -347,6 +369,10 @@ impl<S: Soc> Machine<S> {
         for (i, d) in streams.into_iter().enumerate() {
             let src = ["usb", "uart0", "uart1", "uart2"][i];
             if i < 2 {
+                if i == 1 && !d.is_empty() {
+                    let seen = &mut self.script.uart0_seen; seen.extend_from_slice(&d);
+                    if seen.len() > 1 << 20 { let cut = seen.len() - (1 << 19); seen.drain(..cut); self.script.wait_mark = self.script.wait_mark.map(|m| m.saturating_sub(cut)); }
+                }
                 let backlog = if i == 0 { &mut self.console.usb } else { &mut self.console.uart0 };
                 backlog.extend_from_slice(&d);
                 if backlog.len() > 65536 { let cut = backlog.len() - 49152; backlog.drain(..cut); }
@@ -364,6 +390,7 @@ impl<S: Soc> Machine<S> {
         if !*self.bus.irq_dirty() { return; }
         *self.bus.irq_dirty() = false;
         if self.bus.refresh_irq() { self.present_irqs(); }
+        S::peripheral_event(&self.bus, &mut self.cores);
     }
     fn present_irqs(&mut self) {
         let mut irqs = [<S::Core as Core>::Irq::default(); 4];
@@ -390,6 +417,7 @@ impl<S: Soc> Machine<S> {
         // Core::run returns a trap without its faulting PC. One-instruction fragments make
         // the entry PC exact while retaining callbacks for combined BLOCK/TRAP observers.
         let budget = if self.probes.contains(Wants::TRAP_PC) { budget.min(1) } else { budget };
+        S::select_core(&mut self.bus, core);
         let cpu = &mut self.cores[core];
         let pc = cpu.pc();
         // stubs and probes are block boundaries, so testing them at block start is exact
@@ -398,6 +426,7 @@ impl<S: Soc> Machine<S> {
                 let (args, ret) = (cpu.probe_args(&mut self.bus), cpu.return_address(&mut self.bus));
                 eprintln!("[fn] i={} t={:.4}s c{} {}({}) ret={:#x}", cpu.insn_count(), self.bus.cycles() as f64 / S::CPU_HZ as f64, core, name, args, ret);
             }
+            if S::function_hook(cpu, &mut self.bus) { return (1, None); }
             if let Some(&ret) = self.stubs.get(&pc) { cpu.return_from_stub(&mut self.bus, ret); self.stub_hits += 1; return (1, None); }
         }
         let (used, trap) = cpu.run(&mut self.bus, budget);
@@ -433,7 +462,7 @@ impl<S: Soc> Machine<S> {
         match trap {
             None => {}
             Some(Trap::Exception(_)) => { self.exceptions += 1; }
-            Some(Trap::Interrupt(irq)) => { self.interrupts += 1; self.irq_hist[core][(irq & 31) as usize] += 1; }
+            Some(Trap::Interrupt(irq)) => { self.interrupts += 1; self.irq_hist[core][(irq & 31) as usize] += 1; S::interrupt_taken(&mut self.bus, core, irq); }
             Some(Trap::Unimplemented(p, raw)) => { if self.dbg.stop_on_unimplemented { return Some(Stop::Unimplemented(p, raw)); } }
             Some(Trap::Simcall) => return Some(Stop::Simcall(pc)),
             Some(Trap::Ebreak(p)) => { self.exceptions += 1; if !self.cores[core].has_trap_handler() { return Some(Stop::Ebreak(p)); } }
@@ -461,6 +490,7 @@ impl<S: Soc> Machine<S> {
     /// Execute one instruction on `core` with every per-instruction observer; returns Some(stop) if the run must end.
     #[inline]
     fn step_core(&mut self, core: usize) -> Option<Stop> {
+        S::select_core(&mut self.bus, core);
         let cpu = &mut self.cores[core];
         let pc = cpu.pc();
         if self.probe_bloom & pc_bit(pc) != 0 && !cpu.waiting() {
@@ -470,6 +500,7 @@ impl<S: Soc> Machine<S> {
             }
         }
         if self.stub_bloom & pc_bit(pc) != 0 && !cpu.waiting() {
+            if S::function_hook(cpu, &mut self.bus) { return None; }
             if let Some(&ret) = self.stubs.get(&pc) { cpu.return_from_stub(&mut self.bus, ret); self.stub_hits += 1; return None; }
         }
         {
@@ -491,12 +522,20 @@ impl<S: Soc> Machine<S> {
 
     /// Run until something stops us or the `max_insns` scheduling-step budget is reached. The no-model path
     /// uses complete quanta (`QUANTUM` by default), so a busy round can exceed the budget by up to
-    /// `quantum - 1` steps. The modeled path schedules one priced event at a time.
+    /// `quantum - 1` steps, but the cycle ceiling cuts the final round short.
+    /// The modeled path schedules one priced event at a time.
     pub fn run(&mut self, max_insns: u64) -> Stop {
         self.web_poll_input();
         #[cfg(not(target_arch = "wasm32"))]
-        self.uart_tcp_poll_input();
+        if self.uart_tcp.is_some() { self.uart_tcp_poll_input(); }
         self.refresh_irq();
+        if self.bus.board_ref().uses_gpio_waveform() {
+            if self.has_timing_model() { return Stop::CostModelLifecycle { kind: LifecycleKind::Attach, reason: GPIO_WAVEFORM_TIMING_ERROR.into() }; }
+            let quantum = std::mem::replace(&mut self.quantum, 1);
+            let stop = self.run_unmodeled::<false>(max_insns);
+            self.quantum = quantum;
+            return stop;
+        }
         if self.cost.is_some() { self.run_modeled(max_insns) } else if self.approximate_jit_frontiers { self.run_approximate_jit_frontiers(max_insns) } else if self.approximate_jit_timing.is_some() { self.run_unmodeled::<true>(max_insns) } else { self.run_unmodeled::<false>(max_insns) }
     }
 
@@ -507,11 +546,13 @@ impl<S: Soc> Machine<S> {
     /// still has to enforce architectural boundaries such as
     /// CCOMPARE and register-window overflow for the block it proposes.
     pub fn browser_external_block_budget(&self, requested: u32) -> Option<u32> {
-        if u64::from(requested) < self.quantum
+        if self.bus.board_ref().uses_gpio_waveform()
+            || u64::from(requested) < self.quantum
             || self.cost.is_some()
             || self.approximate_jit_timing.is_some()
             || self.probes.0 != 0
             || !self.stubs.is_empty()
+            || !S::function_hooks(&self.bus).is_empty()
             || !self.fn_probes.is_empty()
             || self.script.pos < self.script.events.len()
             || self.bus.sw_reset()
@@ -539,7 +580,7 @@ impl<S: Soc> Machine<S> {
     fn run_unmodeled<const APPROXIMATE: bool>(&mut self, max_insns: u64) -> Stop {
         assert!(self.quantum != 0, "scheduling quantum must be nonzero");
         let (cpi, max_quantum) = if APPROXIMATE { self.approximate_jit_timing.unwrap() } else { (1, self.quantum as u32) };
-        self.stub_bloom = self.stubs.keys().fold(0, |m, &pc| m | pc_bit(pc));
+        self.stub_bloom = self.stubs.keys().chain(S::function_hooks(&self.bus)).fold(0, |m, &pc| m | pc_bit(pc));
         self.probe_bloom = self.fn_probes.keys().fold(0, |m, &pc| m | pc_bit(pc));
         for c in &mut self.cores {
             c.set_boundaries(self.stub_bloom | self.probe_bloom);
@@ -569,7 +610,7 @@ impl<S: Soc> Machine<S> {
                     CoreState::Reset => { self.core_held[i] = true; false }
                     CoreState::Held => false,
                     CoreState::Running => {
-                        if self.core_held[i] { self.core_held[i] = false; S::reset_core(&mut self.cores[i], i); if trace { eprintln!("          ** core{} released from reset", i); } }
+                        if self.core_held[i] { self.core_held[i] = false; S::reset_core_with_bus(&mut self.cores[i], &mut self.bus, i); if trace { eprintln!("          ** core{} released from reset", i); } }
                         true
                     }
                 };
@@ -579,7 +620,7 @@ impl<S: Soc> Machine<S> {
             if idle[..S::CORES].iter().all(|&x| x) && !slow_path {
                 // Stop at every known source of new work, including core-local timers. Device
                 // deadlines alone do not include CCOMPARE or host-script actions.
-                let limit = S::IDLE_CHUNK.min(max_insns - n).min(self.max_cycles - self.bus.cycles());
+                let limit = S::IDLE_CHUNK.min(max_insns - n).min(self.bus.cpu_cycles_for_bus(self.max_cycles - self.bus.cycles()));
                 let chunk = self.idle_budget(limit, &on);
                 for (i, &enabled) in on.iter().enumerate().take(S::CORES) { if enabled { self.cores[i].idle_advance(chunk as u32); } }
                 n += chunk;
@@ -660,16 +701,17 @@ impl<S: Soc> Machine<S> {
             let quantum = if APPROXIMATE {
                 // An instruction can overrun the deadline by at most CPI-1 cycles.
                 self.idle_budget(u64::from(max_quantum) * u64::from(cpi), &on)
-                    .min(self.max_cycles - self.bus.cycles()).div_ceil(u64::from(cpi)).max(1)
+                    .min(self.bus.cpu_cycles_for_bus(self.max_cycles - self.bus.cycles())).div_ceil(u64::from(cpi)).max(1)
             } else {
                 // A sleeping peer's local timer bounds the entire round. Advancing only that
                 // peer by a shorter interval would leave its CCOUNT behind shared device time.
                 // Use the round-entry idle snapshot: a busy core that reached WAITI in a
                 // partial virtual round has already advanced by resume_at. Its remaining
                 // timer delta cannot shorten that original round, which must match VQ-off.
-                self.cores.iter().enumerate().filter(|(i, _)| on[*i] && idle[*i])
+                let quantum = self.cores.iter().enumerate().filter(|(i, _)| on[*i] && idle[*i])
                     .filter_map(|(_, core)| core.cycles_until_wake())
-                    .fold(self.quantum, |limit, wake| limit.min(wake.max(1)))
+                    .fold(self.quantum, |limit, wake| limit.min(wake.max(1)));
+                if self.max_cycles != u64::MAX { quantum.min(self.bus.cpu_cycles_for_bus(self.max_cycles - self.bus.cycles())) } else { quantum }
             };
             let elapsed = quantum * u64::from(cpi);
             let mut stalls = [0u64; 4];
@@ -758,7 +800,7 @@ impl<S: Soc> Machine<S> {
         if self.rt.enabled { return 1; }
         let now = self.bus.cycles();
         let mut k = self.vq_max.min(deadline.div_ceil(self.quantum)).min(insns_left.div_ceil(self.quantum))
-            .min(self.max_cycles.saturating_sub(now).div_ceil(self.quantum));
+            .min(self.max_cycles.saturating_sub(now) / self.quantum);
         for (i, (core, &enabled)) in self.cores.iter().zip(on).enumerate() {
             if enabled && i != busy { if let Some(wake) = core.cycles_until_wake() { k = k.min(wake / self.quantum); } }
         }
@@ -788,7 +830,7 @@ impl<S: Soc> Machine<S> {
         let q = self.quantum;
         let now = self.bus.cycles();
         let mut k = self.bb_max.min(deadline.div_ceil(q)).min(insns_left.div_ceil(q))
-            .min(self.max_cycles.saturating_sub(now).div_ceil(q))
+            .min(self.max_cycles.saturating_sub(now) / q)
             // the console is drained when the scheduling counter crosses a 64Ki boundary
             .min((0x1_0000 - (n & 0xffff)).div_ceil(q));
         if let Some((at, _)) = self.script.events.get(self.script.pos) { k = k.min(at.saturating_sub(now).div_ceil(q)); }
@@ -822,6 +864,7 @@ impl<S: Soc> Machine<S> {
                     // lane-s2b: a start the core prepared runs without step_blocks' stub/probe test (the
                     // memo never names a boundary PC and batches run without observers).
                     let pc = self.cores[i].pc();
+                    S::select_core(&mut self.bus, i);
                     let (used, stop) = match self.cores[i].run_prepared(&mut self.bus, left) {
                         Some((used, trap)) => { self.bb_stats[7] += 1; self.finish_step(i, pc, used, trap) }
                         None => self.step_blocks(i, left),
@@ -889,7 +932,7 @@ impl<S: Soc> Machine<S> {
             if enabled { if let Some(delta) = core.cycles_until_wake() { budget = budget.min(delta.max(1)); } }
         }
         if let Some((at, _)) = self.script.events.get(self.script.pos) {
-            budget = budget.min(at.saturating_sub(self.bus.cycles()).max(1));
+            budget = budget.min(self.bus.cpu_cycles_for_bus(at.saturating_sub(self.bus.cycles())).max(1));
         }
         budget
     }
@@ -907,9 +950,13 @@ impl<S: Soc> Machine<S> {
     /// Nothing else about a run changes: stubs, probes, observers, scripts and the console work
     /// as in `run`; `max_cycles` is not consulted.
     pub fn run_until_cycle(&mut self, target: u64) -> RunUntil {
+        let quantum = if self.bus.board_ref().uses_gpio_waveform() {
+            if self.has_timing_model() { return RunUntil::Stop(Stop::CostModelLifecycle { kind: LifecycleKind::Attach, reason: GPIO_WAVEFORM_TIMING_ERROR.into() }); }
+            1
+        } else { self.quantum };
         self.web_poll_input();
         self.refresh_irq();
-        self.stub_bloom = self.stubs.keys().fold(0, |m, &pc| m | pc_bit(pc));
+        self.stub_bloom = self.stubs.keys().chain(S::function_hooks(&self.bus)).fold(0, |m, &pc| m | pc_bit(pc));
         self.probe_bloom = self.fn_probes.keys().fold(0, |m, &pc| m | pc_bit(pc));
         for c in &mut self.cores {
             c.set_boundaries(self.stub_bloom | self.probe_bloom);
@@ -936,7 +983,7 @@ impl<S: Soc> Machine<S> {
                 if let Some((at, _)) = self.script.events.get(self.script.pos) {
                     deadline = deadline.min(at.saturating_sub(now).max(1));
                 }
-                let mut budget = left.min(self.quantum).min(deadline) as u32;
+                let mut budget = left.min(quantum).min(deadline) as u32;
                 let (mut used_total, mut yielded, mut stop) = (0u64, false, None);
                 while budget > 0 {
                     let (used, s) = if blocks { self.step_blocks(0, budget) } else { (1, self.step_core(0)) };
@@ -968,6 +1015,7 @@ impl<S: Soc> Machine<S> {
         if *self.bus.irq_dirty() || ticked {
             *self.bus.irq_dirty() = false;
             if self.bus.refresh_irq() { self.present_irqs(); }
+            S::peripheral_event(&self.bus, &mut self.cores);
         }
         let script_stopped = self.after_round_rest();
         self.observe_round();
@@ -999,6 +1047,24 @@ impl<S: Soc> Machine<S> {
     fn apply_due_script_events(&mut self) -> bool {
         let mut stopped = false;
         while self.script.pos < self.script.events.len() && self.script.events[self.script.pos].0 <= self.bus.cycles() {
+            if let ScriptAction::WaitUart0(text, timeout, orig) = self.script.events[self.script.pos].1.clone() {
+                self.drain_console();
+                let now = self.bus.cycles();
+                let mark = *self.script.wait_mark.get_or_insert(self.script.uart0_seen.len());
+                let hit = self.script.uart0_seen[mark.min(self.script.uart0_seen.len())..].windows(text.len().max(1)).any(|w| w == text.as_bytes());
+                if !hit && now < orig.saturating_add(timeout) {
+                    self.script.events[self.script.pos].0 = now + S::CPU_HZ / 1000;   // look again in 1 ms, without spinning
+                    break;
+                }
+                let waited = now.saturating_sub(orig);
+                if self.script.log { eprintln!("[script] t={:.3}s wait uart0 {} {:?} after {:.3}s", now as f64 / S::CPU_HZ as f64, if hit { "matched" } else { "timeout" }, text, waited as f64 / S::CPU_HZ as f64); }
+                self.script.wait_mark = None; self.script.pos += 1;
+                for e in self.script.events[self.script.pos..].iter_mut() {
+                    e.0 += waited;
+                    if let ScriptAction::WaitUart0(_, _, o) = &mut e.1 { *o += waited; }
+                }
+                continue;
+            }
             let (t, a) = self.script.events[self.script.pos].clone(); self.script.pos += 1;
             if self.script.log { eprintln!("[script] t={:.3}s {:?}", t as f64 / S::CPU_HZ as f64, a); }
             match a {
@@ -1006,8 +1072,16 @@ impl<S: Soc> Machine<S> {
                 ScriptAction::Serial(text) => self.bus.serial_input(text.as_bytes()),
                 ScriptAction::Uart(n, text) => self.bus.uart_input(n, text.as_bytes()),
                 ScriptAction::Stop => { self.max_cycles = 0; stopped = true; }
+                ScriptAction::TouchPad(pin, touched) => self.bus.set_touch_input(pin, touched),
                 ScriptAction::Touch(x, y, d) => { self.bus.touch_input(x, y, d); }
                 ScriptAction::Poke(a, v) => { let _ = self.bus.write32_unpriced(a, v); }
+                ScriptAction::Analog(pin, mut src) => {
+                    // a waveform plays from when it is applied: a `waituart0` before it moves `t`, so the start moves too
+                    if let esp_periph::AnalogSource::Wave { start_cycles, .. } = &mut src { *start_cycles = t; }
+                    self.bus.analog_set(pin, src)
+                }
+                ScriptAction::WaitUart0(..) => {}
+                ScriptAction::Ble(command) => { if let Err(error) = self.bus.ble_command(&command) { eprintln!("[ble] {error}"); } }
             }
         }
         stopped
@@ -1017,7 +1091,7 @@ impl<S: Soc> Machine<S> {
     fn after_round_rest(&mut self) -> bool {
         let stopped = self.apply_script_events();
         #[cfg(not(target_arch = "wasm32"))]
-        self.uart_tcp_poll_input();
+        if self.uart_tcp.is_some() { self.uart_tcp_poll_input(); }
         // EX170: the cached interval filters the common not-yet-due round without the board call and
         // division; a due round re-derives it from the board before deciding, as before.
         // EX168 s4: the per-round test is two loads and a compare; the re-derivation, the push and the
@@ -1040,6 +1114,7 @@ impl<S: Soc> Machine<S> {
     #[cold]
     #[inline(never)]
     fn rt_pace(&mut self) {
+        self.poll_camera_input();
         {
             self.rt.last_check = self.bus.cycles();
             let start = *self.rt.wall_start.get_or_insert_with(std::time::Instant::now);
@@ -1074,7 +1149,7 @@ impl<S: Soc> Machine<S> {
         let due = 1 + (now - self.uart_tcp_next_rx) / cycles_per_byte;
         let room = self.bus.uart_rx_capacity(0); if room == 0 { return; }
         let data = tcp.take_input(room.min(due as usize));
-        if !data.is_empty() { self.bus.uart_input(0, &data); self.uart_tcp_next_rx = self.uart_tcp_next_rx.saturating_add(data.len() as u64 * cycles_per_byte); }
+        if !data.is_empty() { self.bus.uart_tcp_input(0, &data); self.uart_tcp_next_rx = self.uart_tcp_next_rx.saturating_add(data.len() as u64 * cycles_per_byte); }
     }
     #[cfg(not(target_arch = "wasm32"))]
     fn uart_tcp_output(&mut self, data: &[u8]) { const LIMIT: usize = 1 << 20; let Some(tcp) = self.uart_tcp.clone() else { return }; if !tcp.connected() { self.uart_tcp_pending.clear(); return; } self.uart_tcp_pending.extend(data); if self.uart_tcp_pending.len() > LIMIT { tcp.disconnect(); self.uart_tcp_pending.clear(); return; } while !self.uart_tcp_pending.is_empty() { let accepted = tcp.queue_output(self.uart_tcp_pending.make_contiguous()); if accepted == 0 { break; } self.uart_tcp_pending.drain(..accepted); } }
@@ -1109,7 +1184,25 @@ impl<S: Soc> Machine<S> {
                 "gpio" => { let mut p = rest.split_whitespace(); let pn = pin(p.next().unwrap_or(""))?; let l = p.next().unwrap_or("1") == "1"; ev.push((c, ScriptAction::Gpio(pn, l))); }
                 "poke" => { let mut p = rest.split_whitespace(); let a = u32::from_str_radix(p.next().unwrap_or("0").trim_start_matches("0x"), 16).map_err(|e| e.to_string())?; let v = u32::from_str_radix(p.next().unwrap_or("0").trim_start_matches("0x"), 16).map_err(|e| e.to_string())?; ev.push((c, ScriptAction::Poke(a, v))); }
                 "touch" => { let mut p = rest.split_whitespace(); let x: u16 = p.next().and_then(|v| v.parse().ok()).unwrap_or(0); let y: u16 = p.next().and_then(|v| v.parse().ok()).unwrap_or(0); let d = p.next().unwrap_or("1") == "1"; ev.push((c, ScriptAction::Touch(x, y, d))); }
+                "touchpad" => {
+                    let mut p = rest.split_whitespace(); let pn = pin(p.next().unwrap_or(""))?;
+                    if !self.bus.has_touch_pad(pn) { return Err(format!("line {}: GPIO {} has no capacitive touch pad on this chip", ln + 1, pn)); }
+                    let touched = match p.next() { Some("0") => false, Some("1") => true, _ => return Err(format!("line {}: touchpad needs 0 or 1", ln + 1)) };
+                    if p.next().is_some_and(|v| !v.starts_with('#')) { return Err(format!("line {}: touchpad takes a GPIO and one value", ln + 1)); }
+                    ev.push((c, ScriptAction::TouchPad(pn, touched)));
+                }
                 "serial" => ev.push((c, ScriptAction::Serial(format!("{}\n", rest)))),
+                // adc <gpio> <volts>: constant voltage on an analog pad
+                "adc" => { let mut p = rest.split_whitespace(); let pn = pin(p.next().unwrap_or(""))?;
+                           let v: f32 = p.next().and_then(|x| x.parse().ok()).ok_or_else(|| format!("line {}: adc <gpio> <volts>", ln + 1))?;
+                           ev.push((c, ScriptAction::Analog(pn, esp_periph::AnalogSource::Const(v)))); }
+                // adcwave <gpio> <file> <rate_hz>: volts (one per line / comma / whitespace separated) played from this time on
+                "adcwave" => { let mut p = rest.split_whitespace(); let pn = pin(p.next().unwrap_or(""))?;
+                               let f = p.next().ok_or_else(|| format!("line {}: adcwave <gpio> <file> <rate_hz>", ln + 1))?;
+                               let rate: f64 = p.next().and_then(|x| x.parse().ok()).ok_or_else(|| format!("line {}: adcwave needs a rate in Hz", ln + 1))?;
+                               let text = std::fs::read_to_string(f).map_err(|e| format!("line {}: {}: {}", ln + 1, f, e))?;
+                               let samples: Vec<f32> = text.split(|ch: char| ch == ',' || ch.is_whitespace()).filter(|s| !s.is_empty()).map(|s| s.parse::<f32>()).collect::<Result<_, _>>().map_err(|e| format!("line {}: {}: {}", ln + 1, f, e))?;
+                               ev.push((c, ScriptAction::Analog(pn, esp_periph::AnalogSource::Wave { samples: std::sync::Arc::new(samples), rate_hz: rate, start_cycles: c }))); }
                 "uart0" | "uart1" => ev.push((c, ScriptAction::Uart(if cmd == "uart0" { 0 } else { 1 }, format!("{}\n", rest)))),
                 "knob" => {
                     let mut p = rest.split_whitespace(); let dir = p.next().unwrap_or("cw"); let n: usize = p.next().map(|x| x.parse().unwrap_or(1)).unwrap_or(1);
@@ -1121,7 +1214,15 @@ impl<S: Soc> Machine<S> {
                         tc += step * 4;
                     }
                 }
+                "ble" => {
+                    rest.parse::<crate::ble::peer::Command>().map_err(|e| format!("line {}: {e}", ln + 1))?;
+                    if !self.bus.ble_enabled() { return Err(format!("line {}: BLE requires --ble with the application ELF, or C3 --ble full", ln + 1)); }
+                    ev.push((c, ScriptAction::Ble(rest.to_string())));
+                },
                 "stop" => ev.push((c, ScriptAction::Stop)),
+                "waituart0" => { let mut p = rest.splitn(2, char::is_whitespace); let to: f64 = p.next().and_then(|x| x.parse().ok()).ok_or_else(|| format!("line {}: waituart0 <timeout_s> <text>", ln + 1))?;
+                                 let text = p.next().unwrap_or("").trim().to_string(); if text.is_empty() { return Err(format!("line {}: waituart0 needs text", ln + 1)); }
+                                 ev.push((c, ScriptAction::WaitUart0(text, (to * hz) as u64, c))); }
                 _ => return Err(format!("line {}: unknown command {}", ln + 1, cmd)),
             }
         }
