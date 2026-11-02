@@ -90,7 +90,8 @@ Rust with the WASM target.
 The ARM64 job builds [.github/ci/aarch64.Dockerfile](.github/ci/aarch64.Dockerfile)
 on the x64 runner. Its cross compiler builds the unchanged ARM64 code and tests;
 `qemu-aarch64` executes the ARM64 binaries, including the architecture-specific
-JIT tests and firmware goldens. Container-only shell launchers also route the
+JIT tests and firmware goldens. Build concurrency is bounded at two workers and tests run serially to limit
+peak resource use on the shared runner. Container-only shell launchers also route the
 golden tests' CLI subprocesses through QEMU. No privileged container or host binfmt changes
 are needed. This verifies execution under QEMU, not physical ARM hardware or
 native ARM performance. Reproduce it with:
