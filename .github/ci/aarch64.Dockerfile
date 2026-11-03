@@ -24,5 +24,13 @@ RUN for name in esp32sim esp32sim-c3 esp32sim-c6 esp32sim-p4; do \
       printf '#!/bin/sh\nexec qemu-aarch64 -L /usr/aarch64-linux-gnu "$0.arm64" "$@"\n' > "$bin"; \
       chmod +x "$bin"; \
     done
-RUN ESP32SIM_ROM_DIR=/work/roms cargo +stable test --release --target aarch64-unknown-linux-gnu \
-    -p esp32sim --test goldens -- --include-ignored --skip external_
+# Run the built harness directly: another Cargo invocation can rematerialize its
+# CLI artifacts and replace the launchers with the original ARM executables.
+RUN set -eu; found=0; \
+    for harness in target/aarch64-unknown-linux-gnu/release/deps/goldens-*; do \
+      [ -f "$harness" ] && [ -x "$harness" ] || continue; \
+      found=1; \
+      ESP32SIM_ROM_DIR=/work/roms qemu-aarch64 -L /usr/aarch64-linux-gnu \
+        "$harness" --include-ignored --skip external_; \
+    done; \
+    test "$found" -eq 1
