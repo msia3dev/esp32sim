@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 RUN rustup toolchain install stable --profile minimal --component clippy \
     --target aarch64-unknown-linux-gnu
-ENV CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=1 \
+ENV CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2 \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="qemu-aarch64 -L /usr/aarch64-linux-gnu"
 WORKDIR /work

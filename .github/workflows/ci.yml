@@ -5,6 +5,10 @@ on:
   pull_request:
 permissions:
   contents: read
+# Push and PR events for one branch share a group; keep only the latest run.
+concurrency:
+  group: ci-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
 jobs:
   test:
     # Validate ARM execution first on the single runner, then run the full x64 suite.
@@ -105,4 +109,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: ARM64 Clippy, core tests and JIT goldens (Docker + QEMU)
-        run: docker build --platform linux/amd64 --progress=plain --file .github/ci/aarch64.Dockerfile .
+        run: docker build --pull --platform linux/amd64 --progress=plain --file .github/ci/aarch64.Dockerfile .

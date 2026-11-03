@@ -5,3 +5,7 @@
 .idea
 node_modules
 **/node_modules
+
+# CI metadata is not an input to the ARM source/tests.
+.github
+CONTRIBUTING.md

@@ -81,7 +81,8 @@ remaining CI steps are in the workflow file.
 
 Every CI and Pages job selects `[self-hosted, Linux, X64, docker]`, including
 pull requests. There is no GitHub-hosted fallback; jobs queue when no matching
-runner is online. The runner needs Git, a C linker/build toolchain, curl, tar,
+runner is online. Push and PR events for the same source branch share a concurrency
+group, so superseded/duplicate runs are canceled. The runner needs Git, a C linker/build toolchain, curl, tar,
 unzip, Docker access, and the runtime dependencies for GitHub's Node-based actions.
 CI installs Node 24, portable Python 3.12 through uv, and stable Rust with Clippy
 and the WASM target. Pages installs the same Node and Python versions and stable
@@ -90,14 +91,14 @@ Rust with the WASM target.
 The ARM64 job builds [.github/ci/aarch64.Dockerfile](.github/ci/aarch64.Dockerfile)
 on the x64 runner. Its cross compiler builds the unchanged ARM64 code and tests;
 `qemu-aarch64` executes the ARM64 binaries, including the architecture-specific
-JIT tests and firmware goldens. Build concurrency is bounded at two workers and tests run serially to limit
-peak resource use on the shared runner. Container-only shell launchers also route the
+JIT tests and firmware goldens. Build and test concurrency are bounded at two workers each to limit peak
+resource use on the shared runner. Container-only shell launchers also route the
 golden tests' CLI subprocesses through QEMU. No privileged container or host binfmt changes
 are needed. This verifies execution under QEMU, not physical ARM hardware or
 native ARM performance. Reproduce it with:
 
 ```sh
-docker build --platform linux/amd64 --progress=plain --file .github/ci/aarch64.Dockerfile .
+docker build --pull --platform linux/amd64 --progress=plain --file .github/ci/aarch64.Dockerfile .
 ```
 
 All PRs run on self-hosted infrastructure under this policy. Use repository-level
